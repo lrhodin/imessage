@@ -8,6 +8,8 @@ This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustp
 
 **Platforms**: macOS (full features) and Linux (via hardware key extracted from a Mac once).
 
+> **Note:** The `master` branch does **not** include message backfill. Chat history starts from the moment you log in — all messages after that point are bridged in real time. If you want to try CloudKit-based backfill (iCloud Messages history), check out the [`backfill`](https://github.com/lrhodin/imessage/tree/backfill) branch. It's a work in progress and may have issues.
+
 ## Quick Start (macOS)
 
 macOS 13+ required (Ventura or later). Sign into iCloud on the Mac running the bridge (Settings → Apple ID) — this lets Apple recognize the device so login works without 2FA prompts.
@@ -82,7 +84,7 @@ go build -o ~/bin/nac-relay ./tools/nac-relay/
 ~/bin/nac-relay --setup
 ```
 
-This installs a LaunchAgent that starts on login and auto-restarts if it crashes. On first run, grant **Full Disk Access** and **Contacts** access when prompted — this enables chat history backfill (including images and attachments), contact name resolution, and SMS forwarding from the Mac.
+This installs a LaunchAgent that starts on login and auto-restarts if it crashes.
 
 The relay auto-generates a self-signed TLS certificate and a random bearer token on first start, stored in `~/Library/Application Support/nac-relay/`. All endpoints (except `/health`) require the token. The bridge verifies the relay's certificate fingerprint (Go side) and authenticates with the token (both Go and Rust sides).
 
@@ -101,7 +103,7 @@ The `extract-key` tool reads the token and certificate fingerprint from `relay-i
 
 If the bridge runs outside your LAN (e.g., cloud VM), forward port 5001 TCP to your Mac's local IP. Lock the allowed source IPs to your bridge server's IP for defense in depth — the relay is also protected by TLS + bearer token auth.
 
-**Intel Macs**: The NAC relay is not needed. The bridge runs the x86_64 NAC emulator locally on Linux using hardware data from the extracted key. Chat history starts from when you log in and contacts appear by phone number / email.
+**Intel Macs**: The NAC relay is not needed. The bridge runs the x86_64 NAC emulator locally on Linux using hardware data from the extracted key.
 
 ### Step 2: Build and install the bridge (on Linux)
 
@@ -161,7 +163,7 @@ This creates a portal room. Messages you send there are delivered as iMessages.
 
 ## How It Works
 
-The bridge connects directly to Apple's iMessage servers using [rustpush](https://github.com/OpenBubbles/rustpush) with local NAC validation (no SIP bypass, no relay server). On macOS with Full Disk Access, it also reads `chat.db` for message history backfill and contact name resolution.
+The bridge connects directly to Apple's iMessage servers using [rustpush](https://github.com/OpenBubbles/rustpush) with local NAC validation (no SIP bypass, no relay server). Contact names are resolved via iCloud CardDAV.
 
 On Linux, NAC validation uses one of two paths:
 
@@ -194,11 +196,9 @@ flowchart TB
     style Relay fill:#ffe0b2,stroke:#e65100,color:#333
 ```
 
-### Real-time and backfill
+### Real-time messaging
 
-**Real-time messages** flow through Apple's push notification service (APNs) via rustpush and appear in Matrix immediately.
-
-**Backfill** runs once on first login: the bridge reads `chat.db` and creates portals for all chats with activity in the last `initial_sync_days` (default: 1 year, configurable). On macOS this reads the local database directly; on Linux with the NAC relay, it proxies queries over HTTP to the Mac. After initial sync, everything is real-time via rustpush.
+Messages flow through Apple's push notification service (APNs) via rustpush and appear in Matrix immediately. There is no backfill on the `master` branch — chat history starts from login. For experimental CloudKit backfill, see the [`backfill`](https://github.com/lrhodin/imessage/tree/backfill) branch.
 
 ## Management
 
@@ -256,10 +256,8 @@ Key options:
 
 | Field | Default | What it does |
 |-------|---------|-------------|
-| `network.initial_sync_days` | `365` | How far back to backfill on first login |
 | `network.displayname_template` | First/Last name | How bridged contacts appear in Matrix |
 | `network.preferred_handle` | *(from login)* | Outgoing identity (`tel:+15551234567` or `mailto:user@example.com`) |
-| `backfill.max_initial_messages` | `10000` | Max messages to backfill per chat |
 | `encryption.allow` | `true` | Enable end-to-bridge encryption |
 | `database.type` | `sqlite3-fk-wal` | `sqlite3-fk-wal` or `postgres` |
 
@@ -280,7 +278,6 @@ pkg/connector/               # bridgev2 connector
   ├── connector.go           #   bridge lifecycle + platform detection
   ├── client.go              #   send/receive/reactions/edits/typing
   ├── login.go               #   Apple ID + external key login flows
-  ├── chatdb.go              #   chat.db backfill + contacts (macOS)
   ├── ids.go                 #   identifier/portal ID conversion
   ├── capabilities.go        #   supported features
   └── config.go              #   bridge config schema
@@ -290,7 +287,7 @@ rustpush/                    # OpenBubbles/rustpush (vendored)
 nac-validation/              # Local NAC via AppleAccount.framework (macOS)
 tools/
   ├── extract-key/           # Hardware key extraction (run on Mac)
-  └── nac-relay/             # NAC validation + contacts + backfill relay (run on Mac)
+  └── nac-relay/             # NAC validation relay (run on Mac, Apple Silicon only)
 imessage/                    # macOS chat.db + Contacts reader
 ```
 
