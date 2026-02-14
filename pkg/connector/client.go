@@ -12,15 +12,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"image"
 	"image/jpeg"
 	"path/filepath"
 	"regexp"
-	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -32,7 +29,6 @@ import (
 	_ "golang.org/x/image/tiff"
 
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"go.mau.fi/util/ptr"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -72,9 +68,6 @@ type IMClient struct {
 	contactsReadyLock sync.RWMutex
 	contactsReadyCh   chan struct{}
 
-	// Cloud backfill local cache store.
-	cloudStore *cloudBackfillStore
-
 	// Background goroutine lifecycle
 	stopChan chan struct{}
 
@@ -85,9 +78,6 @@ type IMClient struct {
 	// SMS portal tracking: portal IDs known to be SMS-only contacts
 	smsPortals     map[string]bool
 	smsPortalsLock sync.RWMutex
-
-	// Initial sync gate: closed once initial sync completes (or is skipped),
-	// so real-time messages don't race ahead of backfill.
 
 	// Group portal fuzzy-matching index: maps each member to the set of
 	// group portal IDs containing that member. Lazily populated from DB.
@@ -110,13 +100,6 @@ type IMClient struct {
 	lastGroupForMember   map[string]networkid.PortalKey
 	lastGroupForMemberMu sync.RWMutex
 
-	// initialSyncSkipForwardBackfill is a set of portal IDs for which forward
-	// backfill should be skipped during initial CloudKit sync. These portals
-	// will get their messages via the backward backfill queue instead, avoiding
-	// expensive megolm session creation + sendToDevice round-trips during the
-	// critical startup path. Only populated for non-priority (old) portals.
-	initialSyncSkipForwardBackfill map[string]bool
-	initialSyncSkipMu              sync.RWMutex
 }
 
 var _ bridgev2.NetworkAPI = (*IMClient)(nil)
@@ -125,7 +108,7 @@ var _ bridgev2.ReactionHandlingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.ReadReceiptHandlingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.TypingHandlingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.IdentifierResolvingNetworkAPI = (*IMClient)(nil)
-var _ bridgev2.BackfillingNetworkAPI = (*IMClient)(nil)
+
 var _ rustpushgo.MessageCallback = (*IMClient)(nil)
 var _ rustpushgo.UpdateUsersCallback = (*IMClient)(nil)
 
@@ -278,13 +261,6 @@ func (c *IMClient) Connect(ctx context.Context) {
 	c.stopChan = make(chan struct{})
 	go c.periodicStateSave(log)
 
-	// Ensure CloudKit backfill schema/storage is available.
-	cloudStoreReady := true
-	if err = c.ensureCloudSyncStore(context.Background()); err != nil {
-		cloudStoreReady = false
-		log.Error().Err(err).Msg("Failed to initialize cloud backfill store")
-	}
-
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 
 	// Set up contact source: iCloud CardDAV via TokenProvider
@@ -304,10 +280,6 @@ func (c *IMClient) Connect(ctx context.Context) {
 		// periodic retries will pick up a fresh delegate once available.
 		log.Warn().Msg("Cloud contacts unavailable on startup, will retry periodically")
 		go c.retryCloudContacts(log)
-	}
-
-	if cloudStoreReady {
-		c.startCloudSyncController(log)
 	}
 
 }
@@ -1272,16 +1244,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 	// Groups use "gid:<UUID>" portal IDs, or legacy comma-separated participant IDs
 	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
 
-	canBackfill := false
-	if c.cloudStore != nil {
-		if hasMessages, err := c.cloudStore.hasPortalMessages(ctx, portalID); err == nil {
-			canBackfill = hasMessages
-		}
-	}
-
-	chatInfo := &bridgev2.ChatInfo{
-		CanBackfill: canBackfill,
-	}
+	chatInfo := &bridgev2.ChatInfo{}
 
 	if isGroup {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDefault)
@@ -1487,475 +1450,7 @@ func (c *IMClient) ResolveIdentifier(ctx context.Context, identifier string, cre
 	}, nil
 }
 
-// ============================================================================
-// Backfill (CloudKit cache-backed)
-// ============================================================================
 
-type cloudBackfillCursor struct {
-	TimestampMS int64  `json:"ts"`
-	GUID        string `json:"g"`
-}
-
-func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
-	fetchStart := time.Now()
-	log := zerolog.Ctx(ctx)
-
-	if c.cloudStore == nil {
-		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: no cloud store, returning empty")
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
-	}
-
-	count := params.Count
-	if count <= 0 {
-		count = 50
-	}
-
-	if params.Portal == nil || params.ThreadRoot != "" {
-		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: nil portal or thread root, returning empty")
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
-	}
-	portalID := string(params.Portal.ID)
-	if portalID == "" {
-		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: empty portal ID, returning empty")
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
-	}
-
-	// Forward backfill: return the newest messages for this portal.
-	// Triggered by the mautrix bridgev2 framework when a portal is first
-	// created (ChatResync / CreatePortal). Populates the room immediately
-	// instead of waiting for the backward backfill queue.
-	if params.Forward {
-		// During initial CloudKit sync, non-priority (old) portals skip forward
-		// backfill to avoid the megolm session + sendToDevice bottleneck. The
-		// backward backfill queue will fill them in gradually afterwards.
-		c.initialSyncSkipMu.RLock()
-		skipForward := c.initialSyncSkipForwardBackfill[portalID]
-		c.initialSyncSkipMu.RUnlock()
-		if skipForward {
-			log.Info().
-				Str("portal_id", portalID).
-				Msg("Skipping forward backfill for non-priority portal during initial sync (backward backfill queue will handle it)")
-			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
-		}
-
-		log.Info().
-			Str("portal_id", portalID).
-			Int("count", count).
-			Str("trigger", "portal_creation").
-			Msg("Forward backfill START — fetching newest messages for new portal")
-		queryStart := time.Now()
-		rows, err := c.cloudStore.listLatestMessages(ctx, portalID, count)
-		if err != nil {
-			log.Err(err).Str("portal_id", portalID).Dur("query_ms", time.Since(queryStart)).Msg("Forward backfill: listLatestMessages FAILED")
-			return nil, err
-		}
-		queryElapsed := time.Since(queryStart)
-		// listLatestMessages returns newest-first; reverse to chronological order
-		reverseCloudMessageRows(rows)
-		convertStart := time.Now()
-		messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
-		for _, row := range rows {
-			messages = append(messages, c.cloudRowToBackfillMessages(ctx, row)...)
-		}
-		convertElapsed := time.Since(convertStart)
-		log.Info().
-			Str("portal_id", portalID).
-			Int("db_rows", len(rows)).
-			Int("backfill_msgs", len(messages)).
-			Dur("query_ms", queryElapsed).
-			Dur("convert_ms", convertElapsed).
-			Dur("total_ms", time.Since(fetchStart)).
-			Msg("Forward backfill COMPLETE — newest messages returned for portal creation")
-		return &bridgev2.FetchMessagesResponse{
-			Messages: messages,
-			HasMore:  false,
-			Forward:  true,
-		}, nil
-	}
-
-	// Backward backfill: triggered by the mautrix bridgev2 backfill queue
-	// for portals with CanBackfill=true (set in GetChatInfo when cloud store
-	// has messages for this portal). Paginates through older messages.
-	cursorDesc := "none (initial page)"
-	fetchCount := count + 1
-	beforeTS := int64(0)
-	beforeGUID := ""
-	if params.Cursor != "" {
-		cursor, err := decodeCloudBackfillCursor(params.Cursor)
-		if err != nil {
-			return nil, fmt.Errorf("invalid backfill cursor: %w", err)
-		}
-		beforeTS = cursor.TimestampMS
-		beforeGUID = cursor.GUID
-		cursorDesc = fmt.Sprintf("before ts=%d guid=%s", beforeTS, beforeGUID)
-	} else if params.AnchorMessage != nil {
-		beforeTS = params.AnchorMessage.Timestamp.UnixMilli()
-		beforeGUID = string(params.AnchorMessage.ID)
-		cursorDesc = fmt.Sprintf("anchor ts=%d id=%s", beforeTS, beforeGUID)
-	}
-
-	log.Info().
-		Str("portal_id", portalID).
-		Int("count", count).
-		Str("cursor", cursorDesc).
-		Str("trigger", "backfill_queue").
-		Msg("Backward backfill START — paginating older messages")
-
-	queryStart := time.Now()
-	rows, err := c.cloudStore.listBackwardMessages(ctx, portalID, beforeTS, beforeGUID, fetchCount)
-	if err != nil {
-		log.Err(err).Str("portal_id", portalID).Dur("query_ms", time.Since(queryStart)).Msg("Backward backfill: query FAILED")
-		return nil, err
-	}
-	queryElapsed := time.Since(queryStart)
-
-	hasMore := false
-	if len(rows) > count {
-		hasMore = true
-		rows = rows[:count]
-	}
-	reverseCloudMessageRows(rows)
-
-	convertStart := time.Now()
-	messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
-	for _, row := range rows {
-		messages = append(messages, c.cloudRowToBackfillMessages(ctx, row)...)
-	}
-	convertElapsed := time.Since(convertStart)
-
-	var nextCursor networkid.PaginationCursor
-	if hasMore && len(rows) > 0 {
-		cursor, cursorErr := encodeCloudBackfillCursor(cloudBackfillCursor{
-			TimestampMS: rows[0].TimestampMS,
-			GUID:        rows[0].GUID,
-		})
-		if cursorErr != nil {
-			return nil, cursorErr
-		}
-		nextCursor = cursor
-	}
-
-	log.Info().
-		Str("portal_id", portalID).
-		Int("db_rows", len(rows)).
-		Int("backfill_msgs", len(messages)).
-		Bool("has_more", hasMore).
-		Dur("query_ms", queryElapsed).
-		Dur("convert_ms", convertElapsed).
-		Dur("total_ms", time.Since(fetchStart)).
-		Msg("Backward backfill COMPLETE — older messages returned")
-
-	return &bridgev2.FetchMessagesResponse{
-		Messages: messages,
-		Cursor:   nextCursor,
-		HasMore:  hasMore,
-		Forward:  false,
-	}, nil
-}
-
-func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow) []*bridgev2.BackfillMessage {
-	sender := c.makeCloudSender(row)
-	ts := time.UnixMilli(row.TimestampMS)
-
-	// Tapback/reaction: return as a reaction event, not a text message.
-	if row.TapbackType != nil && *row.TapbackType >= 2000 {
-		return c.cloudTapbackToBackfill(row, sender, ts)
-	}
-
-	var messages []*bridgev2.BackfillMessage
-
-	// Text message
-	body := row.Text
-	if row.Subject != "" {
-		if body != "" {
-			body = fmt.Sprintf("**%s**\n%s", row.Subject, body)
-		} else {
-			body = row.Subject
-		}
-	}
-	hasText := strings.TrimSpace(body) != "" && strings.TrimRight(body, "\ufffc \n") != ""
-	if hasText {
-		messages = append(messages, &bridgev2.BackfillMessage{
-			Sender:    sender,
-			ID:        makeMessageID(row.GUID),
-			Timestamp: ts,
-			ConvertedMessage: &bridgev2.ConvertedMessage{
-				Parts: []*bridgev2.ConvertedMessagePart{{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType: event.MsgText,
-						Body:    body,
-					},
-				}},
-			},
-		})
-	}
-
-	// Attachments
-	attMessages := c.cloudAttachmentsToBackfill(ctx, row, sender, ts, hasText)
-	messages = append(messages, attMessages...)
-
-	// No text, no attachments, no tapback → likely a deleted/unsent message
-	// whose content was wiped from CloudKit.  Skip silently.
-
-	return messages
-}
-
-func (c *IMClient) makeCloudSender(row cloudMessageRow) bridgev2.EventSender {
-	if row.IsFromMe {
-		return bridgev2.EventSender{
-			IsFromMe:    true,
-			SenderLogin: c.UserLogin.ID,
-			Sender:      makeUserID(c.handle),
-		}
-	}
-	normalizedSender := normalizeIdentifierForPortalID(row.Sender)
-	if normalizedSender == "" {
-		normalizedSender = row.Sender
-	}
-	return bridgev2.EventSender{Sender: makeUserID(normalizedSender)}
-}
-
-// cloudTapbackToBackfill converts a CloudKit reaction record to a backfill reaction event.
-func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.EventSender, ts time.Time) []*bridgev2.BackfillMessage {
-	tapbackType := *row.TapbackType
-	isRemove := tapbackType >= 3000
-	idx := tapbackType - 2000
-	if isRemove {
-		idx = tapbackType - 3000
-	}
-	emoji := tapbackTypeToEmoji(&idx, &row.TapbackEmoji)
-
-	// Parse target GUID from "p:0/GUID" format
-	targetGUID := row.TapbackTargetGUID
-	if parts := strings.SplitN(targetGUID, "/", 2); len(parts) == 2 {
-		targetGUID = parts[1]
-	}
-	if targetGUID == "" {
-		return nil
-	}
-
-	evtType := bridgev2.RemoteEventReaction
-	if isRemove {
-		evtType = bridgev2.RemoteEventReactionRemove
-	}
-
-	// Reactions are sent as remote events, not backfill messages.
-	// We queue them so the bridge handles dedup and target resolution.
-	portalKey := networkid.PortalKey{
-		ID:       networkid.PortalID(row.PortalID),
-		Receiver: c.UserLogin.ID,
-	}
-	c.UserLogin.QueueRemoteEvent(&simplevent.Reaction{
-		EventMeta: simplevent.EventMeta{
-			Type:      evtType,
-			PortalKey: portalKey,
-			Sender:    sender,
-			Timestamp: ts,
-		},
-		TargetMessage: makeMessageID(targetGUID),
-		Emoji:         emoji,
-	})
-	return nil
-}
-
-// cloudAttachmentResult holds the result of a concurrent attachment download+upload.
-type cloudAttachmentResult struct {
-	Index   int
-	Message *bridgev2.BackfillMessage
-}
-
-// cloudAttachmentsToBackfill downloads CloudKit attachments, uploads them to
-// the Matrix media repo, and returns backfill messages with media URLs set.
-// Downloads and uploads run concurrently (up to 4 at a time) for speed.
-func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMessageRow, sender bridgev2.EventSender, ts time.Time, hasText bool) []*bridgev2.BackfillMessage {
-	if row.AttachmentsJSON == "" {
-		return nil
-	}
-	var atts []cloudAttachmentRow
-	if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
-		return nil
-	}
-
-	// Filter to downloadable attachments.
-	type indexedAtt struct {
-		index int
-		att   cloudAttachmentRow
-	}
-	var downloadable []indexedAtt
-	for i, att := range atts {
-		if att.RecordName != "" {
-			downloadable = append(downloadable, indexedAtt{index: i, att: att})
-		}
-	}
-	if len(downloadable) == 0 {
-		return nil
-	}
-
-	// For a single attachment, skip goroutine overhead.
-	if len(downloadable) == 1 {
-		return c.downloadAndUploadAttachment(ctx, row, sender, ts, hasText, downloadable[0].index, downloadable[0].att)
-	}
-
-	// Concurrent download+upload with bounded parallelism.
-	const maxParallel = 4
-	sem := make(chan struct{}, maxParallel)
-	results := make(chan cloudAttachmentResult, len(downloadable))
-	var wg sync.WaitGroup
-
-	for _, da := range downloadable {
-		wg.Add(1)
-		go func(idx int, att cloudAttachmentRow) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			msgs := c.downloadAndUploadAttachment(ctx, row, sender, ts, hasText, idx, att)
-			for _, m := range msgs {
-				results <- cloudAttachmentResult{Index: idx, Message: m}
-			}
-		}(da.index, da.att)
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Collect results and sort by original index for deterministic ordering.
-	var collected []cloudAttachmentResult
-	for r := range results {
-		collected = append(collected, r)
-	}
-	sort.Slice(collected, func(i, j int) bool {
-		return collected[i].Index < collected[j].Index
-	})
-
-	messages := make([]*bridgev2.BackfillMessage, 0, len(collected))
-	for _, r := range collected {
-		messages = append(messages, r.Message)
-	}
-	return messages
-}
-
-// safeCloudDownloadAttachment wraps the FFI call with panic recovery.
-func safeCloudDownloadAttachment(client *rustpushgo.Client, recordName string) (data []byte, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			stack := string(debug.Stack())
-			log.Error().Str("ffi_method", "CloudDownloadAttachment").Str("record_name", recordName).Str("stack", stack).Msgf("FFI panic recovered: %v", r)
-			err = fmt.Errorf("FFI panic in CloudDownloadAttachment: %v", r)
-		}
-	}()
-	return client.CloudDownloadAttachment(recordName)
-}
-
-// downloadAndUploadAttachment handles a single attachment: download from CloudKit,
-// upload to Matrix, return as a backfill message.
-func (c *IMClient) downloadAndUploadAttachment(
-	ctx context.Context,
-	row cloudMessageRow,
-	sender bridgev2.EventSender,
-	ts time.Time,
-	hasText bool,
-	i int,
-	att cloudAttachmentRow,
-) []*bridgev2.BackfillMessage {
-	log := c.Main.Bridge.Log.With().Str("component", "cloud_backfill").Logger()
-	intent := c.Main.Bridge.Bot
-
-	data, err := safeCloudDownloadAttachment(c.client, att.RecordName)
-	if err != nil {
-		log.Warn().Err(err).
-			Str("guid", row.GUID).
-			Str("att_guid", att.GUID).
-			Str("record_name", att.RecordName).
-			Msg("Failed to download CloudKit attachment, skipping")
-		return nil
-	}
-	if len(data) == 0 {
-		return nil
-	}
-
-	attID := row.GUID
-	if i > 0 || hasText {
-		attID = fmt.Sprintf("%s_att%d", row.GUID, i)
-	}
-
-	mimeType := att.MimeType
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
-	fileName := att.Filename
-	if fileName == "" {
-		fileName = "attachment"
-	}
-
-	msgType := mimeToMsgType(mimeType)
-	content := &event.MessageEventContent{
-		MsgType: msgType,
-		Body:    fileName,
-		Info: &event.FileInfo{
-			MimeType: mimeType,
-			Size:     len(data),
-		},
-	}
-
-	url, encFile, uploadErr := intent.UploadMedia(ctx, "", data, fileName, mimeType)
-	if uploadErr != nil {
-		log.Warn().Err(uploadErr).
-			Str("guid", row.GUID).
-			Str("att_guid", att.GUID).
-			Msg("Failed to upload attachment to Matrix, skipping")
-		return nil
-	}
-	if encFile != nil {
-		content.File = encFile
-	} else {
-		content.URL = url
-	}
-
-	return []*bridgev2.BackfillMessage{{
-		Sender:    sender,
-		ID:        makeMessageID(attID),
-		Timestamp: ts,
-		ConvertedMessage: &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{{
-				Type:    event.EventMessage,
-				Content: content,
-			}},
-		},
-	}}
-}
-
-func reverseCloudMessageRows(rows []cloudMessageRow) {
-	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
-		rows[i], rows[j] = rows[j], rows[i]
-	}
-}
-
-func encodeCloudBackfillCursor(cursor cloudBackfillCursor) (networkid.PaginationCursor, error) {
-	data, err := json.Marshal(cursor)
-	if err != nil {
-		return "", err
-	}
-	encoded := base64.RawURLEncoding.EncodeToString(data)
-	return networkid.PaginationCursor(encoded), nil
-}
-
-func decodeCloudBackfillCursor(cursor networkid.PaginationCursor) (*cloudBackfillCursor, error) {
-	decoded, err := base64.RawURLEncoding.DecodeString(string(cursor))
-	if err != nil {
-		return nil, err
-	}
-	var parsed cloudBackfillCursor
-	if err = json.Unmarshal(decoded, &parsed); err != nil {
-		return nil, err
-	}
-	if parsed.GUID == "" {
-		return nil, fmt.Errorf("empty guid in cursor")
-	}
-	return &parsed, nil
-}
 
 // ============================================================================
 // State persistence
@@ -2564,27 +2059,6 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 		if groupName != nil {
 			persistName = *groupName
 		}
-		// Persist participants to cloud_chat so portalToConversation can
-		// find them for outbound messages (even if CloudKit never synced this group).
-		if strings.HasPrefix(string(portalID), "gid:") && len(participants) > 0 {
-			go func(pk networkid.PortalKey, parts []string, guid string) {
-				if c.cloudStore == nil {
-					return
-				}
-				ctx := context.Background()
-				// Only insert if no cloud_chat record exists yet
-				existing, err := c.cloudStore.getChatParticipantsByPortalID(ctx, string(pk.ID))
-				if err == nil && len(existing) > 0 {
-					return // already have participants
-				}
-				if upsertErr := c.cloudStore.upsertChat(ctx, guid, "", guid, string(pk.ID), "iMessage", nil, parts, 0); upsertErr != nil {
-					c.Main.Bridge.Log.Warn().Err(upsertErr).Str("portal_id", string(pk.ID)).Msg("Failed to persist real-time group participants")
-				} else {
-					c.Main.Bridge.Log.Info().Str("portal_id", string(pk.ID)).Int("participants", len(parts)).Msg("Persisted real-time group participants to cloud_chat")
-				}
-			}(portalKey, participants, persistGuid)
-		}
-
 		if persistGuid != "" || persistName != "" {
 			go func(pk networkid.PortalKey, guid, gname string) {
 				ctx := context.Background()
@@ -2708,13 +2182,6 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		var guid string
 		if strings.HasPrefix(portalID, "gid:") {
 			guid = strings.TrimPrefix(portalID, "gid:")
-			// Look up participants from cloud store
-			if c.cloudStore != nil {
-				ctx := context.Background()
-				if parts, err := c.cloudStore.getChatParticipantsByPortalID(ctx, portalID); err == nil && len(parts) > 0 {
-					participants = parts
-				}
-			}
 		} else {
 			participants = strings.Split(portalID, ",")
 		}
@@ -2777,15 +2244,10 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 }
 
 // resolveGroupMembers returns the participant list for a group portal.
-// For gid: portals it queries the cloud store; for legacy comma-separated
-// portal IDs it splits the ID string.
+// For legacy comma-separated portal IDs it splits the ID string.
+// For gid: portals, returns nil (participants come from real-time messages).
 func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []string {
 	if strings.HasPrefix(portalID, "gid:") {
-		if c.cloudStore != nil {
-			if participants, err := c.cloudStore.getChatParticipantsByPortalID(ctx, portalID); err == nil && len(participants) > 0 {
-				return participants
-			}
-		}
 		return nil
 	}
 	return strings.Split(portalID, ",")

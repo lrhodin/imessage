@@ -213,9 +213,5 @@ func CheckSessionRestore() bool {
 	if !session.validate(log) {
 		return false
 	}
-	if !hasKeychainCliqueState(log) {
-		log.Info().Msg("Session restore check failed: keychain trust circle not initialized")
-		return false
-	}
 	return true
 }
