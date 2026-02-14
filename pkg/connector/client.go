@@ -951,7 +951,8 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 
 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
 
-	uuid, err := c.client.SendMessage(conv, textToSend, c.handle)
+	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
+	uuid, err := c.client.SendMessage(conv, textToSend, c.handle, replyGuid, replyPart)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
@@ -1129,7 +1130,8 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	}
 	_ = matrixEdited
 
-	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle)
+	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
+	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
@@ -2440,12 +2442,19 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 
 	content.BeeperLinkPreviews = convertURLPreviewToBeeper(ctx, portal, intent, msg, text)
 
-	return &bridgev2.ConvertedMessage{
+	cm := &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			Type:    event.EventMessage,
 			Content: content,
 		}},
-	}, nil
+	}
+
+	if msg.ReplyGuid != nil && *msg.ReplyGuid != "" {
+		replyToID := makeMessageID(*msg.ReplyGuid)
+		cm.ReplyTo = &networkid.MessageOptionalPartID{MessageID: replyToID}
+	}
+
+	return cm, nil
 }
 
 func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
@@ -2562,18 +2571,47 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		}
 	}
 
-	return &bridgev2.ConvertedMessage{
+	cm := &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			ID:      networkid.PartID(fmt.Sprintf("att%d", attMsg.Index)),
 			Type:    event.EventMessage,
 			Content: content,
 		}},
-	}, nil
+	}
+
+	if attMsg.WrappedMessage.ReplyGuid != nil && *attMsg.WrappedMessage.ReplyGuid != "" {
+		replyToID := makeMessageID(*attMsg.WrappedMessage.ReplyGuid)
+		cm.ReplyTo = &networkid.MessageOptionalPartID{MessageID: replyToID}
+	}
+
+	return cm, nil
 }
 
 // ============================================================================
 // Static helpers
 // ============================================================================
+
+// extractReplyInfo converts a bridgev2 reply-to database message into the
+// iMessage reply_guid and reply_part strings expected by rustpush.
+// reply_guid is the message UUID; reply_part uses the iMessage format "bp:type:length".
+// We don't have the original text length, so we use 0 as a placeholder.
+func extractReplyInfo(replyTo *database.Message) (*string, *string) {
+	if replyTo == nil {
+		return nil, nil
+	}
+	guid := string(replyTo.ID)
+	// Strip attachment suffixes like _att0, _att1 — iMessage expects a pure UUID
+	if idx := strings.Index(guid, "_att"); idx > 0 {
+		guid = guid[:idx]
+	}
+	// iMessage thread_originator_part format is "bp:type:length" where:
+	//   bp = balloon part index (0 for normal messages)
+	//   type = part type (0 for text)
+	//   length = character count of the original message text
+	// We use 0 as the length since we don't have the original text available.
+	part := "0:0:0"
+	return &guid, &part
+}
 
 // scaleAndEncodeThumb generates a JPEG thumbnail capped at 800px on the
 // longest side using nearest-neighbor scaling (no external dependencies).

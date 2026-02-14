@@ -2291,7 +2291,7 @@ impl MessageInst {
                             wallpaper_update_key: normal.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some("YES".to_string()) } else { None }),
                             update_info_included: normal.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some(15) } else { None }),
                         };
-        
+
                         if normal.parts.is_multipart() {
                             raw.xml = Some(normal.parts.to_xml(Some(&mut raw)));
                         }

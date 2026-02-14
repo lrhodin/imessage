@@ -2193,6 +2193,8 @@ impl Client {
         conversation: WrappedConversation,
         text: String,
         handle: String,
+        reply_guid: Option<String>,
+        reply_part: Option<String>,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let service = if conversation.is_sms {
@@ -2260,6 +2262,8 @@ impl Client {
 
         let mut normal = NormalMessage::new(actual_text.clone(), service);
         normal.link_meta = link_meta;
+        normal.reply_guid = reply_guid.clone();
+        normal.reply_part = reply_part.clone();
         let mut msg = MessageInst::new(
             conv.clone(),
             &handle,
@@ -2422,6 +2426,8 @@ impl Client {
         uti_type: String,
         filename: String,
         handle: String,
+        reply_guid: Option<String>,
+        reply_part: Option<String>,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
         // Detect voice messages by UTI (CAF files from OGG→CAF remux are voice recordings)
@@ -2464,8 +2470,8 @@ impl Client {
             Message::Message(NormalMessage {
                 parts: MessageParts(parts),
                 effect: None,
-                reply_guid: None,
-                reply_part: None,
+                reply_guid: reply_guid.clone(),
+                reply_part: reply_part.clone(),
                 service,
                 subject: None,
                 app: None,
@@ -2495,8 +2501,8 @@ impl Client {
                     Message::Message(NormalMessage {
                         parts: MessageParts(sms_parts),
                         effect: None,
-                        reply_guid: None,
-                        reply_part: None,
+                        reply_guid: reply_guid,
+                        reply_part: reply_part,
                         service: sms_service,
                         subject: None,
                         app: None,

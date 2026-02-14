@@ -89,11 +89,22 @@ if [ -f "$CONFIG" ] && [ -z "$EXISTING_BRIDGE" ]; then
     # Config exists locally but bridge isn't registered on server (e.g. bbctl
     # delete was run manually).  The stale config has an invalid as_token and
     # the DB references rooms that no longer exist.
-    echo "⚠  Local config exists but bridge is not registered on server."
-    echo "   Removing stale config and database to re-register..."
-    rm -f "$CONFIG"
-    DB_DIR="$(cd "$DATA_DIR" && pwd)"
-    rm -f "$DB_DIR"/mautrix-imessage.db*
+    #
+    # Double-check by retrying bbctl whoami — a transient network error or the
+    # bridge restarting can cause the first check to return empty even though
+    # the registration is fine.
+    echo "⚠  Bridge not found in bbctl whoami — retrying in 3s to rule out transient error..."
+    sleep 3
+    EXISTING_BRIDGE=$("$BBCTL" whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
+    if [ -z "$EXISTING_BRIDGE" ]; then
+        echo "⚠  Local config exists but bridge is not registered on server."
+        echo "   Removing stale config and database to re-register..."
+        rm -f "$CONFIG"
+        DB_DIR="$(cd "$DATA_DIR" && pwd)"
+        rm -f "$DB_DIR"/mautrix-imessage.db*
+    else
+        echo "✓ Bridge found on retry — keeping existing config and database"
+    fi
 fi
 if [ -f "$CONFIG" ]; then
     echo "✓ Config already exists at $CONFIG"
