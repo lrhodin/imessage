@@ -198,6 +198,8 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     # Stop the bridge if running (otherwise it holds the DB lock)
     if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
         systemctl --user stop mautrix-imessage
+    elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
+        sudo systemctl stop mautrix-imessage
     fi
 
     if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
@@ -213,15 +215,32 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
 fi
 
 # ── Install systemd service (optional) ────────────────────────
-SERVICE_FILE="$HOME/.config/systemd/user/mautrix-imessage.service"
+# Detect whether systemd user sessions work. In containers (LXC) or when
+# running as root, the user instance is often unavailable — fall back to a
+# system-level service in that case.
+USER_SERVICE_FILE="$HOME/.config/systemd/user/mautrix-imessage.service"
+SYSTEM_SERVICE_FILE="/etc/systemd/system/mautrix-imessage.service"
 
-install_systemd() {
+if command -v systemctl >/dev/null 2>&1; then
+    if systemctl --user status >/dev/null 2>&1; then
+        SYSTEMD_MODE="user"
+        SERVICE_FILE="$USER_SERVICE_FILE"
+    else
+        SYSTEMD_MODE="system"
+        SERVICE_FILE="$SYSTEM_SERVICE_FILE"
+    fi
+else
+    SYSTEMD_MODE="none"
+    SERVICE_FILE=""
+fi
+
+install_systemd_user() {
     # Enable lingering so user services survive SSH session closures
     if command -v loginctl >/dev/null 2>&1 && [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
         sudo loginctl enable-linger "$USER" 2>/dev/null || true
     fi
-    mkdir -p "$(dirname "$SERVICE_FILE")"
-    cat > "$SERVICE_FILE" << EOF
+    mkdir -p "$(dirname "$USER_SERVICE_FILE")"
+    cat > "$USER_SERVICE_FILE" << EOF
 [Unit]
 Description=mautrix-imessage bridge
 After=network.target
@@ -240,10 +259,30 @@ EOF
     systemctl --user enable mautrix-imessage
 }
 
-if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
-    if [ -f "$SERVICE_FILE" ]; then
-        # Update: rebuild service file (binary path may change), restart
-        install_systemd
+install_systemd_system() {
+    cat > "$SYSTEM_SERVICE_FILE" << EOF
+[Unit]
+Description=mautrix-imessage bridge
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$(dirname "$BINARY")
+ExecStart=$BINARY -c $CONFIG
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable mautrix-imessage
+}
+
+if [ "$SYSTEMD_MODE" = "user" ]; then
+    if [ -f "$USER_SERVICE_FILE" ]; then
+        install_systemd_user
         systemctl --user restart mautrix-imessage
         echo "✓ Bridge restarted"
     else
@@ -251,9 +290,25 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>
         read -p "Install as a systemd user service? [Y/n] " answer
         case "$answer" in
             [nN]*) ;;
-            *)     install_systemd
+            *)     install_systemd_user
                    systemctl --user start mautrix-imessage
                    echo "✓ Bridge started (systemd user service installed)" ;;
+        esac
+    fi
+elif [ "$SYSTEMD_MODE" = "system" ]; then
+    if [ -f "$SYSTEM_SERVICE_FILE" ]; then
+        install_systemd_system
+        systemctl restart mautrix-imessage
+        echo "✓ Bridge restarted"
+    else
+        echo ""
+        echo "Note: systemd user session not available (container/root)."
+        read -p "Install as a system-level systemd service? [Y/n] " answer
+        case "$answer" in
+            [nN]*) ;;
+            *)     install_systemd_system
+                   systemctl start mautrix-imessage
+                   echo "✓ Bridge started (system service installed)" ;;
         esac
     fi
 fi
@@ -267,11 +322,16 @@ echo "  Binary: $BINARY"
 echo "  Config: $CONFIG"
 echo "  Registration: $REGISTRATION"
 echo ""
-if [ -f "$SERVICE_FILE" ]; then
+if [ "$SYSTEMD_MODE" = "user" ] && [ -f "$USER_SERVICE_FILE" ]; then
     echo "  Status:  systemctl --user status mautrix-imessage"
     echo "  Logs:    journalctl --user -u mautrix-imessage -f"
     echo "  Stop:    systemctl --user stop mautrix-imessage"
     echo "  Restart: systemctl --user restart mautrix-imessage"
+elif [ "$SYSTEMD_MODE" = "system" ] && [ -f "$SYSTEM_SERVICE_FILE" ]; then
+    echo "  Status:  systemctl status mautrix-imessage"
+    echo "  Logs:    journalctl -u mautrix-imessage -f"
+    echo "  Stop:    systemctl stop mautrix-imessage"
+    echo "  Restart: systemctl restart mautrix-imessage"
 else
     echo "  Run manually:"
     echo "    cd $(dirname "$CONFIG") && $BINARY -c $CONFIG"
