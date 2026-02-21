@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
         libolm-dev \
         libunicorn-dev \
+        zlib1g-dev \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
