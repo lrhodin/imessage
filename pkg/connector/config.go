@@ -39,28 +39,28 @@ type IMConfig struct {
 	// If empty, the handle chosen during login is used.
 	PreferredHandle string `yaml:"preferred_handle"`
 
-	// CardDAV is an external CardDAV server for contact name resolution.
-	// When configured, this is used instead of iCloud CardDAV contacts.
-	CardDAV CardDAVConfig `yaml:"carddav"`
+	// DefaultHardwareKey is a server-wide hardware key (base64-encoded JSON) that
+	// users can opt to use during login instead of supplying their own.
+	// Leave empty to require each user to provide their own hardware key.
+	// Warning: sharing a hardware key among multiple users may cause Apple to
+	// restrict affected Apple IDs.
+	DefaultHardwareKey string `yaml:"default_hardware_key"`
 }
 
-// CardDAVConfig configures an external CardDAV server for contact name resolution.
-// Supports Google (with app passwords), Nextcloud, Radicale, Fastmail, etc.
+// CardDAVConfig holds credentials for an external CardDAV server.
+// Used by externalCardDAVClient and stored per-user in UserLoginMetadata.
 type CardDAVConfig struct {
-	// Email address used for CardDAV auto-discovery (RFC 6764 .well-known/carddav).
-	// Also used as the username if Username is empty.
-	Email string `yaml:"email"`
+	// Email address used for auto-discovery and as the default username.
+	Email string
 
 	// URL is the CardDAV server URL. Leave empty to auto-discover from Email.
-	// Example: https://www.googleapis.com/carddav/v1/principals/you@gmail.com/lists/default/
-	URL string `yaml:"url"`
+	URL string
 
 	// Username for HTTP Basic authentication. Defaults to Email if empty.
-	Username string `yaml:"username"`
+	Username string
 
 	// PasswordEncrypted is the AES-256-GCM encrypted app password (base64).
-	// Set by the install script via the carddav-setup subcommand.
-	PasswordEncrypted string `yaml:"password_encrypted"`
+	PasswordEncrypted string
 }
 
 // IsConfigured returns true if the CardDAV config has enough info to connect.
@@ -119,10 +119,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Int, "initial_sync_days")
 	helper.Copy(up.Bool, "cloudkit_backfill")
 	helper.Copy(up.Str, "preferred_handle")
-	helper.Copy(up.Str, "carddav", "email")
-	helper.Copy(up.Str, "carddav", "url")
-	helper.Copy(up.Str, "carddav", "username")
-	helper.Copy(up.Str, "carddav", "password_encrypted")
+	helper.Copy(up.Str, "default_hardware_key")
 }
 
 // GetInitialSyncDays returns the configured initial sync window in days,

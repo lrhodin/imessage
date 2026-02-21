@@ -30,6 +30,10 @@ func isRunningOnMacOS() bool {
 type IMConnector struct {
 	Bridge *bridgev2.Bridge
 	Config IMConfig
+
+	// BridgeSecret is the HMAC key used to derive per-user CardDAV encryption
+	// keys. Set from the AS token in main.go's PostInit hook.
+	BridgeSecret string
 }
 
 var _ bridgev2.NetworkConnector = (*IMConnector)(nil)
@@ -187,6 +191,7 @@ func (c *IMConnector) tryAutoRestore(ctx context.Context) {
 		AccountDSID:              state.AccountDSID,
 		AccountSPDBase64:         state.AccountSPDBase64,
 		MmeDelegateJSON:          state.MmeDelegateJSON,
+		CloudKitBackfill:         state.CloudKitBackfill,
 	}
 
 	_, err = user.NewLogin(ctx, &database.UserLogin{
@@ -288,6 +293,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		AccountDSID:              meta.AccountDSID,
 		AccountSPDBase64:         meta.AccountSPDBase64,
 		MmeDelegateJSON:          meta.MmeDelegateJSON,
+		CloudKitBackfill:         meta.CloudKitBackfill,
 	})
 
 	client := &IMClient{

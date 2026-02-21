@@ -51,6 +51,10 @@ type PersistedSessionState struct {
 
 	// Cached MobileMe delegate for seeding on restore
 	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
+
+	// CloudKitBackfill records the user's per-login backfill preference so it
+	// survives DB resets alongside the rest of the session state.
+	CloudKitBackfill bool `json:"cloudkit_backfill,omitempty"`
 }
 
 // sessionFilePath returns the path to the persisted session state file:

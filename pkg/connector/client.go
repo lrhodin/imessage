@@ -549,11 +549,13 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 
-	// Set up contact source: external CardDAV if configured, else iCloud
-	if c.Main.Config.CardDAV.IsConfigured() {
-		c.contacts = newExternalCardDAVClient(c.Main.Config.CardDAV, log)
+	// Set up contact source: per-user external CardDAV if configured, else iCloud
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	if meta.CardDAVIsConfigured() {
+		key := DeriveCardDAVKey(c.Main.BridgeSecret, string(c.UserLogin.ID))
+		c.contacts = newExternalCardDAVClient(meta.GetCardDAVConfig(), key, log)
 		if c.contacts != nil {
-			log.Info().Str("email", c.Main.Config.CardDAV.Email).Msg("Using external CardDAV for contacts")
+			log.Info().Str("email", meta.CardDAVEmail).Msg("Using external CardDAV for contacts")
 			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial external CardDAV sync failed")
 			} else {
@@ -585,17 +587,31 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 	}
 
-	if cloudStoreReady && c.Main.Config.CloudKitBackfill {
+	if cloudStoreReady && c.cloudKitBackfillEnabled() {
 		c.startCloudSyncController(log)
 	} else {
-		if !c.Main.Config.CloudKitBackfill {
-			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
+		if !c.cloudKitBackfillEnabled() {
+			log.Info().Msg("CloudKit backfill not enabled for this user — skipping cloud sync")
 		}
 		// No CloudKit — open the APNs portal-creation gate immediately
 		// so real-time messages can create portals without waiting.
 		c.setCloudSyncDone()
 	}
 
+}
+
+// cloudKitBackfillEnabled returns true when both the server and this specific
+// user login have CloudKit backfill enabled. The server flag gates global
+// bridge backfill settings; the per-user flag records the user's choice at
+// login time and is paired to their stored hardware key / session state.
+func (c *IMClient) cloudKitBackfillEnabled() bool {
+	if !c.Main.Config.CloudKitBackfill {
+		return false
+	}
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
+		return meta.CloudKitBackfill
+	}
+	return false
 }
 
 func (c *IMClient) Disconnect() {
@@ -2383,9 +2399,9 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}()
 	}
 
-	if !c.Main.Config.CloudKitBackfill || c.cloudStore == nil {
-		log.Debug().Bool("forward", params.Forward).Bool("backfill_enabled", c.Main.Config.CloudKitBackfill).
-			Msg("FetchMessages: backfill disabled or no cloud store, returning empty")
+	if !c.cloudKitBackfillEnabled() || c.cloudStore == nil {
+		log.Debug().Bool("forward", params.Forward).Bool("backfill_enabled", c.cloudKitBackfillEnabled()).
+			Msg("FetchMessages: backfill not enabled for this user or no cloud store, returning empty")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
