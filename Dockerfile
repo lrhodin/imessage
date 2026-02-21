@@ -57,6 +57,8 @@ RUN GOTOOLCHAIN=local go mod download
 # Copy all Go source including generated CGO bindings (rustpushgo.go/.h/.c).
 COPY cmd/ ./cmd/
 COPY pkg/ ./pkg/
+COPY imessage/ ./imessage/
+COPY ipc/ ./ipc/
 
 # Build the binary.
 # - GOTOOLCHAIN=local: prevents Go from downloading a newer toolchain.
