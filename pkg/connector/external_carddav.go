@@ -38,14 +38,15 @@ type externalCardDAVClient struct {
 }
 
 // newExternalCardDAVClient creates an external CardDAV client.
-// Performs auto-discovery if url is empty. Returns nil if configuration is insufficient.
-func newExternalCardDAVClient(cfg CardDAVConfig, log zerolog.Logger) *externalCardDAVClient {
+// key is the per-user AES-256 key from DeriveCardDAVKey.
+// Performs auto-discovery if cfg.URL is empty. Returns nil if configuration is insufficient.
+func newExternalCardDAVClient(cfg CardDAVConfig, key []byte, log zerolog.Logger) *externalCardDAVClient {
 	if !cfg.IsConfigured() {
 		return nil
 	}
 
-	// Decrypt password
-	password, err := DecryptCardDAVPassword(cfg.PasswordEncrypted)
+	// Decrypt password using the per-user derived key
+	password, err := DecryptCardDAVPassword(key, cfg.PasswordEncrypted)
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to decrypt CardDAV password")
 		return nil
@@ -190,6 +191,13 @@ func (c *externalCardDAVClient) GetContactInfo(identifier string) (*imessage.Con
 	}
 
 	return nil, nil
+}
+
+// LastSync returns the time of the most recent successful sync.
+func (c *externalCardDAVClient) LastSync() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastSync
 }
 
 // GetAllContacts returns a snapshot of the full contact list for bulk search.

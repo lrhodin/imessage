@@ -31,22 +31,173 @@ const (
 	LoginStepSelectDevice    = "fi.mau.imessage.login.select_device"
 	LoginStepDevicePasscode  = "fi.mau.imessage.login.device_passcode"
 	LoginStepSelectHandle    = "fi.mau.imessage.login.select_handle"
+	LoginStepBackfillChoice  = "fi.mau.imessage.login.backfill_choice"
+	LoginStepHWKeySource     = "fi.mau.imessage.login.hw_key_source"
 	LoginStepComplete        = "fi.mau.imessage.login.complete"
 )
 
+// Backfill select option values (matched against input["backfill"] at runtime).
+const (
+	backfillOptionYes = "Yes, enable message history backfill"
+	backfillOptionNo  = "No, real-time messages only"
+)
+
+// Hardware key source select option values (ExternalKeyLogin only).
+const (
+	hwKeySourceDefault = "Use pre-shared hardware key"
+	hwKeySourceCustom  = "Provide my own hardware key"
+)
+
+// backfillChoiceStep returns the login step that asks the user whether they
+// want to enable CloudKit message history backfill. Only shown when the server
+// has cloudkit_backfill enabled in config.
+func backfillChoiceStep() *bridgev2.LoginStep {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepBackfillChoice,
+		Instructions: "Do you want to enable message history backfill?\n\n" +
+			"When enabled, the bridge will sync past messages from iCloud during setup. " +
+			"This requires entering your device PIN to join the iCloud Keychain trust circle.\n\n" +
+			"When disabled, only real-time messages are bridged — no PIN needed.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				Type:    bridgev2.LoginInputFieldTypeSelect,
+				ID:      "backfill",
+				Name:    "Message history backfill",
+				Options: []string{backfillOptionYes, backfillOptionNo},
+			}},
+		},
+	}
+}
+
+// hwKeySourceStep returns the login step that lets the user choose between the
+// server's pre-shared hardware key and supplying their own.
+func hwKeySourceStep() *bridgev2.LoginStep {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepHWKeySource,
+		Instructions: "A pre-shared hardware key is available for this bridge.\n\n" +
+			"You may use it instead of extracting your own key from a Mac.\n\n" +
+			"Warning: the pre-shared key is shared among all users of this bridge. " +
+			"Apple may restrict or flag Apple IDs that register using a shared hardware identity. " +
+			"If you have a Mac available, providing your own key is safer.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				Type:    bridgev2.LoginInputFieldTypeSelect,
+				ID:      "hw_key_source",
+				Name:    "Hardware key source",
+				Options: []string{hwKeySourceDefault, hwKeySourceCustom},
+			}},
+		},
+	}
+}
+
+// hwKeyInputStep returns the login step that prompts the user to paste their
+// hardware key (base64-encoded JSON extracted from a real Mac).
+func hwKeyInputStep() *bridgev2.LoginStep {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepExternalKey,
+		Instructions: "Enter your hardware key (base64-encoded JSON).\n\n" +
+			"This is extracted once from a real Mac using the key extraction tool.\n" +
+			"It contains hardware identifiers needed for iMessage registration.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				Type: bridgev2.LoginInputFieldTypePassword,
+				ID:   "hardware_key",
+				Name: "Hardware Key (base64)",
+			}},
+		},
+	}
+}
+
+// appleIDPasswordStep returns the Apple ID + password login step.
+// extraInstructions is appended after the main prompt (e.g. NAC notes).
+func appleIDPasswordStep(extraInstructions string) *bridgev2.LoginStep {
+	instructions := "Enter your Apple ID credentials."
+	if extraInstructions != "" {
+		instructions += "\n\n" + extraInstructions
+	}
+	return &bridgev2.LoginStep{
+		Type:         bridgev2.LoginStepTypeUserInput,
+		StepID:       LoginStepAppleIDPassword,
+		Instructions: instructions,
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				Type: bridgev2.LoginInputFieldTypeEmail,
+				ID:   "username",
+				Name: "Apple ID",
+			}, {
+				Type: bridgev2.LoginInputFieldTypePassword,
+				ID:   "password",
+				Name: "Password",
+			}},
+		},
+	}
+}
+
+// twoFactorStepDetailed returns the 2FA step with per-device instructions
+// (used in the macOS Apple ID flow where the user is more likely to have a device handy).
+func twoFactorStepDetailed() *bridgev2.LoginStep {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepTwoFactor,
+		Instructions: "Enter your Apple ID verification code.\n\n" +
+			"You may see a notification on your trusted Apple devices. " +
+			"If not, you can generate a code manually:\n" +
+			"• iPhone/iPad: Settings → [Your Name] → Sign-In & Security → Two-Factor Authentication → Get Verification Code\n" +
+			"• Mac: System Settings → [Your Name] → Sign-In & Security → Two-Factor Authentication → Get Verification Code",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				ID:   "code",
+				Name: "2FA Code",
+			}},
+		},
+	}
+}
+
+// twoFactorStepShort returns the 2FA step with brief instructions
+// (used in the external key flow).
+func twoFactorStepShort() *bridgev2.LoginStep {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepTwoFactor,
+		Instructions: "Enter your Apple ID verification code.\n\n" +
+			"You may see a notification on your trusted Apple devices.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				ID:   "code",
+				Name: "2FA Code",
+			}},
+		},
+	}
+}
+
+// ============================================================================
+// Apple ID Login (macOS only)
+// ============================================================================
+
 // AppleIDLogin implements the multi-step login flow:
-// Apple ID + password → 2FA code → IDS registration → device selection → passcode → handle selection → connected.
+//
+//	[backfill choice →] Apple ID + password → [2FA →] IDS registration →
+//	[device selection → passcode →] handle selection → connected.
+//
+// The backfill choice step is only shown when the server has cloudkit_backfill
+// enabled. When disabled, cloudKitBackfill is always false and the flow is
+// identical to the previous behaviour.
 type AppleIDLogin struct {
-	User          *bridgev2.User
-	Main          *IMConnector
-	username      string
-	cfg           *rustpushgo.WrappedOsConfig
-	conn          *rustpushgo.WrappedApsConnection
-	session       *rustpushgo.LoginSession
-	result        *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
-	handle        string                                  // chosen handle
-	devices       []rustpushgo.EscrowDeviceInfo           // escrow devices (fetched after IDS registration)
-	selectedDevice int                                    // index into devices (-1 = not yet selected)
+	User             *bridgev2.User
+	Main             *IMConnector
+	backfillChosen   bool // true once the backfill preference step has been answered
+	cloudKitBackfill bool // the user's backfill preference
+	username         string
+	cfg              *rustpushgo.WrappedOsConfig
+	conn             *rustpushgo.WrappedApsConnection
+	session          *rustpushgo.LoginSession
+	result           *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
+	handle           string                                  // chosen handle
+	devices          []rustpushgo.EscrowDeviceInfo           // escrow devices (fetched after IDS registration)
+	selectedDevice   int                                     // index into devices (-1 = not yet selected)
 }
 
 var _ bridgev2.LoginProcessUserInput = (*AppleIDLogin)(nil)
@@ -62,7 +213,6 @@ func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	}
 	l.cfg = cfg
 
-	// Reuse existing session state if available and keystore matches
 	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
 	session := loadCachedSession(l.User, log)
 	if !session.validate(log) {
@@ -71,23 +221,15 @@ func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	apsState := getExistingAPSState(session, log)
 	l.conn = rustpushgo.Connect(cfg, apsState)
 
-	return &bridgev2.LoginStep{
-		Type:   bridgev2.LoginStepTypeUserInput,
-		StepID: LoginStepAppleIDPassword,
-		Instructions: "Enter your Apple ID credentials. " +
-			"Registration uses local NAC (no relay needed).",
-		UserInputParams: &bridgev2.LoginUserInputParams{
-			Fields: []bridgev2.LoginInputDataField{{
-				Type: bridgev2.LoginInputFieldTypeEmail,
-				ID:   "username",
-				Name: "Apple ID",
-			}, {
-				Type: bridgev2.LoginInputFieldTypePassword,
-				ID:   "password",
-				Name: "Password",
-			}},
-		},
-	}, nil
+	// When cloudkit_backfill is disabled server-wide, skip the choice step and
+	// go straight to credentials — behaviour is identical to before this change.
+	if !l.Main.Config.CloudKitBackfill {
+		l.backfillChosen = true
+		l.cloudKitBackfill = false
+		return appleIDPasswordStep("Registration uses local NAC (no relay needed)."), nil
+	}
+
+	return backfillChoiceStep(), nil
 }
 
 func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
@@ -101,13 +243,20 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		return l.handleDeviceSelection(device)
 	}
 
-	// Handle selection step (after device passcode)
+	// Handle selection step (after device passcode or when backfill is skipped)
 	if l.result != nil {
 		l.handle = input["handle"]
 		return l.completeLogin(ctx)
 	}
 
-	// Step 1: Apple ID + password
+	// Backfill choice step — only reached when cloudkit_backfill is enabled server-wide.
+	if !l.backfillChosen {
+		l.backfillChosen = true
+		l.cloudKitBackfill = input["backfill"] == backfillOptionYes
+		return appleIDPasswordStep("Registration uses local NAC (no relay needed)."), nil
+	}
+
+	// Apple ID + password step
 	if l.session == nil {
 		username := input["username"]
 		if username == "" {
@@ -128,29 +277,14 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 
 		if session.Needs2fa() {
 			l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded, waiting for 2FA")
-			return &bridgev2.LoginStep{
-				Type:   bridgev2.LoginStepTypeUserInput,
-				StepID: LoginStepTwoFactor,
-				Instructions: "Enter your Apple ID verification code.\n\n" +
-					"You may see a notification on your trusted Apple devices. " +
-					"If not, you can generate a code manually:\n" +
-					"• iPhone/iPad: Settings → [Your Name] → Sign-In & Security → Two-Factor Authentication → Get Verification Code\n" +
-					"• Mac: System Settings → [Your Name] → Sign-In & Security → Two-Factor Authentication → Get Verification Code",
-				UserInputParams: &bridgev2.LoginUserInputParams{
-					Fields: []bridgev2.LoginInputDataField{{
-						ID:   "code",
-						Name: "2FA Code",
-					}},
-				},
-			}, nil
+			return twoFactorStepDetailed(), nil
 		}
 
-		// No 2FA needed — skip straight to IDS registration
 		l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded without 2FA, finishing registration")
 		return l.finishLogin(ctx)
 	}
 
-	// Step 2: 2FA code
+	// 2FA step
 	code := input["code"]
 	if code == "" {
 		return nil, fmt.Errorf("2FA code is required")
@@ -170,13 +304,11 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
 	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
 
-	// Reuse existing session state if available and keystore matches
 	session := loadCachedSession(l.User, log)
 	if !session.validate(log) {
 		session = nil
 	}
 
-	// Reuse existing identity if available (avoids "new Mac" notifications)
 	var existingIdentityArg **rustpushgo.WrappedIdsngmIdentity
 	if existing := getExistingIdentity(session, log); existing != nil {
 		existingIdentityArg = &existing
@@ -184,7 +316,6 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 		log.Info().Msg("No existing identity found, will generate new one (first login)")
 	}
 
-	// Reuse existing IDS users/registration if available (avoids register() call)
 	var existingUsersArg **rustpushgo.WrappedIdsUsers
 	if existing := getExistingUsers(session, log); existing != nil {
 		existingUsersArg = &existing
@@ -200,10 +331,11 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 	l.result = &result
 	l.selectedDevice = -1
 
-	// Skip device selection and passcode when CloudKit backfill is disabled —
-	// iCloud Keychain is only needed for decrypting CloudKit message records.
-	if !l.Main.Config.CloudKitBackfill {
-		log.Info().Msg("CloudKit backfill disabled, skipping device selection and passcode")
+	// Device selection and passcode are only needed to join the iCloud Keychain
+	// trust circle for CloudKit record decryption. Skip them when the user has
+	// not opted in to backfill.
+	if !l.cloudKitBackfill {
+		log.Info().Msg("CloudKit backfill not enabled for this user, skipping device selection and passcode")
 		handles := l.result.Users.GetHandles()
 		if step := handleSelectionStep(handles); step != nil {
 			return step, nil
@@ -240,12 +372,13 @@ func (l *AppleIDLogin) handlePasscodeAndContinue(ctx context.Context, passcode s
 
 func (l *AppleIDLogin) completeLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
 	meta := &UserLoginMetadata{
-		Platform:        "rustpush-local",
-		APSState:        l.conn.State().ToString(),
-		IDSUsers:        l.result.Users.ToString(),
-		IDSIdentity:     l.result.Identity.ToString(),
-		DeviceID:        l.cfg.GetDeviceId(),
-		PreferredHandle: l.handle,
+		Platform:         "rustpush-local",
+		APSState:         l.conn.State().ToString(),
+		IDSUsers:         l.result.Users.ToString(),
+		IDSIdentity:      l.result.Identity.ToString(),
+		DeviceID:         l.cfg.GetDeviceId(),
+		PreferredHandle:  l.handle,
+		CloudKitBackfill: l.cloudKitBackfill,
 	}
 
 	return completeLoginWithMeta(ctx, l.User, l.Main, l.username, l.cfg, l.conn, l.result, meta)
@@ -256,19 +389,31 @@ func (l *AppleIDLogin) completeLogin(ctx context.Context) (*bridgev2.LoginStep, 
 // ============================================================================
 
 // ExternalKeyLogin implements the multi-step login flow for non-macOS platforms:
-// Hardware key → Apple ID + password → 2FA code → IDS registration → device selection → passcode → handle selection → connected.
+//
+//	[backfill choice →] [hw key source →] [hardware key →]
+//	Apple ID + password → [2FA →] IDS registration →
+//	[device selection → passcode →] handle selection → connected.
+//
+// Steps in brackets are conditional:
+//   - backfill choice: shown when cloudkit_backfill is enabled server-wide
+//   - hw key source: shown when default_hardware_key is set in config
+//   - hardware key input: shown when using a custom key (or no default exists)
+//   - device selection + passcode: shown only when the user opted in to backfill
 type ExternalKeyLogin struct {
-	User           *bridgev2.User
-	Main           *IMConnector
-	hardwareKey    string
-	username       string
-	cfg            *rustpushgo.WrappedOsConfig
-	conn           *rustpushgo.WrappedApsConnection
-	session        *rustpushgo.LoginSession
-	result         *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
-	handle         string                                  // chosen handle
-	devices        []rustpushgo.EscrowDeviceInfo           // escrow devices (fetched after IDS registration)
-	selectedDevice int                                     // index into devices (-1 = not yet selected)
+	User             *bridgev2.User
+	Main             *IMConnector
+	backfillChosen   bool   // true once the backfill preference step has been answered
+	cloudKitBackfill bool   // the user's backfill preference
+	hwKeySource      string // "" | hwKeySourceDefault | hwKeySourceCustom
+	hardwareKey      string
+	username         string
+	cfg              *rustpushgo.WrappedOsConfig
+	conn             *rustpushgo.WrappedApsConnection
+	session          *rustpushgo.LoginSession
+	result           *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
+	handle           string                                  // chosen handle
+	devices          []rustpushgo.EscrowDeviceInfo           // escrow devices (fetched after IDS registration)
+	selectedDevice   int                                     // index into devices (-1 = not yet selected)
 }
 
 var _ bridgev2.LoginProcessUserInput = (*ExternalKeyLogin)(nil)
@@ -276,20 +421,15 @@ var _ bridgev2.LoginProcessUserInput = (*ExternalKeyLogin)(nil)
 func (l *ExternalKeyLogin) Cancel() {}
 
 func (l *ExternalKeyLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
-	return &bridgev2.LoginStep{
-		Type:   bridgev2.LoginStepTypeUserInput,
-		StepID: LoginStepExternalKey,
-		Instructions: "Enter your hardware key (base64-encoded JSON).\n\n" +
-			"This is extracted once from a real Mac using the key extraction tool.\n" +
-			"It contains hardware identifiers needed for iMessage registration.",
-		UserInputParams: &bridgev2.LoginUserInputParams{
-			Fields: []bridgev2.LoginInputDataField{{
-				Type: bridgev2.LoginInputFieldTypePassword,
-				ID:   "hardware_key",
-				Name: "Hardware Key (base64)",
-			}},
-		},
-	}, nil
+	// When cloudkit_backfill is disabled server-wide, skip the choice step —
+	// behaviour is identical to before this change.
+	if !l.Main.Config.CloudKitBackfill {
+		l.backfillChosen = true
+		l.cloudKitBackfill = false
+		return l.nextHardwareKeyStep(), nil
+	}
+
+	return backfillChoiceStep(), nil
 }
 
 func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
@@ -303,57 +443,44 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		return l.handleDeviceSelection(device)
 	}
 
-	// Handle selection step (after device passcode)
+	// Handle selection step (after device passcode or when backfill is skipped)
 	if l.result != nil {
 		l.handle = input["handle"]
 		return l.completeLogin(ctx)
 	}
 
-	// Step 1: Hardware key
+	// Backfill choice step — only reached when cloudkit_backfill is enabled server-wide.
+	if !l.backfillChosen {
+		l.backfillChosen = true
+		l.cloudKitBackfill = input["backfill"] == backfillOptionYes
+		return l.nextHardwareKeyStep(), nil
+	}
+
+	// Hardware key steps — cfg being nil means we haven't accepted a key yet.
 	if l.cfg == nil {
+		// If the server has a default key and the user hasn't chosen a source yet,
+		// process the source selection answer.
+		if l.Main.Config.DefaultHardwareKey != "" && l.hwKeySource == "" {
+			l.hwKeySource = input["hw_key_source"]
+			if l.hwKeySource == hwKeySourceDefault {
+				l.hardwareKey = stripNonBase64(l.Main.Config.DefaultHardwareKey)
+				return l.createConfigAndConnect()
+			}
+			// User chose to provide their own key — show the input step.
+			return hwKeyInputStep(), nil
+		}
+
+		// No default key configured, or user already chose "provide my own" —
+		// accept the hardware key input.
 		hwKey := input["hardware_key"]
 		if hwKey == "" {
 			return nil, fmt.Errorf("hardware key is required")
 		}
 		l.hardwareKey = stripNonBase64(hwKey)
-
-		rustpushgo.InitLogger()
-
-		cfg, err := rustpushgo.CreateConfigFromHardwareKey(l.hardwareKey)
-		if err != nil {
-			return nil, fmt.Errorf("invalid hardware key: %w", err)
-		}
-		l.cfg = cfg
-
-		// Reuse existing session state if available and keystore matches
-		extLog := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
-		session := loadCachedSession(l.User, extLog)
-		if !session.validate(extLog) {
-			session = nil
-		}
-		apsState := getExistingAPSState(session, extLog)
-		l.conn = rustpushgo.Connect(cfg, apsState)
-
-		return &bridgev2.LoginStep{
-			Type:   bridgev2.LoginStepTypeUserInput,
-			StepID: LoginStepAppleIDPassword,
-			Instructions: "Enter your Apple ID credentials.\n" +
-				"Registration uses the hardware key for NAC validation (no Mac needed at runtime).",
-			UserInputParams: &bridgev2.LoginUserInputParams{
-				Fields: []bridgev2.LoginInputDataField{{
-					Type: bridgev2.LoginInputFieldTypeEmail,
-					ID:   "username",
-					Name: "Apple ID",
-				}, {
-					Type: bridgev2.LoginInputFieldTypePassword,
-					ID:   "password",
-					Name: "Password",
-				}},
-			},
-		}, nil
+		return l.createConfigAndConnect()
 	}
 
-	// Step 2: Apple ID + password
+	// Apple ID + password step
 	if l.session == nil {
 		username := input["username"]
 		if username == "" {
@@ -374,25 +501,14 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 
 		if session.Needs2fa() {
 			l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded, waiting for 2FA")
-			return &bridgev2.LoginStep{
-				Type:   bridgev2.LoginStepTypeUserInput,
-				StepID: LoginStepTwoFactor,
-				Instructions: "Enter your Apple ID verification code.\n\n" +
-					"You may see a notification on your trusted Apple devices.",
-				UserInputParams: &bridgev2.LoginUserInputParams{
-					Fields: []bridgev2.LoginInputDataField{{
-						ID:   "code",
-						Name: "2FA Code",
-					}},
-				},
-			}, nil
+			return twoFactorStepShort(), nil
 		}
 
 		l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded without 2FA")
 		return l.finishLogin(ctx)
 	}
 
-	// Step 3: 2FA code
+	// 2FA step
 	code := input["code"]
 	if code == "" {
 		return nil, fmt.Errorf("2FA code is required")
@@ -409,16 +525,47 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 	return l.finishLogin(ctx)
 }
 
+// nextHardwareKeyStep returns the appropriate first hardware-key step:
+// the source-selection step when a default key is available, or the direct
+// key-input step otherwise.
+func (l *ExternalKeyLogin) nextHardwareKeyStep() *bridgev2.LoginStep {
+	if l.Main.Config.DefaultHardwareKey != "" {
+		return hwKeySourceStep()
+	}
+	return hwKeyInputStep()
+}
+
+// createConfigAndConnect initialises the NAC config from the accepted hardware
+// key, creates the APS connection, and returns the Apple ID + password step.
+// It is called from two paths: default key and custom key.
+func (l *ExternalKeyLogin) createConfigAndConnect() (*bridgev2.LoginStep, error) {
+	rustpushgo.InitLogger()
+
+	cfg, err := rustpushgo.CreateConfigFromHardwareKey(l.hardwareKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid hardware key: %w", err)
+	}
+	l.cfg = cfg
+
+	extLog := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
+	session := loadCachedSession(l.User, extLog)
+	if !session.validate(extLog) {
+		session = nil
+	}
+	apsState := getExistingAPSState(session, extLog)
+	l.conn = rustpushgo.Connect(cfg, apsState)
+
+	return appleIDPasswordStep("Registration uses the hardware key for NAC validation (no Mac needed at runtime)."), nil
+}
+
 func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
 	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
 
-	// Reuse existing session state if available and keystore matches
 	session := loadCachedSession(l.User, log)
 	if !session.validate(log) {
 		session = nil
 	}
 
-	// Reuse existing identity if available (avoids "new Mac" notifications)
 	var existingIdentityArg **rustpushgo.WrappedIdsngmIdentity
 	if existing := getExistingIdentity(session, log); existing != nil {
 		existingIdentityArg = &existing
@@ -426,7 +573,6 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 		log.Info().Msg("No existing identity found, will generate new one (first login)")
 	}
 
-	// Reuse existing IDS users/registration if available (avoids register() call)
 	var existingUsersArg **rustpushgo.WrappedIdsUsers
 	if existing := getExistingUsers(session, log); existing != nil {
 		existingUsersArg = &existing
@@ -442,10 +588,11 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 	l.result = &result
 	l.selectedDevice = -1
 
-	// Skip device selection and passcode when CloudKit backfill is disabled —
-	// iCloud Keychain is only needed for decrypting CloudKit message records.
-	if !l.Main.Config.CloudKitBackfill {
-		log.Info().Msg("CloudKit backfill disabled, skipping device selection and passcode")
+	// Device selection and passcode are only needed to join the iCloud Keychain
+	// trust circle for CloudKit record decryption. Skip them when the user has
+	// not opted in to backfill.
+	if !l.cloudKitBackfill {
+		log.Info().Msg("CloudKit backfill not enabled for this user, skipping device selection and passcode")
 		handles := l.result.Users.GetHandles()
 		if step := handleSelectionStep(handles); step != nil {
 			return step, nil
@@ -482,13 +629,14 @@ func (l *ExternalKeyLogin) handlePasscodeAndContinue(ctx context.Context, passco
 
 func (l *ExternalKeyLogin) completeLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
 	meta := &UserLoginMetadata{
-		Platform:        "rustpush-external-key",
-		APSState:        l.conn.State().ToString(),
-		IDSUsers:        l.result.Users.ToString(),
-		IDSIdentity:     l.result.Identity.ToString(),
-		DeviceID:        l.cfg.GetDeviceId(),
-		HardwareKey:     l.hardwareKey,
-		PreferredHandle: l.handle,
+		Platform:         "rustpush-external-key",
+		APSState:         l.conn.State().ToString(),
+		IDSUsers:         l.result.Users.ToString(),
+		IDSIdentity:      l.result.Identity.ToString(),
+		DeviceID:         l.cfg.GetDeviceId(),
+		HardwareKey:      l.hardwareKey,
+		PreferredHandle:  l.handle,
+		CloudKitBackfill: l.cloudKitBackfill,
 	}
 
 	return completeLoginWithMeta(ctx, l.User, l.Main, l.username, l.cfg, l.conn, l.result, meta)
@@ -527,18 +675,6 @@ func loadCachedSession(user *bridgev2.User, log zerolog.Logger) *cachedSessionSt
 					source:          "database",
 				}
 			}
-		}
-	}
-	// Fall back to session file (survives DB resets)
-	state := loadSessionState(log)
-	if state.IDSIdentity != "" || state.APSState != "" || state.IDSUsers != "" {
-		log.Info().Msg("Found existing session state in backup file")
-		return &cachedSessionState{
-			IDSIdentity:     state.IDSIdentity,
-			APSState:        state.APSState,
-			IDSUsers:        state.IDSUsers,
-			PreferredHandle: state.PreferredHandle,
-			source:          "backup file",
 		}
 	}
 	return nil
@@ -790,7 +926,6 @@ func completeLoginWithMeta(
 		meta.AccountDSID = result.AccountPersist.Dsid
 		meta.AccountSPDBase64 = result.AccountPersist.SpdBase64
 		log.Info().Str("dsid", meta.AccountDSID).Msg("iCloud account credentials available for TokenProvider")
-		// Also capture the MobileMe delegate so it can be seeded on restore
 		if result.TokenProvider != nil && *result.TokenProvider != nil {
 			tp := *result.TokenProvider
 			if delegateJSON, mmeErr := tp.GetMmeDelegateJson(); mmeErr == nil && delegateJSON != nil {
@@ -802,44 +937,26 @@ func completeLoginWithMeta(
 		log.Warn().Msg("No account persist data from login — cloud services will not be available")
 	}
 
-	// Persist full session state to backup file so it survives DB resets.
-	saveSessionState(log, PersistedSessionState{
-		IDSIdentity:              meta.IDSIdentity,
-		APSState:                 meta.APSState,
-		IDSUsers:                 meta.IDSUsers,
-		PreferredHandle:          meta.PreferredHandle,
-		Platform:                 meta.Platform,
-		HardwareKey:              meta.HardwareKey,
-		DeviceID:                 meta.DeviceID,
-		AccountUsername:          meta.AccountUsername,
-		AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
-		AccountPET:               meta.AccountPET,
-		AccountADSID:             meta.AccountADSID,
-		AccountDSID:              meta.AccountDSID,
-		AccountSPDBase64:         meta.AccountSPDBase64,
-		MmeDelegateJSON:          meta.MmeDelegateJSON,
-	})
-
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))
 
 	client := &IMClient{
-		Main:               main,
-		config:             cfg,
-		users:              result.Users,
-		identity:           result.Identity,
-		connection:         conn,
-		tokenProvider:      result.TokenProvider,
-		contactsReady:      false,
-		contactsReadyCh:    make(chan struct{}),
-		cloudStore:         newCloudBackfillStore(main.Bridge.DB.Database, loginID),
+		Main:                  main,
+		config:                cfg,
+		users:                 result.Users,
+		identity:              result.Identity,
+		connection:            conn,
+		tokenProvider:         result.TokenProvider,
+		contactsReady:         false,
+		contactsReadyCh:       make(chan struct{}),
+		cloudStore:            newCloudBackfillStore(main.Bridge.DB.Database, loginID),
 		recentUnsends:         make(map[string]time.Time),
 		recentOutboundUnsends: make(map[string]time.Time),
 		smsPortals:            make(map[string]bool),
-		imGroupNames:        make(map[string]string),
-		imGroupGuids:        make(map[string]string),
-		imGroupParticipants: make(map[string][]string),
-		gidAliases:          make(map[string]string),
-		lastGroupForMember:  make(map[string]networkid.PortalKey),
+		imGroupNames:          make(map[string]string),
+		imGroupGuids:          make(map[string]string),
+		imGroupParticipants:   make(map[string][]string),
+		gidAliases:            make(map[string]string),
+		lastGroupForMember:    make(map[string]networkid.PortalKey),
 	}
 
 	ul, err := user.NewLogin(ctx, &database.UserLogin{

@@ -1,0 +1,30 @@
+# Rust/Go build artifacts
+**/target/
+*.a
+mautrix-imessage-v2
+mautrix-imessage-v2.app/
+extract-key
+.build-commit
+
+# Runtime and config files (not needed at build time)
+data/
+state/
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.yaml
+*.session
+*.json
+
+# Git and CI
+.git
+.github
+
+# macOS / IDE
+.DS_Store
+.idea
+prompts/
+_todo/
+docs/
+tools/apl/

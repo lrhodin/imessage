@@ -147,6 +147,49 @@ To bridge SMS (green bubble) messages, enable forwarding on your iPhone:
 
 **Settings → Messages → Text Message Forwarding** → toggle on the bridge device.
 
+### Contact Sync
+
+By default, the bridge resolves contact names and avatars from your iCloud account (the Apple ID you logged in with). To use **Google Contacts or another CardDAV provider** instead, run the setup command in a DM with the bridge bot:
+
+```
+!im carddav setup
+```
+
+This starts an interactive flow — choose your provider, enter credentials, and the bridge will auto-discover the server and sync your contacts immediately.
+
+**Supported providers:** Google Contacts, Fastmail, Yahoo, Nextcloud, Radicale, and any standard CardDAV server.
+
+#### Google Contacts
+
+Google requires an **App Password** (not your regular Google password):
+
+1. Go to [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
+2. Sign in to your Google account
+3. Create a new app password — choose **Other** as the app type
+4. Copy the 16-character password
+
+⚠️ 2-Step Verification must be enabled on your Google account before app passwords are available.
+
+Run `!im carddav setup google` and the bot will walk you through the rest.
+
+#### Other providers
+
+```
+!im carddav setup fastmail          # Fastmail
+!im carddav setup yahoo             # Yahoo
+!im carddav setup https://dav.example.com/  # Custom CardDAV URL
+```
+
+#### Managing contact sync
+
+```
+!im carddav status     # Show current config and last sync time
+!im carddav sync       # Force re-sync contacts now
+!im carddav remove     # Unlink CardDAV account (reverts to iCloud)
+```
+
+Contacts are re-synced automatically every 15 minutes. Credentials are stored encrypted per user — each person using the bridge has their own independent contact source.
+
 ### Chatting
 
 Incoming iMessages automatically create Matrix rooms. If Full Disk Access is granted (macOS), existing conversations from Messages.app are also synced.

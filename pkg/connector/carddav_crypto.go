@@ -1,82 +1,34 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
 //
-// AES-256-GCM encryption for CardDAV credentials stored in config.
-// The encryption key is a random 32-byte file stored alongside session data.
+// AES-256-GCM encryption for per-user CardDAV credentials stored in the DB.
+// The encryption key is derived deterministically from the bridge AS token
+// and the user login ID via HMAC-SHA256, so no key storage is needed.
 
 package connector
 
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"os"
-	"path/filepath"
 )
 
-const cardDAVKeyFileName = "carddav.key"
-
-// cardDAVKeyDir returns the session data directory where the encryption key is stored.
-func cardDAVKeyDir() string {
-	dir := os.Getenv("XDG_DATA_HOME")
-	if dir == "" {
-		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".local", "share")
-	}
-	return filepath.Join(dir, "mautrix-imessage")
+// DeriveCardDAVKey derives a 32-byte AES-256 key for a specific user login.
+// Uses HMAC-SHA256 keyed by the bridge AS token with the user login ID as
+// the message. Deterministic — no on-disk key storage needed.
+func DeriveCardDAVKey(bridgeASToken, userLoginID string) []byte {
+	mac := hmac.New(sha256.New, []byte(bridgeASToken))
+	mac.Write([]byte(userLoginID))
+	return mac.Sum(nil) // 32 bytes — perfect for AES-256
 }
 
-// cardDAVKeyPath returns the full path to the CardDAV encryption key file.
-func cardDAVKeyPath() string {
-	return filepath.Join(cardDAVKeyDir(), cardDAVKeyFileName)
-}
-
-// generateCardDAVKey creates a new random 32-byte AES-256 key and saves it.
-// Returns the key bytes. If the key file already exists, it is overwritten.
-func generateCardDAVKey() ([]byte, error) {
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("failed to generate random key: %w", err)
-	}
-
-	dir := cardDAVKeyDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create key directory: %w", err)
-	}
-
-	if err := os.WriteFile(cardDAVKeyPath(), key, 0600); err != nil {
-		return nil, fmt.Errorf("failed to write key file: %w", err)
-	}
-
-	return key, nil
-}
-
-// loadCardDAVKey reads the AES-256 key from the session data directory.
-func loadCardDAVKey() ([]byte, error) {
-	key, err := os.ReadFile(cardDAVKeyPath())
-	if err != nil {
-		return nil, fmt.Errorf("failed to read CardDAV key file (%s): %w", cardDAVKeyPath(), err)
-	}
-	if len(key) != 32 {
-		return nil, fmt.Errorf("CardDAV key file has wrong size: %d (expected 32)", len(key))
-	}
-	return key, nil
-}
-
-// EncryptCardDAVPassword encrypts a password using AES-256-GCM.
-// Generates a new key if one doesn't exist. Returns base64-encoded ciphertext.
-func EncryptCardDAVPassword(password string) (string, error) {
-	// Try to load existing key, generate if missing
-	key, err := loadCardDAVKey()
-	if err != nil {
-		key, err = generateCardDAVKey()
-		if err != nil {
-			return "", err
-		}
-	}
-
+// EncryptCardDAVPassword encrypts a plaintext password with AES-256-GCM.
+// Returns base64-encoded ciphertext with the nonce prepended.
+func EncryptCardDAVPassword(key []byte, password string) (string, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", fmt.Errorf("failed to create cipher: %w", err)
@@ -92,18 +44,13 @@ func EncryptCardDAVPassword(password string) (string, error) {
 		return "", fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
-	// Seal: nonce is prepended to ciphertext
+	// Seal prepends nonce to ciphertext
 	ciphertext := gcm.Seal(nonce, nonce, []byte(password), nil)
 	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
 // DecryptCardDAVPassword decrypts a base64-encoded AES-256-GCM ciphertext.
-func DecryptCardDAVPassword(encrypted string) (string, error) {
-	key, err := loadCardDAVKey()
-	if err != nil {
-		return "", err
-	}
-
+func DecryptCardDAVPassword(key []byte, encrypted string) (string, error) {
 	ciphertext, err := base64.StdEncoding.DecodeString(encrypted)
 	if err != nil {
 		return "", fmt.Errorf("failed to decode base64: %w", err)

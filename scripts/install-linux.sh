@@ -399,20 +399,21 @@ else
     NEEDS_LOGIN=true
 fi
 
-# Require re-login if keychain trust-circle state is missing.
+# Require re-login if keychain trust-circle state is missing (CloudKit only).
 # This catches upgrades from pre-keychain versions where the device-passcode
-# step was never run. If trustedpeers.plist exists with a user_identity, the
-# keychain was joined successfully and any transient PCS errors are harmless.
+# step was never run. Each user gets a per-DSID trustedpeers file; check all
+# of them. Only applies when cloudkit_backfill is enabled in the config.
 SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
-TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
-if [ "$NEEDS_LOGIN" = "false" ]; then
+CLOUDKIT_ENABLED=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
+if [ "$NEEDS_LOGIN" = "false" ] && [ "$CLOUDKIT_ENABLED" = "true" ]; then
     HAS_CLIQUE=false
-    if [ -f "$TRUSTEDPEERS_FILE" ]; then
-        if grep -q "<key>userIdentity</key>\|<key>user_identity</key>" "$TRUSTEDPEERS_FILE" 2>/dev/null; then
+    for tp_file in "$SESSION_DIR"/trustedpeers_*.plist; do
+        if [ -f "$tp_file" ] && grep -q "<key>userIdentity</key>\|<key>user_identity</key>" "$tp_file" 2>/dev/null; then
             HAS_CLIQUE=true
+            break
         fi
-    fi
+    done
 
     if [ "$HAS_CLIQUE" != "true" ]; then
         echo "⚠ Existing login found, but keychain trust-circle is not initialized."
@@ -438,7 +439,7 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
         echo "Clearing stale local state before login..."
         rm -f "$DB_URI" "$DB_URI-wal" "$DB_URI-shm"
-        rm -f "$SESSION_DIR/session.json" "$SESSION_DIR/identity.plist" "$SESSION_DIR/trustedpeers.plist"
+        rm -f "$SESSION_DIR"/trustedpeers_*.plist
     fi
 
     # Run login from DATA_DIR so that relative paths (state/anisette/)
@@ -447,74 +448,15 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     echo ""
 fi
 
-# ── Preferred handle (runs every time, can reconfigure) ────────
-HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
-CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" | tr -d ' ' || true)
-
-# Try to recover from backups if not set in config
-if [ -z "$CURRENT_HANDLE" ]; then
-    if command -v sqlite3 >/dev/null 2>&1 && [ -n "${DB_URI:-}" ] && [ -f "${DB_URI:-}" ]; then
-        CURRENT_HANDLE=$(sqlite3 "$DB_URI" "SELECT json_extract(metadata, '$.preferred_handle') FROM user_login LIMIT 1;" 2>/dev/null || true)
-    fi
-    if [ -z "$CURRENT_HANDLE" ] && [ -f "$SESSION_DIR/session.json" ] && command -v python3 >/dev/null 2>&1; then
-        CURRENT_HANDLE=$(python3 -c "import json; print(json.load(open('$SESSION_DIR/session.json')).get('preferred_handle',''))" 2>/dev/null || true)
-    fi
-    if [ -z "$CURRENT_HANDLE" ] && [ -f "$HANDLE_BACKUP" ]; then
-        CURRENT_HANDLE=$(cat "$HANDLE_BACKUP")
-    fi
+# ── Preferred handle ──────────────────────────────────────────
+# The handle is set during the login flow and stored in the database.
+# To change it after login, use the !im set-handle command in Matrix.
+CURRENT_HANDLE=""
+if command -v sqlite3 >/dev/null 2>&1 && [ -n "${DB_URI:-}" ] && [ -f "${DB_URI:-}" ]; then
+    CURRENT_HANDLE=$(sqlite3 "$DB_URI" "SELECT json_extract(metadata, '$.preferred_handle') FROM user_login LIMIT 1;" 2>/dev/null || true)
 fi
-
-# Skip interactive prompt if login just ran (login flow already asked)
-if [ -t 0 ] && [ "$NEEDS_LOGIN" = "false" ]; then
-    # Get available handles from session state (available after login)
-    AVAILABLE_HANDLES=$("$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
-    if [ -n "$AVAILABLE_HANDLES" ]; then
-        echo ""
-        echo "Preferred handle (your iMessage sender address):"
-        i=1
-        declare -a HANDLE_LIST=()
-        while IFS= read -r h; do
-            MARKER=""
-            if [ "$h" = "$CURRENT_HANDLE" ]; then
-                MARKER=" (current)"
-            fi
-            echo "  $i) $h$MARKER"
-            HANDLE_LIST+=("$h")
-            i=$((i + 1))
-        done <<< "$AVAILABLE_HANDLES"
-
-        if [ -n "$CURRENT_HANDLE" ]; then
-            read -p "Choice [keep current]: " HANDLE_CHOICE
-        else
-            read -p "Choice [1]: " HANDLE_CHOICE
-        fi
-
-        if [ -n "$HANDLE_CHOICE" ]; then
-            if [ "$HANDLE_CHOICE" -ge 1 ] 2>/dev/null && [ "$HANDLE_CHOICE" -le "${#HANDLE_LIST[@]}" ] 2>/dev/null; then
-                CURRENT_HANDLE="${HANDLE_LIST[$((HANDLE_CHOICE - 1))]}"
-            fi
-        elif [ -z "$CURRENT_HANDLE" ] && [ ${#HANDLE_LIST[@]} -gt 0 ]; then
-            CURRENT_HANDLE="${HANDLE_LIST[0]}"
-        fi
-    elif [ -n "$CURRENT_HANDLE" ]; then
-        echo ""
-        echo "Preferred handle: $CURRENT_HANDLE"
-        read -p "New handle, or Enter to keep current: " NEW_HANDLE
-        if [ -n "$NEW_HANDLE" ]; then
-            CURRENT_HANDLE="$NEW_HANDLE"
-        fi
-    fi
-fi
-
-# Write preferred handle to config (add key if missing, patch if present)
 if [ -n "${CURRENT_HANDLE:-}" ]; then
-    if grep -q 'preferred_handle:' "$CONFIG" 2>/dev/null; then
-        sed -i "s|preferred_handle: .*|preferred_handle: '$CURRENT_HANDLE'|" "$CONFIG"
-    else
-        sed -i "/^network:/a\\    preferred_handle: '$CURRENT_HANDLE'" "$CONFIG"
-    fi
     echo "✓ Preferred handle: $CURRENT_HANDLE"
-    echo "$CURRENT_HANDLE" > "$HANDLE_BACKUP"
 fi
 
 # ── Install systemd service (optional) ────────────────────────

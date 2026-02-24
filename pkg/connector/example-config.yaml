@@ -9,22 +9,8 @@ displayname_template: "{{if .FirstName}}{{.FirstName}}{{if .LastName}} {{.LastNa
 # When false (default), only real-time messages are bridged — no PIN needed.
 cloudkit_backfill: false
 
-# Override the outgoing iMessage identity (what recipients see your messages "from").
-# Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
-# Leave empty to use the handle chosen during login.
-# Available handles are logged on startup.
-preferred_handle: ""
-
-# External CardDAV server for contact name resolution.
-# Works with Google (app passwords), Nextcloud, Radicale, Fastmail, etc.
-# When configured, this is used instead of iCloud contacts.
-# Set up during install or via: ./mautrix-imessage-v2 carddav-setup
-carddav:
-    # Email address — used for auto-discovery and as default username.
-    email: ""
-    # CardDAV server URL. Leave empty to auto-discover from email.
-    url: ""
-    # Username for authentication (defaults to email if empty).
-    username: ""
-    # Encrypted app password (set by carddav-setup command).
-    password_encrypted: ""
+# Server-wide hardware key for cross-platform (non-macOS) operation.
+# When set, users can choose to use this shared key during login instead of providing their own.
+# Leave empty to require each user to supply their own hardware key (extracted from a real Mac).
+# Warning: sharing a hardware key among multiple users may cause Apple to restrict those Apple IDs.
+default_hardware_key: ""

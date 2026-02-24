@@ -152,11 +152,12 @@ func runInteractiveLogin(br *mxmain.BridgeMain) {
 		case bridgev2.LoginStepTypeUserInput:
 			input := make(map[string]string)
 			for _, field := range step.UserInputParams.Fields {
-				if strings.Contains(field.ID, "key") {
+				if len(field.Options) > 0 {
+					// Select fields always use the numbered menu regardless of ID.
+					input[field.ID] = promptSelect(field.Name, field.Options)
+				} else if strings.Contains(field.ID, "key") {
 					// Long base64 values get line-wrapped when pasted.
 					input[field.ID] = promptMultiline(field.Name)
-				} else if len(field.Options) > 0 {
-					input[field.ID] = promptSelect(field.Name, field.Options)
 				} else {
 					input[field.ID] = prompt(field.Name)
 				}

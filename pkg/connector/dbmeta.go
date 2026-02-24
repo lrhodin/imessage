@@ -36,7 +36,13 @@ type UserLoginMetadata struct {
 
 	// Hardware key for cross-platform (non-macOS) operation.
 	// Base64-encoded JSON HardwareConfig extracted from a real Mac.
+	// Copied at login time and paired to user's login — must not be changed after setup.
 	HardwareKey string `json:"hardware_key,omitempty"`
+
+	// CloudKitBackfill records whether this user opted in to CloudKit message
+	// history backfill during login. Requires the server to have cloudkit_backfill
+	// enabled. Set once at login time and not changed afterwards.
+	CloudKitBackfill bool `json:"cloudkit_backfill,omitempty"`
 
 	// PreferredHandle is the user-chosen handle for outgoing messages
 	// (e.g. "tel:+15551234567" or "mailto:user@example.com").
@@ -54,6 +60,29 @@ type UserLoginMetadata struct {
 	// Cached MobileMe delegate JSON — seeded on restore so contacts work
 	// without needing to refresh (which requires a still-valid PET).
 	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
+
+	// External CardDAV contact sync — set via the !im carddav command.
+	// When configured, this overrides iCloud contacts for this user.
+	CardDAVEmail             string `json:"carddav_email,omitempty"`
+	CardDAVURL               string `json:"carddav_url,omitempty"`
+	CardDAVUsername          string `json:"carddav_username,omitempty"`
+	CardDAVPasswordEncrypted string `json:"carddav_password_encrypted,omitempty"`
+}
+
+// CardDAVIsConfigured returns true if external CardDAV credentials are stored
+// for this user login.
+func (m *UserLoginMetadata) CardDAVIsConfigured() bool {
+	return m.CardDAVEmail != "" && m.CardDAVPasswordEncrypted != ""
+}
+
+// GetCardDAVConfig builds a CardDAVConfig from the stored login metadata.
+func (m *UserLoginMetadata) GetCardDAVConfig() CardDAVConfig {
+	return CardDAVConfig{
+		Email:             m.CardDAVEmail,
+		URL:               m.CardDAVURL,
+		Username:          m.CardDAVUsername,
+		PasswordEncrypted: m.CardDAVPasswordEncrypted,
+	}
 }
 
 func (c *IMConnector) GetDBMetaTypes() database.MetaTypes {
