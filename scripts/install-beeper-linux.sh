@@ -11,14 +11,26 @@ CONFIG="$DATA_DIR/config.yaml"
 
 # Where we build/cache bbctl
 BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bridge-manager}"
-BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/bridge-manager.git}"
-BBCTL_BRANCH="${BBCTL_BRANCH:-add-imessage-v2}"
+BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
+BBCTL_BRANCH="${BBCTL_BRANCH:-master}"
 
 echo ""
 echo "═══════════════════════════════════════════════"
 echo "  iMessage Bridge Setup (Beeper · Linux)"
 echo "═══════════════════════════════════════════════"
 echo ""
+
+# ── Migrate old bbctl (one-time) ──────────────────────────────
+# Previous versions cloned beeper/bridge-manager into BBCTL_DIR.
+# The new bbctl is built from this repo instead. Detect the old
+# clone by its remote URL and wipe it so it gets recreated cleanly.
+if [ -d "$BBCTL_DIR/.git" ]; then
+    OLD_REMOTE=$(git -C "$BBCTL_DIR" remote get-url origin 2>/dev/null || true)
+    if echo "$OLD_REMOTE" | grep -q "bridge-manager"; then
+        echo "Migrating bbctl — removing old bridge-manager clone..."
+        rm -rf "$BBCTL_DIR"
+    fi
+fi
 
 # ── Build bbctl from source ───────────────────────────────────
 BBCTL="$BBCTL_DIR/bbctl"
@@ -584,6 +596,60 @@ if [ -n "${CURRENT_HANDLE:-}" ]; then
     echo "$CURRENT_HANDLE" > "$HANDLE_BACKUP"
 fi
 
+# ── Write auto-update wrapper ─────────────────────────────────
+cat > "$DATA_DIR/start.sh" << HEADER_EOF
+#!/bin/bash
+BBCTL_DIR="$BBCTL_DIR"
+BBCTL_BRANCH="$BBCTL_BRANCH"
+BINARY="$BINARY"
+CONFIG="$CONFIG"
+HEADER_EOF
+cat >> "$DATA_DIR/start.sh" << 'BODY_EOF'
+
+# Extend PATH to find go
+export PATH="$PATH:/usr/local/go/bin:/opt/homebrew/bin:$HOME/go/bin"
+
+# ANSI helpers
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+YELLOW='\033[0;33m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+ts()   { date '+%H:%M:%S'; }
+ok()   { printf "${DIM}$(ts)${RESET}  ${GREEN}✓${RESET}  %s\n" "$*"; }
+step() { printf "${DIM}$(ts)${RESET}  ${CYAN}▶${RESET}  %s\n" "$*"; }
+warn() { printf "${DIM}$(ts)${RESET}  ${YELLOW}⚠${RESET}  %s\n" "$*"; }
+
+printf "\n  ${BOLD}iMessage Bridge${RESET}\n\n"
+
+if [ -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
+    git -C "$BBCTL_DIR" fetch origin --quiet 2>/dev/null || true
+    LOCAL=$(git -C "$BBCTL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    REMOTE=$(git -C "$BBCTL_DIR" rev-parse --short "origin/$BBCTL_BRANCH" 2>/dev/null || echo "unknown")
+    if [ "$LOCAL" != "$REMOTE" ] && [ "$LOCAL" != "unknown" ] && [ "$REMOTE" != "unknown" ]; then
+        step "Updating bbctl  $LOCAL → $REMOTE"
+        T0=$(date +%s)
+        git -C "$BBCTL_DIR" reset --hard "origin/$BBCTL_BRANCH" --quiet
+        step "Updating bridge-manager..."
+        (cd "$BBCTL_DIR" && go get github.com/beeper/bridge-manager@main && go mod tidy 2>&1) | sed 's/^/  /'
+        step "Building bbctl..."
+        (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
+        T1=$(date +%s)
+        ok "bbctl updated  ($(( T1 - T0 ))s)"
+    else
+        ok "bbctl $LOCAL"
+    fi
+elif [ -d "$BBCTL_DIR/.git" ]; then
+    warn "go not found — skipping bbctl update"
+fi
+
+step "Starting bridge..."
+exec "$BINARY" -c "$CONFIG"
+BODY_EOF
+chmod +x "$DATA_DIR/start.sh"
+
 # ── Install / update systemd service ─────────────────────────
 # Detect whether systemd user sessions work. In containers (LXC) or when
 # running as root, the user instance is often unavailable — fall back to a
@@ -618,7 +684,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$DATA_DIR
-ExecStart=$BINARY -c $CONFIG
+ExecStart=/bin/bash $DATA_DIR/start.sh
 Restart=always
 RestartSec=5
 
@@ -639,7 +705,7 @@ After=network.target
 Type=simple
 User=$USER
 WorkingDirectory=$DATA_DIR
-ExecStart=$BINARY -c $CONFIG
+ExecStart=/bin/bash $DATA_DIR/start.sh
 Restart=always
 RestartSec=5
 

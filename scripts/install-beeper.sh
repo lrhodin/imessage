@@ -13,14 +13,26 @@ PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 
 # Where we build/cache bbctl
 BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bridge-manager}"
-BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/bridge-manager.git}"
-BBCTL_BRANCH="${BBCTL_BRANCH:-add-imessage-v2}"
+BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
+BBCTL_BRANCH="${BBCTL_BRANCH:-master}"
 
 echo ""
 echo "═══════════════════════════════════════════════"
 echo "  iMessage Bridge Setup (Beeper)"
 echo "═══════════════════════════════════════════════"
 echo ""
+
+# ── Migrate old bbctl (one-time) ──────────────────────────────
+# Previous versions cloned beeper/bridge-manager into BBCTL_DIR.
+# The new bbctl is built from this repo instead. Detect the old
+# clone by its remote URL and wipe it so it gets recreated cleanly.
+if [ -d "$BBCTL_DIR/.git" ]; then
+    OLD_REMOTE=$(git -C "$BBCTL_DIR" remote get-url origin 2>/dev/null || true)
+    if echo "$OLD_REMOTE" | grep -q "bridge-manager"; then
+        echo "Migrating bbctl — removing old bridge-manager clone..."
+        rm -rf "$BBCTL_DIR"
+    fi
+fi
 
 # ── Build bbctl from source ───────────────────────────────────
 BBCTL="$BBCTL_DIR/bbctl"
@@ -672,6 +684,57 @@ DATA_ABS="$(cd "$DATA_DIR" && pwd)"
 LOG_OUT="$DATA_ABS/bridge.stdout.log"
 LOG_ERR="$DATA_ABS/bridge.stderr.log"
 
+# ── Write auto-update wrapper ─────────────────────────────────
+cat > "$DATA_ABS/start.sh" << HEADER_EOF
+#!/bin/bash
+BBCTL_DIR="$BBCTL_DIR"
+BBCTL_BRANCH="$BBCTL_BRANCH"
+BINARY="$BINARY"
+CONFIG="$CONFIG_ABS"
+HEADER_EOF
+cat >> "$DATA_ABS/start.sh" << 'BODY_EOF'
+
+# ANSI helpers
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+YELLOW='\033[0;33m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+ts()   { date '+%H:%M:%S'; }
+ok()   { printf "${DIM}$(ts)${RESET}  ${GREEN}✓${RESET}  %s\n" "$*"; }
+step() { printf "${DIM}$(ts)${RESET}  ${CYAN}▶${RESET}  %s\n" "$*"; }
+warn() { printf "${DIM}$(ts)${RESET}  ${YELLOW}⚠${RESET}  %s\n" "$*"; }
+
+printf "\n  ${BOLD}iMessage Bridge${RESET}\n\n"
+
+if [ -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
+    git -C "$BBCTL_DIR" fetch origin --quiet 2>/dev/null || true
+    LOCAL=$(git -C "$BBCTL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    REMOTE=$(git -C "$BBCTL_DIR" rev-parse --short "origin/$BBCTL_BRANCH" 2>/dev/null || echo "unknown")
+    if [ "$LOCAL" != "$REMOTE" ] && [ "$LOCAL" != "unknown" ] && [ "$REMOTE" != "unknown" ]; then
+        step "Updating bbctl  $LOCAL → $REMOTE"
+        T0=$(date +%s)
+        git -C "$BBCTL_DIR" reset --hard "origin/$BBCTL_BRANCH" --quiet
+        step "Updating bridge-manager..."
+        (cd "$BBCTL_DIR" && go get github.com/beeper/bridge-manager@main && go mod tidy 2>&1) | sed 's/^/  /'
+        step "Building bbctl..."
+        (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
+        T1=$(date +%s)
+        ok "bbctl updated  ($(( T1 - T0 ))s)"
+    else
+        ok "bbctl $LOCAL"
+    fi
+elif [ -d "$BBCTL_DIR/.git" ]; then
+    warn "go not found — skipping bbctl update"
+fi
+
+step "Starting bridge..."
+exec "$BINARY" -c "$CONFIG"
+BODY_EOF
+chmod +x "$DATA_ABS/start.sh"
+
 mkdir -p "$(dirname "$PLIST")"
 GUI_DOMAIN="gui/$(id -u)"
 launchctl bootout "$GUI_DOMAIN/$BUNDLE_ID" 2>/dev/null || true
@@ -686,9 +749,8 @@ cat > "$PLIST" << PLIST_EOF
     <string>$BUNDLE_ID</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$BINARY</string>
-        <string>-c</string>
-        <string>$CONFIG_ABS</string>
+        <string>/bin/bash</string>
+        <string>$DATA_ABS/start.sh</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DATA_ABS</string>
@@ -706,7 +768,7 @@ cat > "$PLIST" << PLIST_EOF
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/go/bin:$HOME/go/bin</string>
         <key>CGO_CFLAGS</key>
         <string>-I/opt/homebrew/include</string>
         <key>CGO_LDFLAGS</key>
