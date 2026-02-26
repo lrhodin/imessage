@@ -181,10 +181,15 @@ func cmdLogin(ctx *cli.Context) error {
 
 	envCfg := cfg.Environments.Get("prod")
 	envCfg.AccessToken = matrixResp.AccessToken
-	if apiResp.Whoami != nil {
-		envCfg.Username = apiResp.Whoami.UserInfo.Username
-		envCfg.ClusterID = apiResp.Whoami.UserInfo.BridgeClusterID
+	whoami := apiResp.Whoami
+	if whoami == nil {
+		whoami, err = beeperapi.Whoami(baseDomain, matrixResp.AccessToken)
+		if err != nil {
+			return fmt.Errorf("failed to get user details: %w", err)
+		}
 	}
+	envCfg.Username = whoami.UserInfo.Username
+	envCfg.ClusterID = whoami.UserInfo.BridgeClusterID
 	if err = cfg.Save(); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
