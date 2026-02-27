@@ -17,11 +17,18 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
+	"github.com/beeper/bridge-manager/api/beeperapi"
+
+	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/lrhodin/imessage/pkg/connector"
 )
@@ -102,5 +109,104 @@ func main() {
 		return
 	}
 
-	m.Run()
+	// Instead of m.Run(), manually call PreInit/Init/Start so we can
+	// repair broken permissions before validateConfig() runs in Init().
+	m.PreInit()
+	repairPermissions(&m)
+	m.Init()
+	m.Start()
+	exitCode := m.WaitForInterrupt()
+	m.Stop()
+	os.Exit(exitCode)
+}
+
+// repairPermissions detects and fixes broken bridge.permissions before the
+// bridge's validateConfig() rejects the config. This handles cases where
+// bbctl generated a config with an empty or invalid username, leaving
+// permissions with only example.com defaults.
+func repairPermissions(br *mxmain.BridgeMain) {
+	if br.Config == nil {
+		return
+	}
+	configured := br.Config.Bridge.Permissions.IsConfigured()
+	fmt.Fprintf(os.Stderr, "[permissions] IsConfigured=%v entries=%d\n", configured, len(br.Config.Bridge.Permissions))
+	for key := range br.Config.Bridge.Permissions {
+		fmt.Fprintf(os.Stderr, "[permissions]   %q\n", key)
+	}
+	if configured {
+		return
+	}
+
+	// Permissions are not configured — try to derive the correct MXID
+	// from bbctl's saved credentials.
+	username := loadBBCtlUsername()
+	if username == "" {
+		fmt.Fprintf(os.Stderr, "[permissions] loadBBCtlUsername returned empty — cannot repair\n")
+		return
+	}
+
+	mxid := id.NewUserID(username, "beeper.com")
+	br.Config.Bridge.Permissions[string(mxid)] = &bridgeconfig.PermissionLevelAdmin
+
+	// Also persist the fix to config.yaml so this is a one-time repair.
+	if br.ConfigPath != "" {
+		fixPermissionsOnDisk(br.ConfigPath, string(mxid))
+	}
+
+	fmt.Fprintf(os.Stderr, "Auto-repaired bridge.permissions: %s → admin\n", mxid)
+}
+
+// loadBBCtlUsername reads the username from bbctl's config.json.
+func loadBBCtlUsername() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	path := filepath.Join(configDir, "bbctl", "config.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var cfg struct {
+		Environments map[string]struct {
+			Username    string `json:"username"`
+			AccessToken string `json:"access_token"`
+		} `json:"environments"`
+	}
+	if json.Unmarshal(data, &cfg) != nil {
+		return ""
+	}
+	if prod, ok := cfg.Environments["prod"]; ok {
+		if prod.Username != "" {
+			return prod.Username
+		}
+		// Username empty but have credentials — try whoami as last resort
+		if strings.HasPrefix(prod.AccessToken, "syt_") {
+			resp, err := beeperapi.Whoami("beeper.com", prod.AccessToken)
+			if err == nil && resp.UserInfo.Username != "" {
+				return resp.UserInfo.Username
+			}
+		}
+	}
+	return ""
+}
+
+// fixPermissionsOnDisk patches the config.yaml file to replace any broken
+// admin MXID in the permissions block with the correct one.
+func fixPermissionsOnDisk(configPath string, mxid string) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	content := string(data)
+	// Replace any admin line that has an invalid/example MXID
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasSuffix(trimmed, ": admin") && (strings.Contains(trimmed, "example.com") || strings.Contains(trimmed, `"@:`) || strings.Contains(trimmed, `"@":`)) {
+			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+			lines[i] = indent + `"` + mxid + `": admin`
+		}
+	}
+	_ = os.WriteFile(configPath, []byte(strings.Join(lines, "\n")), 0600)
 }

@@ -4,6 +4,7 @@ set -euo pipefail
 BINARY="$1"
 DATA_DIR="$2"
 BUNDLE_ID="$3"
+PREBUILT_BBCTL="${4:-}"
 
 BRIDGE_NAME="${BRIDGE_NAME:-sh-imessage}"
 
@@ -11,10 +12,10 @@ BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 
-# Where we build/cache bbctl
-BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bridge-manager}"
+# Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
+BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bbctl}"
 BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
-BBCTL_BRANCH="${BBCTL_BRANCH:-master}"
+BBCTL_BRANCH="${BBCTL_BRANCH:-fix-bbctl}"
 
 echo ""
 echo "═══════════════════════════════════════════════"
@@ -25,24 +26,50 @@ echo ""
 # ── Build bbctl from source ───────────────────────────────────
 BBCTL="$BBCTL_DIR/bbctl"
 
+# Warn about old full-repo clone and offer to remove it
+OLD_BBCTL_DIR="$HOME/.local/share/mautrix-imessage/bridge-manager"
+if [ -d "$OLD_BBCTL_DIR/.git" ] && [ "$BBCTL_DIR" != "$OLD_BBCTL_DIR" ]; then
+    echo "⚠  Found old full-repo clone at $OLD_BBCTL_DIR"
+    echo "   This is no longer needed (bbctl now uses a sparse checkout)."
+    if [ -t 0 ]; then
+        read -p "   Delete it to free disk space? [Y/n]: " DEL_OLD
+        case "$DEL_OLD" in
+            [nN]*) ;;
+            *)     rm -rf "$OLD_BBCTL_DIR"
+                   echo "   ✓ Removed $OLD_BBCTL_DIR" ;;
+        esac
+    else
+        echo "   You can safely delete it: rm -rf $OLD_BBCTL_DIR"
+    fi
+fi
+
 build_bbctl() {
     echo "Building bbctl..."
     mkdir -p "$(dirname "$BBCTL_DIR")"
-    if [ -d "$BBCTL_DIR" ]; then
+    if [ -d "$BBCTL_DIR/.git" ]; then
         cd "$BBCTL_DIR"
         git fetch --quiet origin
-        git checkout --quiet "$BBCTL_BRANCH"
         git reset --hard --quiet "origin/$BBCTL_BRANCH"
     else
-        git clone --quiet --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
+        rm -rf "$BBCTL_DIR"
+        git clone --filter=blob:none --no-checkout --quiet \
+            --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
         cd "$BBCTL_DIR"
+        git sparse-checkout init --cone
+        git sparse-checkout set cmd/bbctl
+        git checkout --quiet "$BBCTL_BRANCH"
     fi
     go build -o bbctl ./cmd/bbctl/ 2>&1
     cd - >/dev/null
     echo "✓ Built bbctl"
 }
 
-if [ ! -x "$BBCTL" ]; then
+if [ -n "$PREBUILT_BBCTL" ] && [ -x "$PREBUILT_BBCTL" ]; then
+    # Install the bbctl built by `make build` into BBCTL_DIR
+    mkdir -p "$BBCTL_DIR"
+    cp "$PREBUILT_BBCTL" "$BBCTL"
+    echo "✓ Installed bbctl to $BBCTL_DIR/"
+elif [ ! -x "$BBCTL" ]; then
     build_bbctl
 else
     echo "✓ Found bbctl: $BBCTL"
@@ -67,7 +94,24 @@ if ! "$BBCTL" whoami >/dev/null 2>&1 || "$BBCTL" whoami 2>&1 | grep -qi "not log
     echo ""
     "$BBCTL" login
 fi
-WHOAMI=$("$BBCTL" whoami 2>&1 | head -1 || true)
+# Capture username (discard stderr so "Fetching whoami..." doesn't contaminate)
+WHOAMI=$("$BBCTL" whoami 2>/dev/null | head -1 || true)
+# On slow machines the Beeper API may not have the username ready yet — retry
+if [ -z "$WHOAMI" ] || [ "$WHOAMI" = "null" ]; then
+    for i in 1 2 3 4 5; do
+        echo "  Waiting for username from Beeper API (attempt $i/5)..."
+        sleep 3
+        WHOAMI=$("$BBCTL" whoami 2>/dev/null | head -1 || true)
+        [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ] && break
+    done
+fi
+if [ -z "$WHOAMI" ] || [ "$WHOAMI" = "null" ]; then
+    echo ""
+    echo "ERROR: Could not get username from Beeper API."
+    echo "  This can happen when the API is slow to propagate after login."
+    echo "  Wait a minute and re-run: make install-beeper"
+    exit 1
+fi
 echo "✓ Logged in: $WHOAMI"
 
 # ── Check for existing bridge registration ────────────────────
@@ -81,6 +125,8 @@ if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     echo "   Deleting old registration to avoid orphaned rooms..."
     "$BBCTL" delete "$BRIDGE_NAME"
     echo "✓ Old registration cleaned up"
+    echo "   Waiting for server-side deletion to complete..."
+    sleep 5
 fi
 
 # ── Generate config via bbctl ─────────────────────────────────
@@ -111,7 +157,17 @@ if [ -f "$CONFIG" ]; then
     echo "  Delete it to regenerate from Beeper."
 else
     echo "Generating Beeper config..."
-    "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME"
+    for attempt in 1 2 3 4 5; do
+        if "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME" 2>&1; then
+            break
+        fi
+        if [ "$attempt" -eq 5 ]; then
+            echo "ERROR: Failed to register appservice after $attempt attempts."
+            exit 1
+        fi
+        echo "  Retrying in 5s... (attempt $attempt/5)"
+        sleep 5
+    done
     # Make DB path absolute so it doesn't depend on working directory
     DATA_ABS_TMP="$(cd "$DATA_DIR" && pwd)"
     sed -i '' "s|uri: file:mautrix-imessage.db|uri: file:$DATA_ABS_TMP/mautrix-imessage.db|" "$CONFIG"
@@ -131,6 +187,36 @@ else
     fi
 
     echo "✓ Config saved to $CONFIG"
+fi
+
+# ── Belt-and-suspenders: fix broken permissions ───────────────
+# If bbctl generated config with an empty username, the UserID becomes
+# "@:beeper.com" which is invalid. The mautrix config upgrader then
+# replaces it with example.com defaults, causing "bridge.permissions
+# not configured". Detect BOTH patterns and fix them.
+MXID="@${WHOAMI}:beeper.com"
+PERMS_BAD=false
+if grep -q '"@:' "$CONFIG" 2>/dev/null; then
+    echo "⚠  Detected empty username in permissions (@:beeper.com) — fixing..."
+    PERMS_BAD=true
+elif grep -q '@.*example\.com' "$CONFIG" 2>/dev/null; then
+    echo "⚠  Detected example.com in permissions — fixing..."
+    PERMS_BAD=true
+fi
+if [ "$PERMS_BAD" = true ]; then
+    if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
+        sed -i '' '/permissions:/,/^[^ ]/{
+            s/"@[^"]*": admin/"'"$MXID"'": admin/
+            /@.*example\.com/d
+        }' "$CONFIG"
+        echo "✓ Fixed permissions: $MXID → admin"
+    else
+        echo ""
+        echo "ERROR: Config has broken permissions and cannot determine your username."
+        echo "  Try: $BBCTL login && rm $CONFIG && re-run make install-beeper"
+        echo ""
+        exit 1
+    fi
 fi
 
 # Ensure backfill settings are sane for existing configs
@@ -610,8 +696,22 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
 
     # Run login from the data directory so the keystore (state/keystore.plist)
     # is written to the same location the launchd service will read from.
-    (cd "$DATA_DIR" && XDG_DATA_HOME="$SESSION_DIR_BASE" "$BINARY" login -c "$CONFIG")
+    (cd "$DATA_DIR" && XDG_DATA_HOME="$SESSION_DIR_BASE" "$BINARY" login -n -c "$CONFIG")
     echo ""
+
+    # Re-check permissions after login — the config upgrader may have
+    # corrupted them even with -n if repairPermissions couldn't determine
+    # the username.
+    if grep -q '@.*example\.com' "$CONFIG" 2>/dev/null || grep -q '"@":' "$CONFIG" 2>/dev/null; then
+        if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
+            MXID="@${WHOAMI}:beeper.com"
+            sed -i '' '/permissions:/,/^[^ ]/{
+                s/"@[^"]*": admin/"'"$MXID"'": admin/
+                /@.*example\.com/d
+            }' "$CONFIG"
+            echo "✓ Fixed permissions after login: $MXID → admin"
+        fi
+    fi
 fi
 
 # ── Preferred handle (runs every time, can reconfigure) ────────
@@ -702,6 +802,7 @@ CONFIG="$CONFIG_ABS"
 export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 HEADER_EOF
 cat >> "$DATA_ABS/start.sh" << 'BODY_EOF'
+BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
 
 # ANSI helpers
 BOLD='\033[1m'
@@ -718,6 +819,23 @@ warn() { printf "${DIM}$(ts)${RESET}  ${YELLOW}⚠${RESET}  %s\n" "$*"; }
 
 printf "\n  ${BOLD}iMessage Bridge${RESET}\n\n"
 
+# Bootstrap sparse clone if it doesn't exist yet
+if [ ! -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
+    step "Setting up bbctl sparse checkout..."
+    EXISTING_BBCTL=""
+    [ -x "$BBCTL_DIR/bbctl" ] && EXISTING_BBCTL=$(mktemp)  && cp "$BBCTL_DIR/bbctl" "$EXISTING_BBCTL"
+    rm -rf "$BBCTL_DIR"
+    mkdir -p "$(dirname "$BBCTL_DIR")"
+    git clone --filter=blob:none --no-checkout --quiet \
+        --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
+    git -C "$BBCTL_DIR" sparse-checkout init --cone
+    git -C "$BBCTL_DIR" sparse-checkout set cmd/bbctl
+    git -C "$BBCTL_DIR" checkout --quiet "$BBCTL_BRANCH"
+    (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
+    [ -n "$EXISTING_BBCTL" ] && rm -f "$EXISTING_BBCTL"
+    ok "bbctl ready"
+fi
+
 LOCKDIR="$BBCTL_DIR/.update-lock"
 if [ -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
     if mkdir "$LOCKDIR" 2>/dev/null; then
@@ -729,8 +847,6 @@ if [ -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
             step "Updating bbctl  $LOCAL → $REMOTE"
             T0=$(date +%s)
             git -C "$BBCTL_DIR" reset --hard "origin/$BBCTL_BRANCH" --quiet
-            step "Updating bridge-manager..."
-            (cd "$BBCTL_DIR" && go get github.com/beeper/bridge-manager@main && go mod tidy 2>&1) | sed 's/^/  /'
             step "Building bbctl..."
             (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
             T1=$(date +%s)
@@ -747,8 +863,25 @@ elif [ -d "$BBCTL_DIR/.git" ]; then
     warn "go not found — skipping bbctl update"
 fi
 
+# Fix permissions before starting — the config upgrader may have replaced
+# the user's permissions with example.com defaults on a previous run.
+if grep -q '@.*example\.com' "$CONFIG" 2>/dev/null; then
+    BBCTL_BIN="$BBCTL_DIR/bbctl"
+    if [ -x "$BBCTL_BIN" ]; then
+        FIX_USER=$("$BBCTL_BIN" whoami 2>/dev/null | head -1 || true)
+        if [ -n "$FIX_USER" ] && [ "$FIX_USER" != "null" ]; then
+            FIX_MXID="@${FIX_USER}:beeper.com"
+            sed -i '' '/permissions:/,/^[^ ]/{
+                s/"@[^"]*": admin/"'"$FIX_MXID"'": admin/
+                /@.*example\.com/d
+            }' "$CONFIG"
+            ok "Fixed permissions: $FIX_MXID"
+        fi
+    fi
+fi
+
 step "Starting bridge..."
-exec "$BINARY" -c "$CONFIG"
+exec "$BINARY" -n -c "$CONFIG"
 BODY_EOF
 chmod +x "$DATA_ABS/start.sh"
 

@@ -60,6 +60,9 @@ func cmdConfig(ctx *cli.Context) error {
 	bridge := ctx.Args().Get(0)
 
 	envCfg := getEnvConfig(ctx)
+	if envCfg.Username == "" {
+		return fmt.Errorf("cannot generate config: username is empty (Beeper API may not have it ready yet — try again in a few seconds)")
+	}
 	hungryClient := getHungryClient(ctx)
 
 	// Register (or re-fetch) the appservice with Beeper hungryserv
