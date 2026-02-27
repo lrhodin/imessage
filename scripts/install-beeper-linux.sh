@@ -12,7 +12,7 @@ CONFIG="$DATA_DIR/config.yaml"
 # Where we build/cache bbctl
 BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bridge-manager}"
 BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
-BBCTL_BRANCH="${BBCTL_BRANCH:-master}"
+BBCTL_BRANCH="${BBCTL_BRANCH:-fix-bbctl}"
 
 echo ""
 echo "═══════════════════════════════════════════════"
