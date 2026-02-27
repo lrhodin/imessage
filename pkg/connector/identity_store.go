@@ -53,46 +53,49 @@ type PersistedSessionState struct {
 	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
 }
 
-// sessionFilePath returns the path to the persisted session state file:
-// ~/.local/share/mautrix-imessage/session.json
+// sessionDir returns the directory for session state files.
+// Uses IMESSAGE_DATA_DIR if set (for multi-instance support),
+// otherwise falls back to ~/.local/share/mautrix-imessage/.
+func sessionDir() (string, error) {
+	if dir := os.Getenv("IMESSAGE_DATA_DIR"); dir != "" {
+		return dir, nil
+	}
+	dataDir := os.Getenv("XDG_DATA_HOME")
+	if dataDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		dataDir = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(dataDir, "mautrix-imessage"), nil
+}
+
+// sessionFilePath returns the path to the persisted session state file.
 func sessionFilePath() (string, error) {
-	dataDir := os.Getenv("XDG_DATA_HOME")
-	if dataDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		dataDir = filepath.Join(home, ".local", "share")
+	dir, err := sessionDir()
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(dataDir, "mautrix-imessage", "session.json"), nil
+	return filepath.Join(dir, "session.json"), nil
 }
 
-// legacyIdentityFilePath returns the old v1 identity file path for migration:
-// ~/.local/share/mautrix-imessage/identity.plist
+// legacyIdentityFilePath returns the old v1 identity file path for migration.
 func legacyIdentityFilePath() (string, error) {
-	dataDir := os.Getenv("XDG_DATA_HOME")
-	if dataDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		dataDir = filepath.Join(home, ".local", "share")
+	dir, err := sessionDir()
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(dataDir, "mautrix-imessage", "identity.plist"), nil
+	return filepath.Join(dir, "identity.plist"), nil
 }
 
-// trustedPeersFilePath returns the keychain trust state path:
-// ~/.local/share/mautrix-imessage/trustedpeers.plist
+// trustedPeersFilePath returns the keychain trust state path.
 func trustedPeersFilePath() (string, error) {
-	dataDir := os.Getenv("XDG_DATA_HOME")
-	if dataDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		dataDir = filepath.Join(home, ".local", "share")
+	dir, err := sessionDir()
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(dataDir, "mautrix-imessage", "trustedpeers.plist"), nil
+	return filepath.Join(dir, "trustedpeers.plist"), nil
 }
 
 // hasKeychainCliqueState returns true if trustedpeers.plist appears to contain

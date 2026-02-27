@@ -6,6 +6,14 @@ DATA_DIR="$2"
 
 BRIDGE_NAME="${BRIDGE_NAME:-sh-imessage}"
 
+# Derive a unique systemd service name from BRIDGE_NAME for multi-instance support.
+SERVICE_NAME="mautrix-imessage"
+if [ "$BRIDGE_NAME" != "sh-imessage" ]; then
+    # e.g. sh-imessage-1 → mautrix-imessage-1
+    INSTANCE_SUFFIX="${BRIDGE_NAME#sh-imessage}"
+    SERVICE_NAME="mautrix-imessage${INSTANCE_SUFFIX}"
+fi
+
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 
@@ -100,6 +108,11 @@ else
     sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
     # Use 1s between batches — fast enough for backfill, prevents idle hot-loop
     sed -i 's/batch_delay: [0-9]*/batch_delay: 1/' "$CONFIG"
+    # Patch appservice port for multi-instance support
+    if [ -n "${BRIDGE_PORT:-}" ]; then
+        sed -i "s/port: 4000/port: $BRIDGE_PORT/" "$CONFIG"
+    fi
+
     echo "✓ Config saved to $CONFIG"
 fi
 
@@ -393,7 +406,7 @@ open('$CONFIG', 'w').write(text)
             if [ -n "$CARDDAV_USERNAME" ]; then
                 CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
             fi
-            CARDDAV_JSON=$("$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
+            CARDDAV_JSON=$(IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
 
             if [ -z "$CARDDAV_JSON" ]; then
                 echo "⚠  CardDAV setup failed. You can configure it manually in $CONFIG"
@@ -442,7 +455,12 @@ fi
 DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
 NEEDS_LOGIN=false
 
-SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+# Session dir matches Go sessionDir(): IMESSAGE_DATA_DIR if set, else XDG default
+if [ -n "${IMESSAGE_DATA_DIR:-}" ]; then
+    SESSION_DIR="$IMESSAGE_DATA_DIR"
+else
+    SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+fi
 SESSION_FILE="$SESSION_DIR/session.json"
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
     # DB missing — check if session.json can auto-restore (has hardware_key)
@@ -496,10 +514,10 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     echo "└─────────────────────────────────────────────────┘"
     echo ""
     # Stop the bridge if running (otherwise it holds the DB lock)
-    if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
-        systemctl --user stop mautrix-imessage
-    elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-        sudo systemctl stop mautrix-imessage
+    if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        systemctl --user stop "$SERVICE_NAME"
+    elif systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        sudo systemctl stop "$SERVICE_NAME"
     fi
 
     if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
@@ -510,7 +528,7 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
 
     # Run login from DATA_DIR so that relative paths (state/anisette/)
     # resolve to the same location as when systemd runs the bridge.
-    (cd "$DATA_DIR" && "$BINARY" login -c "$CONFIG")
+    (cd "$DATA_DIR" && IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" login -c "$CONFIG")
     echo ""
 fi
 
@@ -534,7 +552,7 @@ fi
 # Skip interactive prompt if login just ran (login flow already asked)
 if [ -t 0 ] && [ "$NEEDS_LOGIN" = "false" ]; then
     # Get available handles from session state (available after login)
-    AVAILABLE_HANDLES=$("$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
+    AVAILABLE_HANDLES=$(IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
     if [ -n "$AVAILABLE_HANDLES" ]; then
         echo ""
         echo "Preferred handle (your iMessage sender address):"
@@ -591,6 +609,7 @@ BBCTL_DIR="$BBCTL_DIR"
 BBCTL_BRANCH="$BBCTL_BRANCH"
 BINARY="$BINARY"
 CONFIG="$CONFIG"
+export IMESSAGE_DATA_DIR="$DATA_DIR"
 HEADER_EOF
 cat >> "$DATA_DIR/start.sh" << 'BODY_EOF'
 
@@ -642,8 +661,8 @@ chmod +x "$DATA_DIR/start.sh"
 # Detect whether systemd user sessions work. In containers (LXC) or when
 # running as root, the user instance is often unavailable — fall back to a
 # system-level service in that case.
-USER_SERVICE_FILE="$HOME/.config/systemd/user/mautrix-imessage.service"
-SYSTEM_SERVICE_FILE="/etc/systemd/system/mautrix-imessage.service"
+USER_SERVICE_FILE="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
+SYSTEM_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 if command -v systemctl >/dev/null 2>&1; then
     if systemctl --user status >/dev/null 2>&1; then
@@ -666,12 +685,13 @@ install_systemd_user() {
     mkdir -p "$(dirname "$USER_SERVICE_FILE")"
     cat > "$USER_SERVICE_FILE" << EOF
 [Unit]
-Description=mautrix-imessage bridge (Beeper)
+Description=mautrix-imessage bridge (Beeper) — $BRIDGE_NAME
 After=network.target
 
 [Service]
 Type=simple
 WorkingDirectory=$DATA_DIR
+Environment=IMESSAGE_DATA_DIR=$DATA_DIR
 ExecStart=/bin/bash $DATA_DIR/start.sh
 Restart=always
 RestartSec=5
@@ -680,19 +700,20 @@ RestartSec=5
 WantedBy=default.target
 EOF
     systemctl --user daemon-reload
-    systemctl --user enable mautrix-imessage
+    systemctl --user enable "$SERVICE_NAME"
 }
 
 install_systemd_system() {
     cat > "$SYSTEM_SERVICE_FILE" << EOF
 [Unit]
-Description=mautrix-imessage bridge (Beeper)
+Description=mautrix-imessage bridge (Beeper) — $BRIDGE_NAME
 After=network.target
 
 [Service]
 Type=simple
 User=$USER
 WorkingDirectory=$DATA_DIR
+Environment=IMESSAGE_DATA_DIR=$DATA_DIR
 ExecStart=/bin/bash $DATA_DIR/start.sh
 Restart=always
 RestartSec=5
@@ -701,13 +722,13 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable mautrix-imessage
+    systemctl enable "$SERVICE_NAME"
 }
 
 if [ "$SYSTEMD_MODE" = "user" ]; then
     if [ -f "$USER_SERVICE_FILE" ]; then
         install_systemd_user
-        systemctl --user restart mautrix-imessage
+        systemctl --user restart "$SERVICE_NAME"
         echo "✓ Bridge restarted"
     else
         echo ""
@@ -715,14 +736,14 @@ if [ "$SYSTEMD_MODE" = "user" ]; then
         case "$answer" in
             [nN]*) ;;
             *)     install_systemd_user
-                   systemctl --user start mautrix-imessage
+                   systemctl --user start "$SERVICE_NAME"
                    echo "✓ Bridge started (systemd user service installed)" ;;
         esac
     fi
 elif [ "$SYSTEMD_MODE" = "system" ]; then
     if [ -f "$SYSTEM_SERVICE_FILE" ]; then
         install_systemd_system
-        systemctl restart mautrix-imessage
+        systemctl restart "$SERVICE_NAME"
         echo "✓ Bridge restarted"
     else
         echo ""
@@ -731,7 +752,7 @@ elif [ "$SYSTEMD_MODE" = "system" ]; then
         case "$answer" in
             [nN]*) ;;
             *)     install_systemd_system
-                   systemctl start mautrix-imessage
+                   systemctl start "$SERVICE_NAME"
                    echo "✓ Bridge started (system service installed)" ;;
         esac
     fi
@@ -746,15 +767,15 @@ echo "  Binary: $BINARY"
 echo "  Config: $CONFIG"
 echo ""
 if [ "$SYSTEMD_MODE" = "user" ] && [ -f "$USER_SERVICE_FILE" ]; then
-    echo "  Status:  systemctl --user status mautrix-imessage"
-    echo "  Logs:    journalctl --user -u mautrix-imessage -f"
-    echo "  Stop:    systemctl --user stop mautrix-imessage"
-    echo "  Restart: systemctl --user restart mautrix-imessage"
+    echo "  Status:  systemctl --user status $SERVICE_NAME"
+    echo "  Logs:    journalctl --user -u $SERVICE_NAME -f"
+    echo "  Stop:    systemctl --user stop $SERVICE_NAME"
+    echo "  Restart: systemctl --user restart $SERVICE_NAME"
 elif [ "$SYSTEMD_MODE" = "system" ] && [ -f "$SYSTEM_SERVICE_FILE" ]; then
-    echo "  Status:  systemctl status mautrix-imessage"
-    echo "  Logs:    journalctl -u mautrix-imessage -f"
-    echo "  Stop:    systemctl stop mautrix-imessage"
-    echo "  Restart: systemctl restart mautrix-imessage"
+    echo "  Status:  systemctl status $SERVICE_NAME"
+    echo "  Logs:    journalctl -u $SERVICE_NAME -f"
+    echo "  Stop:    systemctl stop $SERVICE_NAME"
+    echo "  Restart: systemctl restart $SERVICE_NAME"
 else
     echo "  Run manually:"
     echo "    cd $(dirname "$CONFIG") && $BINARY -c $CONFIG"

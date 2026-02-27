@@ -125,6 +125,11 @@ else
     # Use 1s between batches — fast enough for backfill, prevents idle hot-loop
     sed -i '' 's/batch_delay: [0-9]*/batch_delay: 1/' "$CONFIG"
 
+    # Patch appservice port for multi-instance support
+    if [ -n "${BRIDGE_PORT:-}" ]; then
+        sed -i '' "s/port: 4000/port: $BRIDGE_PORT/" "$CONFIG"
+    fi
+
     echo "✓ Config saved to $CONFIG"
 fi
 
@@ -470,7 +475,7 @@ open('$CONFIG', 'w').write(text)
             if [ -n "$CARDDAV_USERNAME" ]; then
                 CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
             fi
-            CARDDAV_JSON=$("$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
+            CARDDAV_JSON=$(IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
 
             if [ -z "$CARDDAV_JSON" ]; then
                 echo "⚠  CardDAV setup failed. You can configure it manually in $CONFIG"
@@ -519,7 +524,12 @@ fi
 DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
 NEEDS_LOGIN=false
 
-SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+# Session dir matches Go sessionDir(): IMESSAGE_DATA_DIR if set, else XDG default
+if [ -n "${IMESSAGE_DATA_DIR:-}" ]; then
+    SESSION_DIR="$IMESSAGE_DATA_DIR"
+else
+    SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+fi
 SESSION_FILE="$SESSION_DIR/session.json"
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
     # DB missing — check if session.json can auto-restore (has hardware_key for Linux, or macOS)
@@ -567,7 +577,7 @@ fi
 
 # Check if backup session state can be restored — validates that session.json
 # and keystore.plist exist AND that the keystore has the referenced keys.
-if [ "$NEEDS_LOGIN" = "true" ] && [ "${FORCE_CLEAR_STATE:-false}" != "true" ] && "$BINARY" check-restore 2>/dev/null; then
+if [ "$NEEDS_LOGIN" = "true" ] && [ "${FORCE_CLEAR_STATE:-false}" != "true" ] && IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" check-restore 2>/dev/null; then
     echo "✓ Backup session state validated — bridge will auto-restore login"
     NEEDS_LOGIN=false
 fi
@@ -590,7 +600,7 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
 
     # Run login from the data directory so the keystore (state/keystore.plist)
     # is written to the same location the launchd service will read from.
-    (cd "$DATA_DIR" && "$BINARY" login -c "$CONFIG")
+    (cd "$DATA_DIR" && IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" login -c "$CONFIG")
     echo ""
 fi
 
@@ -614,7 +624,7 @@ fi
 # Skip interactive prompt if login just ran (login flow already asked)
 if [ -t 0 ] && [ "$NEEDS_LOGIN" = "false" ]; then
     # Get available handles from session state (available after login)
-    AVAILABLE_HANDLES=$("$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
+    AVAILABLE_HANDLES=$(IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
     if [ -n "$AVAILABLE_HANDLES" ]; then
         echo ""
         echo "Preferred handle (your iMessage sender address):"
@@ -679,6 +689,7 @@ BBCTL_DIR="$BBCTL_DIR"
 BBCTL_BRANCH="$BBCTL_BRANCH"
 BINARY="$BINARY"
 CONFIG="$CONFIG_ABS"
+export IMESSAGE_DATA_DIR="$DATA_ABS"
 HEADER_EOF
 cat >> "$DATA_ABS/start.sh" << 'BODY_EOF'
 
@@ -761,6 +772,8 @@ cat > "$PLIST" << PLIST_EOF
         <string>-I/opt/homebrew/include</string>
         <key>CGO_LDFLAGS</key>
         <string>-L/opt/homebrew/lib</string>
+        <key>IMESSAGE_DATA_DIR</key>
+        <string>$DATA_ABS</string>
     </dict>
 </dict>
 </plist>

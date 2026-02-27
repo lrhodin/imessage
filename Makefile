@@ -23,7 +23,7 @@ ifneq ($(COMMIT),$(PREV_COMMIT))
   $(shell echo $(COMMIT) > $(COMMIT_FILE))
 endif
 
-.PHONY: build clean install install-beeper uninstall reset rust bindings check-deps check-deps-linux
+.PHONY: build clean install install-beeper install-beeper-multi uninstall reset rust bindings check-deps check-deps-linux
 
 # ===========================================================================
 # Path validation – spaces in the working directory break CGO linker flags
@@ -147,6 +147,24 @@ ifeq ($(UNAME_S),Darwin)
 else
 	@scripts/install-beeper-linux.sh "$(BINARY)" "$(DATA_DIR)"
 endif
+
+install-beeper-multi: build
+	@echo ""; \
+	echo "Multi-instance iMessage Bridge Setup"; \
+	echo ""; \
+	read -p "How many bridges would you like to create? " COUNT; \
+	for i in $$(seq 1 $$COUNT); do \
+		echo ""; \
+		echo "═══════════════════════════════════════════════"; \
+		echo "  Setting up bridge $$i of $$COUNT (sh-imessage-$$i)"; \
+		echo "═══════════════════════════════════════════════"; \
+		BRIDGE_NAME=sh-imessage-$$i \
+		DATA_DIR=$(HOME)/.local/share/mautrix-imessage-$$i \
+		IMESSAGE_DATA_DIR=$(HOME)/.local/share/mautrix-imessage-$$i \
+		BUNDLE_ID=com.lrhodin.mautrix-imessage-$$i \
+		BRIDGE_PORT=$$((4000 + $$i)) \
+		$(MAKE) install-beeper; \
+	done
 
 reset:
 ifeq ($(UNAME_S),Darwin)
