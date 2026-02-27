@@ -508,53 +508,64 @@ fn extract_device_info(meta: &rustpush::keychain::EscrowMetadata) -> (String, St
     (device_name, device_model)
 }
 
-/// Replicates join_clique_from_escrow but handles PeerNotFound by falling
-/// back to the `establish` path (no voucher). This fixes Ventura systems
-/// where escrow bottles reference peers that have been evicted from the
-/// trust circle.
+/// Joins the iCloud Keychain clique from an escrow bottle, working around
+/// "dead bottles" where the sponsor peer has been evicted from the trust circle.
+///
+/// After recover_bottle(), the sponsor peer is in local state. We save it
+/// before new_user_identity() clears state, then re-inject it via
+/// apply_changes() so that join_clique's derive_trust_from_included_peer()
+/// can find the sponsor even if sync_changes() no longer returns it.
 async fn join_clique_from_escrow_with_fallback(
     keychain: &rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>,
     data: &rustpush::cloudkit_proto::EscrowData,
     passcode_bytes: &[u8],
 ) -> Result<(), WrappedError> {
-    // Step 1: Recover bottle (escrow SRP) — proves passcode is correct
+    // Step 1: Recover bottle — state now has the sponsor peer
     let other_identity = keychain.recover_bottle(data, passcode_bytes).await?;
 
+    // Step 1b: Save sponsor's CuttlefishPeer before new_user_identity clears state.
+    // The sponsor may have been evicted from the trust circle on Apple's servers
+    // (dead bottle), so we preserve it to re-inject after state is cleared.
+    let sponsor_id = other_identity.identifier.clone();
+    let saved_sponsor_peer = {
+        let state = keychain.state.read().await;
+        let found = state.peers()
+            .find(|p| p.0.hash.as_deref() == Some(sponsor_id.as_str()))
+            .cloned();
+        found
+    };
+
     // Step 2: Fetch TLK shares while state still has peers
-    // (new_user_identity will clear state.state)
     let shares = keychain.fetch_shares_for(&other_identity).await?;
 
     // Step 3: Create new identity (clears state.state and state_token)
     let new_identity = keychain.new_user_identity().await?;
 
-    // Steps 4+5: Create voucher and join — catch PeerNotFound from either
-    // vouch_for or join_clique, since the dead sponsor can cause both to fail.
-    let voucher_result: Result<(), rustpush::PushError> = async {
-        let my_id = {
-            let state = keychain.state.read().await;
-            state.user_identity.as_ref().unwrap().identifier.clone()
+    // Step 4: Re-inject sponsor peer into cleared state if we saved it.
+    // apply_changes() is additive — it inserts into the private state.state
+    // HashMap. The subsequent sync_changes() inside join_clique is also
+    // additive (no .clear()), so the sponsor survives.
+    if let Some(peer) = saved_sponsor_peer {
+        info!("Re-injecting sponsor peer {} into state for dead-bottle workaround", sponsor_id);
+        let changes = rustpush::cloudkit_proto::CuttlefishChanges {
+            sync_token: None,
+            changes: vec![rustpush::cloudkit_proto::CuttlefishChange {
+                add: Some(peer.0),
+            }],
         };
-        let voucher = other_identity.vouch_for(my_id)?;
-        keychain.join_clique(passcode_bytes, &new_identity, Some(voucher), &shares, vec![]).await
-    }.await;
-
-    match voucher_result {
-        Ok(()) => {
-            info!("Joined clique via voucher path");
-            return Ok(());
-        }
-        Err(rustpush::PushError::PeerNotFound) => {
-            warn!(
-                "Sponsor peer has been evicted from trust circle (dead bottle). \
-                 Falling back to establish path..."
-            );
-        }
-        Err(e) => return Err(e.into()),
+        let mut state = keychain.state.write().await;
+        keychain.apply_changes(changes, &mut state);
+        drop(state);
     }
 
-    // Step 6: Fallback — establish a new trust circle with recovered TLK shares
-    keychain.join_clique(passcode_bytes, &new_identity, None, &shares, vec![]).await?;
-    info!("Joined clique via establish fallback (dead sponsor workaround)");
+    // Step 5: Create voucher and join clique (normal path)
+    let my_id = {
+        let state = keychain.state.read().await;
+        state.user_identity.as_ref().unwrap().identifier.clone()
+    };
+    let voucher = other_identity.vouch_for(my_id)?;
+    keychain.join_clique(passcode_bytes, &new_identity, Some(voucher), &shares, vec![]).await?;
+
     Ok(())
 }
 
