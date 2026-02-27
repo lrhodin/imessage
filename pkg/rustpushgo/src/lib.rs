@@ -508,6 +508,56 @@ fn extract_device_info(meta: &rustpush::keychain::EscrowMetadata) -> (String, St
     (device_name, device_model)
 }
 
+/// Replicates join_clique_from_escrow but handles PeerNotFound by falling
+/// back to the `establish` path (no voucher). This fixes Ventura systems
+/// where escrow bottles reference peers that have been evicted from the
+/// trust circle.
+async fn join_clique_from_escrow_with_fallback(
+    keychain: &rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>,
+    data: &rustpush::cloudkit_proto::EscrowData,
+    passcode_bytes: &[u8],
+) -> Result<(), WrappedError> {
+    // Step 1: Recover bottle (escrow SRP) — proves passcode is correct
+    let other_identity = keychain.recover_bottle(data, passcode_bytes).await?;
+
+    // Step 2: Fetch TLK shares while state still has peers
+    // (new_user_identity will clear state.state)
+    let shares = keychain.fetch_shares_for(&other_identity).await?;
+
+    // Step 3: Create new identity (clears state.state and state_token)
+    let new_identity = keychain.new_user_identity().await?;
+
+    // Steps 4+5: Create voucher and join — catch PeerNotFound from either
+    // vouch_for or join_clique, since the dead sponsor can cause both to fail.
+    let voucher_result: Result<(), rustpush::PushError> = async {
+        let my_id = {
+            let state = keychain.state.read().await;
+            state.user_identity.as_ref().unwrap().identifier.clone()
+        };
+        let voucher = other_identity.vouch_for(my_id)?;
+        keychain.join_clique(passcode_bytes, &new_identity, Some(voucher), &shares, vec![]).await
+    }.await;
+
+    match voucher_result {
+        Ok(()) => {
+            info!("Joined clique via voucher path");
+            return Ok(());
+        }
+        Err(rustpush::PushError::PeerNotFound) => {
+            warn!(
+                "Sponsor peer has been evicted from trust circle (dead bottle). \
+                 Falling back to establish path..."
+            );
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // Step 6: Fallback — establish a new trust circle with recovered TLK shares
+    keychain.join_clique(passcode_bytes, &new_identity, None, &shares, vec![]).await?;
+    info!("Joined clique via establish fallback (dead sponsor workaround)");
+    Ok(())
+}
+
 /// Core keychain joining logic used by both join_keychain_clique and join_keychain_clique_for_device.
 /// If `preferred_index` is Some, the bottle at that index is tried first before falling back to others.
 async fn join_keychain_with_bottles(
@@ -546,7 +596,7 @@ async fn join_keychain_with_bottles(
         for &i in &indices {
             let (data, meta) = &bottles[i];
             info!("Trying bottle {} (serial={})...", i, meta.serial);
-            match keychain.join_clique_from_escrow(data, passcode_bytes, passcode_bytes).await {
+            match join_clique_from_escrow_with_fallback(&keychain, data, passcode_bytes).await {
                 Ok(()) => {
                     joined_any = true;
                     last_joined_meta = Some((meta.serial.clone(), meta.build.clone()));
