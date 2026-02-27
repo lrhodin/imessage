@@ -103,6 +103,27 @@ else
     echo "✓ Config saved to $CONFIG"
 fi
 
+# ── Belt-and-suspenders: fix broken permissions ───────────────
+# If bbctl generated config with an empty username, the mautrix config
+# upgrader replaces the permissions with example.com defaults, causing
+# "bridge.permissions not configured". Detect and fix this.
+if grep -q '@.*example\.com' "$CONFIG" 2>/dev/null; then
+    echo "⚠  Detected example.com in permissions — fixing..."
+    # $WHOAMI was captured from 'bbctl whoami' earlier in this script
+    if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
+        MXID="@${WHOAMI}:beeper.com"
+        sed -i "s|@.*example\.com.*: admin|\"${MXID}\": admin|" "$CONFIG"
+        sed -i "/@.*example\.com/d" "$CONFIG"
+        echo "✓ Fixed permissions: $MXID → admin"
+    else
+        echo ""
+        echo "ERROR: Config has broken permissions and cannot determine your username."
+        echo "  Try: $BBCTL login && rm $CONFIG && re-run make install-beeper"
+        echo ""
+        exit 1
+    fi
+fi
+
 # Ensure backfill settings are sane for existing configs
 PATCHED_BACKFILL=false
 # Only enable unlimited backward backfill when max_initial is uncapped.
