@@ -125,7 +125,15 @@ func main() {
 // bbctl generated a config with an empty or invalid username, leaving
 // permissions with only example.com defaults.
 func repairPermissions(br *mxmain.BridgeMain) {
-	if br.Config == nil || br.Config.Bridge.Permissions.IsConfigured() {
+	if br.Config == nil {
+		return
+	}
+	configured := br.Config.Bridge.Permissions.IsConfigured()
+	fmt.Fprintf(os.Stderr, "[permissions] IsConfigured=%v entries=%d\n", configured, len(br.Config.Bridge.Permissions))
+	for key := range br.Config.Bridge.Permissions {
+		fmt.Fprintf(os.Stderr, "[permissions]   %q\n", key)
+	}
+	if configured {
 		return
 	}
 
@@ -133,6 +141,7 @@ func repairPermissions(br *mxmain.BridgeMain) {
 	// from bbctl's saved credentials.
 	username := loadBBCtlUsername()
 	if username == "" {
+		fmt.Fprintf(os.Stderr, "[permissions] loadBBCtlUsername returned empty — cannot repair\n")
 		return
 	}
 

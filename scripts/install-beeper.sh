@@ -820,8 +820,25 @@ elif [ -d "$BBCTL_DIR/.git" ]; then
     warn "go not found — skipping bbctl update"
 fi
 
+# Fix permissions before starting — the config upgrader may have replaced
+# the user's permissions with example.com defaults on a previous run.
+if grep -q '@.*example\.com' "$CONFIG" 2>/dev/null; then
+    BBCTL_BIN="$BBCTL_DIR/bbctl"
+    if [ -x "$BBCTL_BIN" ]; then
+        FIX_USER=$("$BBCTL_BIN" whoami 2>/dev/null | head -1 || true)
+        if [ -n "$FIX_USER" ] && [ "$FIX_USER" != "null" ]; then
+            FIX_MXID="@${FIX_USER}:beeper.com"
+            sed -i '' '/permissions:/,/^[^ ]/{
+                s/"@[^"]*": admin/"'"$FIX_MXID"'": admin/
+                /@.*example\.com/d
+            }' "$CONFIG"
+            ok "Fixed permissions: $FIX_MXID"
+        fi
+    fi
+fi
+
 step "Starting bridge..."
-exec "$BINARY" -c "$CONFIG"
+exec "$BINARY" -n -c "$CONFIG"
 BODY_EOF
 chmod +x "$DATA_ABS/start.sh"
 
