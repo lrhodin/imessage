@@ -18,10 +18,11 @@ use rustpush::{
     OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, UnsendMessage,
     IndexedMessagePart, LinkMeta, LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL,
     TokenProvider,
-    cloudkit::{ZoneDeleteOperation, CloudKitSession},
+    cloudkit::{ZoneDeleteOperation, CloudKitSession, FunctionInvokeOperation},
     util::{base64_decode, encode_hex, ResourceState},
 };
 use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
+use prost::Message as ProstMessage;
 use omnisette::default_provider;
 use std::sync::RwLock;
 use tokio::sync::broadcast;
@@ -492,6 +493,90 @@ async fn create_keychain_clients(
     Ok((keychain, cloudkit))
 }
 
+/// Extended version of CuttlefishFetchViableBottleResponse that also decodes
+/// field 2 (legacy bottles), which the vendored proto definition omits.
+#[derive(Clone, PartialEq, prost::Message)]
+struct ExtendedFetchViableBottleResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub valid: Vec<rustpush::cloudkit_proto::EscrowData>,
+    #[prost(message, repeated, tag = "2")]
+    pub legacy: Vec<rustpush::cloudkit_proto::EscrowData>,
+    #[prost(message, repeated, tag = "3")]
+    pub partial: Vec<rustpush::cloudkit_proto::EscrowMeta>,
+}
+
+/// Fetch viable bottles with diagnostic logging for legacy (field 2) bottles.
+/// Returns (valid_bottles, legacy_bottles) from the Cuttlefish fetchViableBottles RPC.
+async fn fetch_viable_bottles_extended(
+    keychain: &rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>,
+) -> Result<(Vec<rustpush::cloudkit_proto::EscrowData>, Vec<rustpush::cloudkit_proto::EscrowData>), WrappedError> {
+    let container = keychain.get_container().await
+        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+
+    let request = rustpush::cloudkit_proto::CuttlefishFetchViableBottleRequest {
+        filter: Some(1),
+        metrics: Some(vec![]),
+    };
+    let response_bytes = container.perform(
+        &CloudKitSession::new(),
+        FunctionInvokeOperation::new("Cuttlefish".to_string(), "fetchViableBottles".to_string(), request.encode_to_vec()),
+    ).await.map_err(|e| WrappedError::GenericError { msg: format!("fetchViableBottles RPC failed: {}", e) })?;
+
+    let response = ExtendedFetchViableBottleResponse::decode(&response_bytes[..])
+        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to decode fetchViableBottles response: {}", e) })?;
+
+    info!(
+        "fetchViableBottles: {} valid, {} legacy, {} partial",
+        response.valid.len(),
+        response.legacy.len(),
+        response.partial.len()
+    );
+
+    Ok((response.valid, response.legacy))
+}
+
+/// Fetch viable bottles, falling back to legacy (field 2) bottles if the normal
+/// path returns empty. Legacy bottles get dummy metadata since we can't access
+/// the escrow metadata service directly — the metadata is only used for logging.
+async fn fetch_viable_bottles_with_legacy(
+    keychain: &rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>,
+) -> Result<Vec<(rustpush::cloudkit_proto::EscrowData, rustpush::keychain::EscrowMetadata)>, WrappedError> {
+    // Try the normal path first (matches bottles with escrow metadata)
+    let bottles = keychain.get_viable_bottles().await
+        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+
+    if !bottles.is_empty() {
+        return Ok(bottles);
+    }
+
+    // Normal path returned empty — check if there are legacy bottles (field 2)
+    info!("No viable bottles from normal path, checking for legacy bottles...");
+    let (valid, legacy) = fetch_viable_bottles_extended(keychain).await?;
+
+    if legacy.is_empty() {
+        info!("No legacy bottles found either (valid={}, legacy=0)", valid.len());
+        return Ok(vec![]);
+    }
+
+    info!("Found {} legacy bottle(s), using them with placeholder metadata", legacy.len());
+    let bottles_with_dummy_meta: Vec<_> = legacy.into_iter().map(|data| {
+        let bottle_id = data.id().to_string();
+        let meta = rustpush::keychain::EscrowMetadata {
+            serial: bottle_id.clone(),
+            build: "legacy".to_string(),
+            passcode_generation: 0,
+            timestamp: String::new(),
+            bottle_id,
+            client_metadata: plist::Value::Dictionary(plist::Dictionary::new()),
+            escrowed_spki: plist::Data::new(vec![]),
+            multiple_icsc: false,
+        };
+        (data, meta)
+    }).collect();
+
+    Ok(bottles_with_dummy_meta)
+}
+
 /// Extract device name and model from an EscrowMetadata's client_metadata dictionary.
 fn extract_device_info(meta: &rustpush::keychain::EscrowMetadata) -> (String, String) {
     let dict = meta.client_metadata.as_dictionary();
@@ -734,8 +819,7 @@ impl WrappedTokenProvider {
         info!("Fetching escrow devices...");
         let (keychain, _cloudkit) = create_keychain_clients(&self.inner).await?;
 
-        let bottles = keychain.get_viable_bottles().await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+        let bottles = fetch_viable_bottles_with_legacy(&keychain).await?;
 
         if bottles.is_empty() {
             return Err(WrappedError::GenericError {
@@ -769,8 +853,7 @@ impl WrappedTokenProvider {
         let (keychain, cloudkit) = create_keychain_clients(&self.inner).await?;
 
         info!("Fetching escrow bottles...");
-        let bottles = keychain.get_viable_bottles().await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+        let bottles = fetch_viable_bottles_with_legacy(&keychain).await?;
 
         if bottles.is_empty() {
             return Err(WrappedError::GenericError {
@@ -794,8 +877,7 @@ impl WrappedTokenProvider {
         let (keychain, cloudkit) = create_keychain_clients(&self.inner).await?;
 
         info!("Fetching escrow bottles...");
-        let bottles = keychain.get_viable_bottles().await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+        let bottles = fetch_viable_bottles_with_legacy(&keychain).await?;
 
         if bottles.is_empty() {
             return Err(WrappedError::GenericError {
