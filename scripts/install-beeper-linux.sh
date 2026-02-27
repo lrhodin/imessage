@@ -628,22 +628,30 @@ warn() { printf "${DIM}$(ts)${RESET}  ${YELLOW}⚠${RESET}  %s\n" "$*"; }
 
 printf "\n  ${BOLD}iMessage Bridge${RESET}\n\n"
 
+LOCKDIR="$BBCTL_DIR/.update-lock"
 if [ -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
-    git -C "$BBCTL_DIR" fetch origin --quiet 2>/dev/null || true
-    LOCAL=$(git -C "$BBCTL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-    REMOTE=$(git -C "$BBCTL_DIR" rev-parse --short "origin/$BBCTL_BRANCH" 2>/dev/null || echo "unknown")
-    if [ "$LOCAL" != "$REMOTE" ] && [ "$LOCAL" != "unknown" ] && [ "$REMOTE" != "unknown" ]; then
-        step "Updating bbctl  $LOCAL → $REMOTE"
-        T0=$(date +%s)
-        git -C "$BBCTL_DIR" reset --hard "origin/$BBCTL_BRANCH" --quiet
-        step "Updating bridge-manager..."
-        (cd "$BBCTL_DIR" && go get github.com/beeper/bridge-manager@main && go mod tidy 2>&1) | sed 's/^/  /'
-        step "Building bbctl..."
-        (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
-        T1=$(date +%s)
-        ok "bbctl updated  ($(( T1 - T0 ))s)"
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+        trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT
+        git -C "$BBCTL_DIR" fetch origin --quiet 2>/dev/null || true
+        LOCAL=$(git -C "$BBCTL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        REMOTE=$(git -C "$BBCTL_DIR" rev-parse --short "origin/$BBCTL_BRANCH" 2>/dev/null || echo "unknown")
+        if [ "$LOCAL" != "$REMOTE" ] && [ "$LOCAL" != "unknown" ] && [ "$REMOTE" != "unknown" ]; then
+            step "Updating bbctl  $LOCAL → $REMOTE"
+            T0=$(date +%s)
+            git -C "$BBCTL_DIR" reset --hard "origin/$BBCTL_BRANCH" --quiet
+            step "Updating bridge-manager..."
+            (cd "$BBCTL_DIR" && go get github.com/beeper/bridge-manager@main && go mod tidy 2>&1) | sed 's/^/  /'
+            step "Building bbctl..."
+            (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
+            T1=$(date +%s)
+            ok "bbctl updated  ($(( T1 - T0 ))s)"
+        else
+            ok "bbctl $LOCAL"
+        fi
+        rmdir "$LOCKDIR" 2>/dev/null
+        trap - EXIT
     else
-        ok "bbctl $LOCAL"
+        warn "Another instance is updating bbctl — skipping"
     fi
 elif [ -d "$BBCTL_DIR/.git" ]; then
     warn "go not found — skipping bbctl update"

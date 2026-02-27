@@ -116,11 +116,10 @@ var loginCommand = &cli.Command{
 }
 
 var logoutCommand = &cli.Command{
-	Name:      "logout",
-	Usage:     "Delete bridge and log out of Beeper",
-	ArgsUsage: "[BRIDGE]",
-	Before:    requiresAuth,
-	Action:    cmdLogout,
+	Name:   "logout",
+	Usage:  "Delete all iMessage bridges and log out of Beeper",
+	Before: requiresAuth,
+	Action: cmdLogout,
 }
 
 var whoamiCommand = &cli.Command{
@@ -199,21 +198,27 @@ func cmdLogin(ctx *cli.Context) error {
 }
 
 func cmdLogout(ctx *cli.Context) error {
-	bridge := ctx.Args().Get(0)
-	if bridge == "" {
-		bridge = "sh-imessage"
-	}
-
 	envCfg := getEnvConfig(ctx)
 	hungryClient := getHungryClient(ctx)
 
-	if err := hungryClient.DeleteAppService(ctx.Context, bridge); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to delete appservice: %v\n", err)
+	// Find all iMessage bridges registered to this account and delete them.
+	resp, err := beeperapi.Whoami(baseDomain, envCfg.AccessToken)
+	if err != nil {
+		return fmt.Errorf("failed to get bridge list: %w", err)
 	}
-	if err := beeperapi.DeleteBridge(baseDomain, bridge, envCfg.AccessToken); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to delete bridge from Beeper API: %v\n", err)
-	} else {
-		fmt.Printf("Bridge '%s' deleted\n", bridge)
+
+	for name, bridge := range resp.User.Bridges {
+		if bridge.BridgeState.BridgeType != "imessage" {
+			continue
+		}
+		if err := hungryClient.DeleteAppService(ctx.Context, name); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to delete appservice %s: %v\n", name, err)
+		}
+		if err := beeperapi.DeleteBridge(baseDomain, name, envCfg.AccessToken); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to delete bridge %s from Beeper API: %v\n", name, err)
+		} else {
+			fmt.Printf("Bridge '%s' deleted\n", name)
+		}
 	}
 
 	cfg := getConfig(ctx)

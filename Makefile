@@ -154,6 +154,12 @@ install-beeper-multi: build
 	echo ""; \
 	read -p "How many bridges would you like to create? " COUNT; \
 	for i in $$(seq 1 $$COUNT); do \
+		PORT=$$((4000 + $$i)); \
+		if lsof -iTCP:$$PORT -sTCP:LISTEN >/dev/null 2>&1; then \
+			echo ""; \
+			echo "ERROR: Port $$PORT is already in use (needed for sh-imessage-$$i)"; \
+			exit 1; \
+		fi; \
 		echo ""; \
 		echo "═══════════════════════════════════════════════"; \
 		echo "  Setting up bridge $$i of $$COUNT (sh-imessage-$$i)"; \
@@ -162,7 +168,7 @@ install-beeper-multi: build
 		XDG_DATA_HOME=$(HOME)/.local/share/imessage-$$i \
 		DATA_DIR=$(HOME)/.local/share/imessage-$$i/mautrix-imessage \
 		BUNDLE_ID=com.lrhodin.mautrix-imessage-$$i \
-		BRIDGE_PORT=$$((4000 + $$i)) \
+		BRIDGE_PORT=$$PORT \
 		$(MAKE) install-beeper; \
 	done
 
