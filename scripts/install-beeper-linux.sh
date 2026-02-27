@@ -3,14 +3,15 @@ set -euo pipefail
 
 BINARY="$1"
 DATA_DIR="$2"
+PREBUILT_BBCTL="${3:-}"
 
 BRIDGE_NAME="${BRIDGE_NAME:-sh-imessage}"
 
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 
-# Where we build/cache bbctl
-BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bridge-manager}"
+# Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
+BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bbctl}"
 BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
 BBCTL_BRANCH="${BBCTL_BRANCH:-fix-bbctl}"
 
@@ -23,24 +24,50 @@ echo ""
 # ── Build bbctl from source ───────────────────────────────────
 BBCTL="$BBCTL_DIR/bbctl"
 
+# Warn about old full-repo clone and offer to remove it
+OLD_BBCTL_DIR="$HOME/.local/share/mautrix-imessage/bridge-manager"
+if [ -d "$OLD_BBCTL_DIR/.git" ] && [ "$BBCTL_DIR" != "$OLD_BBCTL_DIR" ]; then
+    echo "⚠  Found old full-repo clone at $OLD_BBCTL_DIR"
+    echo "   This is no longer needed (bbctl now uses a sparse checkout)."
+    if [ -t 0 ]; then
+        read -p "   Delete it to free disk space? [Y/n]: " DEL_OLD
+        case "$DEL_OLD" in
+            [nN]*) ;;
+            *)     rm -rf "$OLD_BBCTL_DIR"
+                   echo "   ✓ Removed $OLD_BBCTL_DIR" ;;
+        esac
+    else
+        echo "   You can safely delete it: rm -rf $OLD_BBCTL_DIR"
+    fi
+fi
+
 build_bbctl() {
     echo "Building bbctl..."
     mkdir -p "$(dirname "$BBCTL_DIR")"
-    if [ -d "$BBCTL_DIR" ]; then
+    if [ -d "$BBCTL_DIR/.git" ]; then
         cd "$BBCTL_DIR"
         git fetch --quiet origin
-        git checkout --quiet "$BBCTL_BRANCH"
         git reset --hard --quiet "origin/$BBCTL_BRANCH"
     else
-        git clone --quiet --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
+        rm -rf "$BBCTL_DIR"
+        git clone --filter=blob:none --no-checkout --quiet \
+            --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
         cd "$BBCTL_DIR"
+        git sparse-checkout init --cone
+        git sparse-checkout set cmd/bbctl
+        git checkout --quiet "$BBCTL_BRANCH"
     fi
     go build -o bbctl ./cmd/bbctl/ 2>&1
     cd - >/dev/null
     echo "✓ Built bbctl"
 }
 
-if [ ! -x "$BBCTL" ]; then
+if [ -n "$PREBUILT_BBCTL" ] && [ -x "$PREBUILT_BBCTL" ]; then
+    # Install the bbctl built by `make build` into BBCTL_DIR
+    mkdir -p "$BBCTL_DIR"
+    cp "$PREBUILT_BBCTL" "$BBCTL"
+    echo "✓ Installed bbctl to $BBCTL_DIR/"
+elif [ ! -x "$BBCTL" ]; then
     build_bbctl
 else
     echo "✓ Found bbctl: $BBCTL"
@@ -69,6 +96,8 @@ if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     echo "   Deleting old registration to avoid orphaned rooms..."
     "$BBCTL" delete "$BRIDGE_NAME"
     echo "✓ Old registration cleaned up"
+    echo "   Waiting for server-side deletion to complete..."
+    sleep 5
 fi
 
 # ── Generate config via bbctl ─────────────────────────────────
@@ -86,7 +115,17 @@ if [ -f "$CONFIG" ]; then
     echo "✓ Config already exists at $CONFIG"
 else
     echo "Generating Beeper config..."
-    "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME"
+    for attempt in 1 2 3 4 5; do
+        if "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME" 2>&1; then
+            break
+        fi
+        if [ "$attempt" -eq 5 ]; then
+            echo "ERROR: Failed to register appservice after $attempt attempts."
+            exit 1
+        fi
+        echo "  Retrying in 5s... (attempt $attempt/5)"
+        sleep 5
+    done
     # Make DB path absolute — everything lives in DATA_DIR
     sed -i "s|uri: file:mautrix-imessage.db|uri: file:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
     # Also catch sqlite:// URIs from newer bbctl versions
@@ -623,6 +662,7 @@ BINARY="$BINARY"
 CONFIG="$CONFIG"
 HEADER_EOF
 cat >> "$DATA_DIR/start.sh" << 'BODY_EOF'
+BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
 
 # Extend PATH to find go
 export PATH="$PATH:/usr/local/go/bin:/opt/homebrew/bin:$HOME/go/bin"
@@ -642,6 +682,23 @@ warn() { printf "${DIM}$(ts)${RESET}  ${YELLOW}⚠${RESET}  %s\n" "$*"; }
 
 printf "\n  ${BOLD}iMessage Bridge${RESET}\n\n"
 
+# Bootstrap sparse clone if it doesn't exist yet
+if [ ! -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
+    step "Setting up bbctl sparse checkout..."
+    EXISTING_BBCTL=""
+    [ -x "$BBCTL_DIR/bbctl" ] && EXISTING_BBCTL=$(mktemp) && cp "$BBCTL_DIR/bbctl" "$EXISTING_BBCTL"
+    rm -rf "$BBCTL_DIR"
+    mkdir -p "$(dirname "$BBCTL_DIR")"
+    git clone --filter=blob:none --no-checkout --quiet \
+        --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
+    git -C "$BBCTL_DIR" sparse-checkout init --cone
+    git -C "$BBCTL_DIR" sparse-checkout set cmd/bbctl
+    git -C "$BBCTL_DIR" checkout --quiet "$BBCTL_BRANCH"
+    (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
+    [ -n "$EXISTING_BBCTL" ] && rm -f "$EXISTING_BBCTL"
+    ok "bbctl ready"
+fi
+
 if [ -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
     git -C "$BBCTL_DIR" fetch origin --quiet 2>/dev/null || true
     LOCAL=$(git -C "$BBCTL_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -650,8 +707,6 @@ if [ -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
         step "Updating bbctl  $LOCAL → $REMOTE"
         T0=$(date +%s)
         git -C "$BBCTL_DIR" reset --hard "origin/$BBCTL_BRANCH" --quiet
-        step "Updating bridge-manager..."
-        (cd "$BBCTL_DIR" && go get github.com/beeper/bridge-manager@main && go mod tidy 2>&1) | sed 's/^/  /'
         step "Building bbctl..."
         (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
         T1=$(date +%s)

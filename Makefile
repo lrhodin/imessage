@@ -13,6 +13,7 @@ RUSTPUSH_SRC:= $(shell find rustpush/src rustpush/apple-private-apis rustpush/op
 CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
 GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
 
+BBCTL       := bbctl
 LDFLAGS     := -X main.Tag=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)
 
 # Track the git commit so ldflags changes trigger a Go rebuild.
@@ -112,9 +113,9 @@ bindings: $(RUST_LIB)
 # ===========================================================================
 
 ifeq ($(UNAME_S),Darwin)
-build: check-deps $(RUST_LIB) $(BINARY)
+build: check-deps $(RUST_LIB) $(BINARY) $(BBCTL)
 	codesign --force --deep --sign - $(APP_BUNDLE)
-	@echo "Built $(APP_BUNDLE) ($(VERSION)-$(COMMIT))"
+	@echo "Built $(APP_BUNDLE) + $(BBCTL) ($(VERSION)-$(COMMIT))"
 
 $(BINARY): $(GO_SRC) $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | grep -v target) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
 	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
@@ -122,13 +123,16 @@ $(BINARY): $(GO_SRC) $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | gre
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
 else
-build: check-deps $(RUST_LIB) $(BINARY)
-	@echo "Built $(BINARY) ($(VERSION)-$(COMMIT))"
+build: check-deps $(RUST_LIB) $(BINARY) $(BBCTL)
+	@echo "Built $(BINARY) + $(BBCTL) ($(VERSION)-$(COMMIT))"
 
 $(BINARY): $(GO_SRC) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
 endif
+
+$(BBCTL): $(GO_SRC) go.mod go.sum
+	go build -o $(BBCTL) ./cmd/bbctl/
 
 # ===========================================================================
 # Install / uninstall (macOS)
@@ -143,9 +147,9 @@ endif
 
 install-beeper: build
 ifeq ($(UNAME_S),Darwin)
-	@scripts/install-beeper.sh "$(BINARY)" "$(DATA_DIR)" "$(BUNDLE_ID)"
+	@scripts/install-beeper.sh "$(BINARY)" "$(DATA_DIR)" "$(BUNDLE_ID)" "$(CURDIR)/$(BBCTL)"
 else
-	@scripts/install-beeper-linux.sh "$(BINARY)" "$(DATA_DIR)"
+	@scripts/install-beeper-linux.sh "$(BINARY)" "$(DATA_DIR)" "$(CURDIR)/$(BBCTL)"
 endif
 
 reset:
@@ -193,5 +197,5 @@ clean:
 ifeq ($(UNAME_S),Darwin)
 	rm -rf $(APP_NAME).app
 endif
-	rm -f $(APP_NAME) $(RUST_LIB) extract-key tools/extract-key/extract-key
+	rm -f $(APP_NAME) $(BBCTL) $(RUST_LIB) extract-key tools/extract-key/extract-key
 	cd pkg/rustpushgo && cargo clean 2>/dev/null || true
