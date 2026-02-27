@@ -342,6 +342,11 @@ if [ "$CURRENT_BACKFILL" = "true" ]; then
     fi
 fi
 
+# Session dir matches Go sessionDir(): XDG_DATA_HOME/mautrix-imessage
+SESSION_DIR_BASE="${XDG_DATA_HOME:-$HOME/.local/share}"
+SESSION_DIR="$SESSION_DIR_BASE/mautrix-imessage"
+SESSION_FILE="$SESSION_DIR/session.json"
+
 # ── Restore CardDAV config from backup ────────────────────────
 # Skip when using chat.db — local macOS Contacts are used automatically.
 CARDDAV_BACKUP="$DATA_DIR/.carddav-config"
@@ -536,10 +541,6 @@ fi
 DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
 NEEDS_LOGIN=false
 
-# Session dir matches Go sessionDir(): XDG_DATA_HOME/mautrix-imessage
-SESSION_DIR_BASE="${XDG_DATA_HOME:-$HOME/.local/share}"
-SESSION_DIR="$SESSION_DIR_BASE/mautrix-imessage"
-SESSION_FILE="$SESSION_DIR/session.json"
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
     # DB missing — check if session.json can auto-restore (has hardware_key for Linux, or macOS)
     if [ -f "$SESSION_FILE" ] && { grep -q '"hardware_key"' "$SESSION_FILE" 2>/dev/null || [ "$(uname -s)" = "Darwin" ]; }; then
