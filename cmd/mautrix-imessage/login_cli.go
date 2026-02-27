@@ -77,6 +77,7 @@ func promptMultiline(label string) string {
 func runInteractiveLogin(br *mxmain.BridgeMain) {
 	// Initialize the bridge (DB, connector, etc.) without starting Matrix.
 	br.PreInit()
+	repairPermissions(br)
 	br.Init()
 
 	ctx := br.Log.WithContext(context.Background())

@@ -595,8 +595,22 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
 
     # Run login from DATA_DIR so that relative paths (state/anisette/)
     # resolve to the same location as when systemd runs the bridge.
-    (cd "$DATA_DIR" && "$BINARY" login -c "$CONFIG")
+    (cd "$DATA_DIR" && "$BINARY" login -n -c "$CONFIG")
     echo ""
+
+    # Re-check permissions after login — the config upgrader may have
+    # corrupted them even with -n if repairPermissions couldn't determine
+    # the username.
+    if grep -q '@.*example\.com' "$CONFIG" 2>/dev/null || grep -q '"@":' "$CONFIG" 2>/dev/null; then
+        if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
+            MXID="@${WHOAMI}:beeper.com"
+            sed -i '/permissions:/,/^[^ ]/{
+                s/"@[^"]*": admin/"'"$MXID"'": admin/
+                /@.*example\.com/d
+            }' "$CONFIG"
+            echo "✓ Fixed permissions after login: $MXID → admin"
+        fi
+    fi
 fi
 
 # ── Preferred handle (runs every time, can reconfigure) ────────
