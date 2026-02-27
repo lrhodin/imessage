@@ -54,12 +54,9 @@ type PersistedSessionState struct {
 }
 
 // sessionDir returns the directory for session state files.
-// Uses IMESSAGE_DATA_DIR if set (for multi-instance support),
-// otherwise falls back to ~/.local/share/mautrix-imessage/.
+// Uses XDG_DATA_HOME/mautrix-imessage, falling back to ~/.local/share/mautrix-imessage/.
+// For multi-instance, set XDG_DATA_HOME per instance so both Go and Rust resolve the same path.
 func sessionDir() (string, error) {
-	if dir := os.Getenv("IMESSAGE_DATA_DIR"); dir != "" {
-		return dir, nil
-	}
 	dataDir := os.Getenv("XDG_DATA_HOME")
 	if dataDir == "" {
 		home, err := os.UserHomeDir()

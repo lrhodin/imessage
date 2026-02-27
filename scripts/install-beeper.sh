@@ -537,7 +537,6 @@ DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//
 NEEDS_LOGIN=false
 
 # Session dir matches Go sessionDir(): XDG_DATA_HOME/mautrix-imessage
-# (IMESSAGE_DATA_DIR is checked first in Go but not used for multi-instance)
 SESSION_DIR_BASE="${XDG_DATA_HOME:-$HOME/.local/share}"
 SESSION_DIR="$SESSION_DIR_BASE/mautrix-imessage"
 SESSION_FILE="$SESSION_DIR/session.json"
