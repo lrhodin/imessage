@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/urfave/cli/v2"
 	"maunium.net/go/mautrix"
@@ -186,6 +187,24 @@ func cmdLogin(ctx *cli.Context) error {
 		whoami, err = beeperapi.Whoami(baseDomain, matrixResp.AccessToken)
 		if err != nil {
 			return fmt.Errorf("failed to get user details: %w", err)
+		}
+	}
+	// The Beeper API may not have the username ready immediately after login
+	// for some accounts. Retry with backoff to handle propagation delay.
+	if whoami.UserInfo.Username == "" {
+		for attempt := 1; attempt <= 5; attempt++ {
+			fmt.Fprintf(os.Stderr, "Waiting for username from Beeper API (attempt %d/5)...\n", attempt)
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			whoami, err = beeperapi.Whoami(baseDomain, matrixResp.AccessToken)
+			if err != nil {
+				return fmt.Errorf("failed to get user details: %w", err)
+			}
+			if whoami.UserInfo.Username != "" {
+				break
+			}
+		}
+		if whoami.UserInfo.Username == "" {
+			return fmt.Errorf("Beeper API returned empty username after login — please try again in a few seconds")
 		}
 	}
 	envCfg.Username = whoami.UserInfo.Username
