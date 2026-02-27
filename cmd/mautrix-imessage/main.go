@@ -146,6 +146,15 @@ func repairPermissions(br *mxmain.BridgeMain) {
 	}
 
 	mxid := id.NewUserID(username, "beeper.com")
+
+	// Remove bogus entries (example.com defaults, empty username) from the
+	// in-memory map so findAdminUser() doesn't pick them over the real MXID.
+	for key := range br.Config.Bridge.Permissions {
+		if strings.Contains(key, "example.com") || key == "*" || key == "@:" || key == "@" {
+			delete(br.Config.Bridge.Permissions, key)
+		}
+	}
+
 	br.Config.Bridge.Permissions[string(mxid)] = &bridgeconfig.PermissionLevelAdmin
 
 	// Also persist the fix to config.yaml so this is a one-time repair.
