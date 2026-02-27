@@ -104,16 +104,25 @@ else
 fi
 
 # ── Belt-and-suspenders: fix broken permissions ───────────────
-# If bbctl generated config with an empty username, the mautrix config
-# upgrader replaces the permissions with example.com defaults, causing
-# "bridge.permissions not configured". Detect and fix this.
-if grep -q '@.*example\.com' "$CONFIG" 2>/dev/null; then
+# If bbctl generated config with an empty username, the UserID becomes
+# "@:beeper.com" which is invalid. The mautrix config upgrader then
+# replaces it with example.com defaults, causing "bridge.permissions
+# not configured". Detect BOTH patterns and fix them.
+MXID="@${WHOAMI}:beeper.com"
+PERMS_BAD=false
+if grep -q '"@:' "$CONFIG" 2>/dev/null; then
+    echo "⚠  Detected empty username in permissions (@:beeper.com) — fixing..."
+    PERMS_BAD=true
+elif grep -q '@.*example\.com' "$CONFIG" 2>/dev/null; then
     echo "⚠  Detected example.com in permissions — fixing..."
-    # $WHOAMI was captured from 'bbctl whoami' earlier in this script
+    PERMS_BAD=true
+fi
+if [ "$PERMS_BAD" = true ]; then
     if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
-        MXID="@${WHOAMI}:beeper.com"
-        sed -i "s|@.*example\.com.*: admin|\"${MXID}\": admin|" "$CONFIG"
-        sed -i "/@.*example\.com/d" "$CONFIG"
+        sed -i '/permissions:/,/^[^ ]/{
+            s/"@[^"]*": admin/"'"$MXID"'": admin/
+            /@.*example\.com/d
+        }' "$CONFIG"
         echo "✓ Fixed permissions: $MXID → admin"
     else
         echo ""
