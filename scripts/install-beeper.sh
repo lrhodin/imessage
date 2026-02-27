@@ -94,7 +94,24 @@ if ! "$BBCTL" whoami >/dev/null 2>&1 || "$BBCTL" whoami 2>&1 | grep -qi "not log
     echo ""
     "$BBCTL" login
 fi
-WHOAMI=$("$BBCTL" whoami 2>&1 | head -1 || true)
+# Capture username (discard stderr so "Fetching whoami..." doesn't contaminate)
+WHOAMI=$("$BBCTL" whoami 2>/dev/null | head -1 || true)
+# On slow machines the Beeper API may not have the username ready yet — retry
+if [ -z "$WHOAMI" ] || [ "$WHOAMI" = "null" ]; then
+    for i in 1 2 3 4 5; do
+        echo "  Waiting for username from Beeper API (attempt $i/5)..."
+        sleep 3
+        WHOAMI=$("$BBCTL" whoami 2>/dev/null | head -1 || true)
+        [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ] && break
+    done
+fi
+if [ -z "$WHOAMI" ] || [ "$WHOAMI" = "null" ]; then
+    echo ""
+    echo "ERROR: Could not get username from Beeper API."
+    echo "  This can happen when the API is slow to propagate after login."
+    echo "  Wait a minute and re-run: make install-beeper"
+    exit 1
+fi
 echo "✓ Logged in: $WHOAMI"
 
 # ── Check for existing bridge registration ────────────────────
