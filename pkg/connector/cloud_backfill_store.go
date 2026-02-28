@@ -1648,12 +1648,22 @@ func (s *cloudBackfillStore) saveAttachmentCacheEntry(ctx context.Context, recor
 // and cloud_chat, and any other case where a portal exists without a
 // corresponding cloud_chat row.
 func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portalID string) {
-	res, _ := s.db.Exec(ctx,
+	res, err := s.db.Exec(ctx,
 		`UPDATE cloud_chat SET fwd_backfill_done=1 WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, portalID,
 	)
-	if rows, _ := res.RowsAffected(); rows == 0 {
-		_, _ = s.db.Exec(ctx, `
+
+	// If the UPDATE failed (cancelled context, DB error) or matched 0 rows
+	// (no cloud_chat entry for this portal), insert a synthetic row.
+	// Use context.Background() — this MUST persist even during shutdown.
+	needsInsert := err != nil || res == nil
+	if !needsInsert {
+		if rows, _ := res.RowsAffected(); rows == 0 {
+			needsInsert = true
+		}
+	}
+	if needsInsert {
+		_, _ = s.db.Exec(context.Background(), `
 			INSERT OR IGNORE INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, fwd_backfill_done)
 			VALUES ($1, $2, $3, $4, 1)`,
 			s.loginID, "synthetic:"+portalID, portalID, time.Now().UnixMilli(),

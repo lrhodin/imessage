@@ -2757,7 +2757,9 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 
 		if len(allMessages) == 0 {
 			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")
-			c.cloudStore.markForwardBackfillDone(ctx, portalID)
+			// Use context.Background() — if the bridge is shutting down, ctx
+			// may be cancelled but we still need to persist the flag.
+			c.cloudStore.markForwardBackfillDone(context.Background(), portalID)
 			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
 		}
 
