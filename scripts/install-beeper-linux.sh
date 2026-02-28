@@ -21,6 +21,28 @@ echo "  iMessage Bridge Setup (Beeper · Linux)"
 echo "═══════════════════════════════════════════════"
 echo ""
 
+# ── Permission repair helper ──────────────────────────────────
+# Detects and fixes broken permissions in config.yaml. Matches the same
+# patterns as repairPermissions() / fixPermissionsOnDisk() in the Go code:
+#   - Empty username: "@:beeper.com", "@": ...
+#   - Example defaults: "@admin:example.com", "example.com", "*": relay
+# Usage: fix_permissions <config_path> <username>
+fix_permissions() {
+    local config="$1" whoami="$2"
+    if grep -q '"@:\|"@":\|@.*example\.com\|"\*":.*relay' "$config" 2>/dev/null; then
+        local mxid="@${whoami}:beeper.com"
+        sed -i '/permissions:/,/^[^ ]/{
+            s/"@[^"]*": admin/"'"$mxid"'": admin/
+            /@.*example\.com/d
+            /"\*":.*relay/d
+            /"@":/d
+            /"@:/d
+        }' "$config"
+        return 0
+    fi
+    return 1
+}
+
 # ── Build bbctl from source ───────────────────────────────────
 BBCTL="$BBCTL_DIR/bbctl"
 
@@ -159,27 +181,12 @@ else
 fi
 
 # ── Belt-and-suspenders: fix broken permissions ───────────────
-# If bbctl generated config with an empty username, the UserID becomes
-# "@:beeper.com" which is invalid. The mautrix config upgrader then
-# replaces it with example.com defaults, causing "bridge.permissions
-# not configured". Detect BOTH patterns and fix them.
-MXID="@${WHOAMI}:beeper.com"
-PERMS_BAD=false
-if grep -q '"@:' "$CONFIG" 2>/dev/null; then
-    echo "⚠  Detected empty username in permissions (@:beeper.com) — fixing..."
-    PERMS_BAD=true
-elif grep -q '@.*example\.com' "$CONFIG" 2>/dev/null; then
-    echo "⚠  Detected example.com in permissions — fixing..."
-    PERMS_BAD=true
-fi
-if [ "$PERMS_BAD" = true ]; then
-    if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
-        sed -i '/permissions:/,/^[^ ]/{
-            s/"@[^"]*": admin/"'"$MXID"'": admin/
-            /@.*example\.com/d
-        }' "$CONFIG"
-        echo "✓ Fixed permissions: $MXID → admin"
-    else
+if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
+    if fix_permissions "$CONFIG" "$WHOAMI"; then
+        echo "✓ Fixed permissions: @${WHOAMI}:beeper.com → admin"
+    fi
+else
+    if grep -q '"@:\|"@":\|@.*example\.com' "$CONFIG" 2>/dev/null; then
         echo ""
         echo "ERROR: Config has broken permissions and cannot determine your username."
         echo "  Try: $BBCTL login && rm $CONFIG && re-run make install-beeper"
@@ -601,14 +608,9 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     # Re-check permissions after login — the config upgrader may have
     # corrupted them even with -n if repairPermissions couldn't determine
     # the username.
-    if grep -q '@.*example\.com' "$CONFIG" 2>/dev/null || grep -q '"@":' "$CONFIG" 2>/dev/null; then
-        if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
-            MXID="@${WHOAMI}:beeper.com"
-            sed -i '/permissions:/,/^[^ ]/{
-                s/"@[^"]*": admin/"'"$MXID"'": admin/
-                /@.*example\.com/d
-            }' "$CONFIG"
-            echo "✓ Fixed permissions after login: $MXID → admin"
+    if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
+        if fix_permissions "$CONFIG" "$WHOAMI"; then
+            echo "✓ Fixed permissions after login: @${WHOAMI}:beeper.com → admin"
         fi
     fi
 fi
@@ -750,7 +752,8 @@ fi
 
 # Fix permissions before starting — the config upgrader may have replaced
 # the user's permissions with example.com defaults on a previous run.
-if grep -q '@.*example\.com' "$CONFIG" 2>/dev/null; then
+# Detects: empty username (@:, @":), example.com defaults, wildcard relay.
+if grep -q '"@:\|"@":\|@.*example\.com\|"\*":.*relay' "$CONFIG" 2>/dev/null; then
     BBCTL_BIN="$BBCTL_DIR/bbctl"
     if [ -x "$BBCTL_BIN" ]; then
         FIX_USER=$("$BBCTL_BIN" whoami 2>/dev/null | head -1 || true)
@@ -759,6 +762,9 @@ if grep -q '@.*example\.com' "$CONFIG" 2>/dev/null; then
             sed -i '/permissions:/,/^[^ ]/{
                 s/"@[^"]*": admin/"'"$FIX_MXID"'": admin/
                 /@.*example\.com/d
+                /"\*":.*relay/d
+                /"@":/d
+                /"@:/d
             }' "$CONFIG"
             ok "Fixed permissions: $FIX_MXID"
         fi

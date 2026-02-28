@@ -147,10 +147,13 @@ func repairPermissions(br *mxmain.BridgeMain) {
 
 	mxid := id.NewUserID(username, "beeper.com")
 
-	// Remove bogus entries (example.com defaults, empty username) from the
-	// in-memory map so findAdminUser() doesn't pick them over the real MXID.
+	// Remove bogus entries (example.com defaults, empty username variants,
+	// wildcard relay) from the in-memory map so findAdminUser() doesn't
+	// pick them over the real MXID. Patterns match fixPermissionsOnDisk()
+	// and the shell fix_permissions() function.
 	for key := range br.Config.Bridge.Permissions {
-		if strings.Contains(key, "example.com") || key == "*" || key == "@:" || key == "@" {
+		if strings.Contains(key, "example.com") || key == "*" ||
+			key == "@:" || key == "@" || strings.HasPrefix(key, "@:") {
 			delete(br.Config.Bridge.Permissions, key)
 		}
 	}
@@ -200,22 +203,63 @@ func loadBBCtlUsername() string {
 	return ""
 }
 
-// fixPermissionsOnDisk patches the config.yaml file to replace any broken
-// admin MXID in the permissions block with the correct one.
+// fixPermissionsOnDisk patches the config.yaml file to set the correct admin
+// MXID and remove all bogus permission entries (example.com defaults, empty
+// username variants). Matches the same patterns as the in-memory cleanup in
+// repairPermissions() and the shell repair function in the install scripts.
 func fixPermissionsOnDisk(configPath string, mxid string) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return
 	}
-	content := string(data)
-	// Replace any admin line that has an invalid/example MXID
-	lines := strings.Split(content, "\n")
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasSuffix(trimmed, ": admin") && (strings.Contains(trimmed, "example.com") || strings.Contains(trimmed, `"@:`) || strings.Contains(trimmed, `"@":`)) {
-			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-			lines[i] = indent + `"` + mxid + `": admin`
+
+	// isBogusPermLine returns true for any permissions entry that should be
+	// removed: example.com defaults, empty-username variants, wildcard relay.
+	isBogusPermLine := func(trimmed string) bool {
+		// Empty-username patterns: "@:beeper.com", "@": ...
+		if strings.Contains(trimmed, `"@":`) || strings.Contains(trimmed, `"@:`) {
+			return true
 		}
+		// Example.com defaults: "@admin:example.com", "example.com"
+		if strings.Contains(trimmed, "example.com") {
+			return true
+		}
+		// Wildcard relay entry from example config
+		if strings.HasPrefix(trimmed, `"*":`) {
+			return true
+		}
+		return false
 	}
-	_ = os.WriteFile(configPath, []byte(strings.Join(lines, "\n")), 0600)
+
+	lines := strings.Split(string(data), "\n")
+	inPerms := false
+	replaced := false
+	var out []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Track whether we're inside the permissions block.
+		if strings.HasPrefix(trimmed, "permissions:") {
+			inPerms = true
+			out = append(out, line)
+			continue
+		}
+		// A non-indented, non-empty line exits the permissions block.
+		if inPerms && trimmed != "" && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			inPerms = false
+		}
+
+		if inPerms && isBogusPermLine(trimmed) {
+			if !replaced && strings.Contains(trimmed, ": admin") {
+				// Replace the first admin line with the correct MXID.
+				indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+				out = append(out, indent+`"`+mxid+`": admin`)
+				replaced = true
+			}
+			// Drop all other bogus lines (example.com user, wildcard relay, etc.)
+			continue
+		}
+		out = append(out, line)
+	}
+	_ = os.WriteFile(configPath, []byte(strings.Join(out, "\n")), 0600)
 }
