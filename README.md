@@ -112,6 +112,17 @@ If the bridge runs outside your LAN (e.g., cloud VM), forward port 5001 TCP to y
 
 **Intel Macs**: The NAC relay is not needed. The bridge runs the x86_64 NAC emulator locally on Linux using hardware data from the extracted key. Chat history starts from when you log in and contacts appear by phone number / email.
 
+If your extracted key is missing `_enc` fields, you can enrich it once on an
+x86_64 Linux host:
+
+```bash
+cd rustpush/open-absinthe
+cargo run --bin enrich_hw_key -- --file ~/hwkey.b64 > ~/hwkey-enriched.b64
+```
+
+The command reads base64 input (from `--file`, `--key`, or stdin), derives
+missing `_enc` fields, and prints the enriched base64 key to stdout.
+
 ### Step 2: Build and install the bridge (on Linux)
 
 #### With Beeper

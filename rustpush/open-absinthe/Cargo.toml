@@ -11,11 +11,11 @@ ureq = "2.9"
 sha1 = "0.10"
 rand = "0.8"
 log = "0.4"
+base64 = "0.21"
+serde_json = "1.0"
 
 [dev-dependencies]
 plist = "1.7"
-base64 = "0.21"
-serde_json = "1.0"
 ureq = { version = "2.9", features = ["native-tls"] }
 native-tls = "0.2"
 

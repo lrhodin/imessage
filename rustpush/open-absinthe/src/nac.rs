@@ -102,6 +102,23 @@ fn compute_missing_enc_fields(hw: &mut HardwareConfig) -> Result<(), AbsintheErr
     Ok(())
 }
 
+/// Enrich a hardware key by deriving missing `_enc` fields.
+///
+/// This is only available when the crate is built on x86_64 Linux, where the
+/// XNU property encryption routine is compiled in.
+#[cfg(has_xnu_encrypt)]
+pub fn enrich_missing_enc_fields(hw: &mut HardwareConfig) -> Result<(), AbsintheError> {
+    compute_missing_enc_fields(hw)
+}
+
+/// Enriching missing `_enc` fields is not supported on this target.
+#[cfg(not(has_xnu_encrypt))]
+pub fn enrich_missing_enc_fields(_hw: &mut HardwareConfig) -> Result<(), AbsintheError> {
+    Err(AbsintheError::Other(
+        "Missing _enc derivation is only supported on x86_64 Linux builds".into(),
+    ))
+}
+
 // ============================================================================
 // Serde helpers
 // ============================================================================
