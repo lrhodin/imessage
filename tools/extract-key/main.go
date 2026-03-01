@@ -216,10 +216,13 @@ static struct hw_result read_hardware() {
     io_data(platform, CFSTR("oycqAZloTNDm"), &r.rom_enc,       &r.rom_enc_len);
     io_data(platform, CFSTR("abKPld1EcMni"), &r.mlb_enc,       &r.mlb_enc_len);
 
-    // On Apple Silicon, ROM is not in NVRAM — derive from en0 MAC address
+    // On Apple Silicon, ROM is not in NVRAM — derive from en0 MAC address.
+    // Only do this on ARM; on Intel we fall through to nvram CLI below.
+#if defined(__arm64__)
     if (r.rom == NULL || r.rom_len == 0) {
         get_mac_address(&r.rom, &r.rom_len);
     }
+#endif
 
     // On Apple Silicon, MLB is under "mlb-serial-number" as padded data
     if (!r.mlb) {
@@ -260,6 +263,64 @@ static struct hw_result read_hardware() {
                 io_data(options, CFSTR("4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:ROM"), &r.rom, &r.rom_len);
             }
             IOObjectRelease(options);
+        }
+    }
+
+    // Fallback: shell out to `nvram` CLI which uses a different code path
+    // and works on Macs where the IODeviceTree properties above aren't found
+    // (e.g. MacBookAir7,2).
+    if (r.rom == NULL || r.rom_len == 0) {
+        FILE *fp = popen("nvram '4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:ROM' 2>/dev/null", "r");
+        if (fp) {
+            char buf[512];
+            if (fgets(buf, sizeof(buf), fp)) {
+                // nvram output: "4D1EDE05-...:ROM\t<value>"
+                // Value is percent-encoded binary: $%1e%eb%08n%ae
+                char *tab = strchr(buf, '\t');
+                if (tab) {
+                    tab++; // skip tab
+                    char *nl = strchr(tab, '\n');
+                    if (nl) *nl = '\0';
+                    // Decode percent-encoded binary
+                    int alloc = (int)strlen(tab);
+                    unsigned char *decoded = (unsigned char*)malloc(alloc);
+                    int dlen = 0;
+                    for (int i = 0; tab[i]; i++) {
+                        if (tab[i] == '%' && tab[i+1] && tab[i+2]) {
+                            char hex[3] = {tab[i+1], tab[i+2], 0};
+                            decoded[dlen++] = (unsigned char)strtol(hex, NULL, 16);
+                            i += 2;
+                        } else {
+                            decoded[dlen++] = (unsigned char)tab[i];
+                        }
+                    }
+                    if (dlen > 0) {
+                        r.rom = decoded;
+                        r.rom_len = dlen;
+                    } else {
+                        free(decoded);
+                    }
+                }
+            }
+            pclose(fp);
+        }
+    }
+    if (!r.mlb) {
+        FILE *fp = popen("nvram '4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:MLB' 2>/dev/null", "r");
+        if (fp) {
+            char buf[512];
+            if (fgets(buf, sizeof(buf), fp)) {
+                char *tab = strchr(buf, '\t');
+                if (tab) {
+                    tab++;
+                    char *nl = strchr(tab, '\n');
+                    if (nl) *nl = '\0';
+                    if (strlen(tab) > 0) {
+                        r.mlb = strdup(tab);
+                    }
+                }
+            }
+            pclose(fp);
         }
     }
 
