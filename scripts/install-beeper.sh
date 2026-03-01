@@ -15,7 +15,7 @@ PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 # Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
 BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bbctl}"
 BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
-BBCTL_BRANCH="${BBCTL_BRANCH:-fix-bbctl}"
+BBCTL_BRANCH="${BBCTL_BRANCH:-master}"
 
 echo ""
 echo "═══════════════════════════════════════════════"

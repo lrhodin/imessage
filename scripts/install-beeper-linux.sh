@@ -13,7 +13,7 @@ CONFIG="$DATA_DIR/config.yaml"
 # Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
 BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bbctl}"
 BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
-BBCTL_BRANCH="${BBCTL_BRANCH:-fix-bbctl}"
+BBCTL_BRANCH="${BBCTL_BRANCH:-master}"
 
 echo ""
 echo "═══════════════════════════════════════════════"
@@ -245,75 +245,80 @@ if ! grep -q 'backfill_source:' "$CONFIG" 2>/dev/null; then
     sed -i '/cloudkit_backfill:/a\    backfill_source: cloudkit' "$CONFIG"
 fi
 
-# ── CloudKit backfill toggle (runs every time) ────────────────
+# ── CloudKit backfill toggle ───────────────────────────────────
+# Only prompt on first run (fresh DB). On re-runs, preserve existing setting.
+DB_PATH_CHECK=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
+IS_FRESH_DB=false
+if [ -z "$DB_PATH_CHECK" ] || [ ! -f "$DB_PATH_CHECK" ]; then
+    IS_FRESH_DB=true
+fi
+
 CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
 if [ -t 0 ]; then
-    echo ""
-    echo "CloudKit Backfill:"
-    echo "  When enabled, the bridge will sync your iMessage history from iCloud."
-    echo "  This requires entering your device PIN during login to join the iCloud Keychain."
-    echo "  When disabled, only new real-time messages are bridged (no PIN needed)."
-    echo ""
-    if [ "$CURRENT_BACKFILL" = "true" ]; then
-        read -p "Enable CloudKit message history backfill? [Y/n]: " ENABLE_BACKFILL
-        case "$ENABLE_BACKFILL" in
-            [nN]*) ENABLE_BACKFILL=false ;;
-            *)     ENABLE_BACKFILL=true ;;
-        esac
-    else
+    if [ "$IS_FRESH_DB" = "true" ]; then
+        echo ""
+        echo "CloudKit Backfill:"
+        echo "  When enabled, the bridge will sync your iMessage history from iCloud."
+        echo "  This requires entering your device PIN during login to join the iCloud Keychain."
+        echo "  When disabled, only new real-time messages are bridged (no PIN needed)."
+        echo ""
         read -p "Enable CloudKit message history backfill? [y/N]: " ENABLE_BACKFILL
         case "$ENABLE_BACKFILL" in
             [yY]*) ENABLE_BACKFILL=true ;;
             *)     ENABLE_BACKFILL=false ;;
         esac
-    fi
-    sed -i "s/cloudkit_backfill: .*/cloudkit_backfill: $ENABLE_BACKFILL/" "$CONFIG"
-    if [ "$ENABLE_BACKFILL" = "true" ]; then
-        echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
-        echo ""
-        echo "IMPORTANT: Before starting the bridge, sync your latest messages to iCloud"
-        echo "from an Apple device (iPhone, iPad, or Mac) to ensure all recent messages"
-        echo "are available for backfill."
-        echo ""
-        read -p "Have you synced your Apple device to iCloud? [y/N]: " ICLOUD_SYNCED
-        case "$ICLOUD_SYNCED" in
-            [yY]*) echo "✓ Great — backfill will include your latest messages" ;;
-            *)     echo "⚠ Please sync your Apple device to iCloud before starting the bridge" ;;
-        esac
+        sed -i "s/cloudkit_backfill: .*/cloudkit_backfill: $ENABLE_BACKFILL/" "$CONFIG"
+        if [ "$ENABLE_BACKFILL" = "true" ]; then
+            echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
+            echo ""
+            echo "IMPORTANT: Before starting the bridge, sync your latest messages to iCloud"
+            echo "from an Apple device (iPhone, iPad, or Mac) to ensure all recent messages"
+            echo "are available for backfill."
+            echo ""
+            read -p "Have you synced your Apple device to iCloud? [y/N]: " ICLOUD_SYNCED
+            case "$ICLOUD_SYNCED" in
+                [yY]*) echo "✓ Great — backfill will include your latest messages" ;;
+                *)     echo "⚠ Please sync your Apple device to iCloud before starting the bridge" ;;
+            esac
+        else
+            echo "✓ CloudKit backfill disabled — real-time messages only, no PIN needed"
+        fi
     else
-        echo "✓ CloudKit backfill disabled — real-time messages only, no PIN needed"
+        # Re-run: show current setting without prompting
+        if [ "$CURRENT_BACKFILL" = "true" ]; then
+            echo "✓ Backfill source: CloudKit (iCloud sync)"
+        else
+            echo "✓ Backfill: disabled (real-time messages only)"
+        fi
     fi
 fi
 
 # ── Max initial messages (new database + CloudKit backfill + interactive) ──
 CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
-if [ "$CURRENT_BACKFILL" = "true" ] && [ -t 0 ]; then
-    DB_PATH=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
-    if [ -z "$DB_PATH" ] || [ ! -f "$DB_PATH" ]; then
-        echo ""
-        echo "By default, all messages per chat will be backfilled."
-        echo "If you choose to limit, the minimum is 100 messages per chat."
-        read -p "Would you like to limit the number of messages? [y/N]: " LIMIT_MSGS
-        case "$LIMIT_MSGS" in
-            [yY]*)
-                while true; do
-                    read -p "Max messages per chat (minimum 100): " MAX_MSGS
-                    MAX_MSGS=$(echo "$MAX_MSGS" | tr -dc '0-9')
-                    if [ -n "$MAX_MSGS" ] && [ "$MAX_MSGS" -ge 100 ] 2>/dev/null; then
-                        break
-                    fi
-                    echo "Minimum is 100. Please enter a value of 100 or more."
-                done
-                sed -i "s/max_initial_messages: [0-9]*/max_initial_messages: $MAX_MSGS/" "$CONFIG"
-                # Disable backward backfill so the cap is the final word on message count
-                sed -i 's/max_batches: -1$/max_batches: 0/' "$CONFIG"
-                echo "✓ Max initial messages set to $MAX_MSGS per chat"
-                ;;
-            *)
-                echo "✓ Backfilling all messages"
-                ;;
-        esac
-    fi
+if [ "$CURRENT_BACKFILL" = "true" ] && [ "$IS_FRESH_DB" = "true" ] && [ -t 0 ]; then
+    echo ""
+    echo "By default, all messages per chat will be backfilled."
+    echo "If you choose to limit, the minimum is 100 messages per chat."
+    read -p "Would you like to limit the number of messages? [y/N]: " LIMIT_MSGS
+    case "$LIMIT_MSGS" in
+        [yY]*)
+            while true; do
+                read -p "Max messages per chat (minimum 100): " MAX_MSGS
+                MAX_MSGS=$(echo "$MAX_MSGS" | tr -dc '0-9')
+                if [ -n "$MAX_MSGS" ] && [ "$MAX_MSGS" -ge 100 ] 2>/dev/null; then
+                    break
+                fi
+                echo "Minimum is 100. Please enter a value of 100 or more."
+            done
+            sed -i "s/max_initial_messages: [0-9]*/max_initial_messages: $MAX_MSGS/" "$CONFIG"
+            # Disable backward backfill so the cap is the final word on message count
+            sed -i 's/max_batches: -1$/max_batches: 0/' "$CONFIG"
+            echo "✓ Max initial messages set to $MAX_MSGS per chat"
+            ;;
+        *)
+            echo "✓ Backfilling all messages"
+            ;;
+    esac
 fi
 
 # Tune backfill settings when CloudKit backfill is enabled

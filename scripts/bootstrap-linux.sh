@@ -103,7 +103,7 @@ install_go() {
 }
 
 if command -v go >/dev/null 2>&1; then
-    GO_VER=$(go version | grep -o 'go[0-9.]*' | head -1 | sed 's/go//')
+    GO_VER=$(go version | awk '{print $3}' | sed 's/^go//')
     GO_MAJOR=$(echo "$GO_VER" | cut -d. -f1)
     GO_MINOR=$(echo "$GO_VER" | cut -d. -f2)
     NEED_MINOR=$(echo "$MIN_GO" | cut -d. -f2)
