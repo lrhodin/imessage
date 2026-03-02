@@ -16,6 +16,10 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 16) {
                 headerSection
 
+                if isRunningOnAppleSilicon() {
+                    appleSiliconWarning
+                }
+
                 if extractor.isExtracting {
                     loadingSection
                 } else if let error = extractor.errorMessage {
@@ -50,6 +54,25 @@ struct ContentView: View {
                 .font(.subheadline)
                 .foregroundColor(.secondary)
         }
+    }
+
+    // MARK: - Apple Silicon Warning
+
+    private var appleSiliconWarning: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                Text("Apple Silicon Mac Detected")
+                    .fontWeight(.semibold)
+            }
+            Text("This tool is designed for Intel Macs. On Apple Silicon, the extracted key will be missing encrypted fields required by Apple. Use the NAC relay approach instead.")
+                .font(.callout)
+                .foregroundColor(.secondary)
+        }
+        .padding()
+        .background(Color.orange.opacity(0.1))
+        .cornerRadius(8)
     }
 
     // MARK: - Loading
