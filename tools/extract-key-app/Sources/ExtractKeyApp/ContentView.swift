@@ -37,7 +37,7 @@ struct ContentView: View {
             }
             .padding(24)
         }
-        .frame(minWidth: 600, idealWidth: 700, minHeight: 750, idealHeight: 900)
+        .frame(minWidth: 600, idealWidth: 700, minHeight: 850, idealHeight: 950)
         .onAppear {
             extractor.extract()
         }
