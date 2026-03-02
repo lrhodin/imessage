@@ -664,8 +664,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	// Set up contact source: external CardDAV > local macOS > iCloud CardDAV
 	if c.Main.Config.CardDAV.IsConfigured() {
-		c.contacts = newExternalCardDAVClient(c.Main.Config.CardDAV, log)
-		if c.contacts != nil {
+		extContacts := newExternalCardDAVClient(c.Main.Config.CardDAV, log)
+		if extContacts != nil {
+			c.contacts = extContacts
 			log.Info().Str("email", c.Main.Config.CardDAV.Email).Msg("Using external CardDAV for contacts")
 			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial external CardDAV sync failed")
@@ -689,12 +690,11 @@ func (c *IMClient) Connect(ctx context.Context) {
 			log.Warn().Msg("Local macOS contacts unavailable — contact names will not be resolved")
 		}
 	} else {
-		c.contacts = newCloudContactsClient(c.client, log)
-		if c.contacts != nil {
-			if cc, ok := c.contacts.(*cloudContactsClient); ok {
-				log.Info().Str("url", cc.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
-			}
-			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
+		cloudContacts := newCloudContactsClient(c.client, log)
+		if cloudContacts != nil {
+			c.contacts = cloudContacts
+			log.Info().Str("url", cloudContacts.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
+			if syncErr := cloudContacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial CardDAV sync failed")
 			} else {
 				c.setContactsReady(log)
