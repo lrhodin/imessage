@@ -3,11 +3,12 @@ import SwiftUI
 struct PopoverView: View {
     @ObservedObject var relay: RelayManager
     @ObservedObject var extractor: KeyExtractor
+    @ObservedObject var loginItem: LoginItemManager
     @State private var copied = false
     @State private var showLog = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             // Header
             HStack {
                 Text("NAC Relay")
@@ -167,9 +168,17 @@ struct PopoverView: View {
                 .font(.caption)
             }
 
-            // Quit
+            // Footer: Start at Login + Quit
             HStack {
+                Toggle("Start at Login", isOn: Binding(
+                    get: { loginItem.isEnabled },
+                    set: { _ in loginItem.toggle() }
+                ))
+                .toggleStyle(.checkbox)
+                .font(.caption)
+
                 Spacer()
+
                 Button("Quit") {
                     relay.stop()
                     NSApplication.shared.terminate(nil)
@@ -178,6 +187,6 @@ struct PopoverView: View {
             }
         }
         .padding()
-        .frame(width: 340)
+        .frame(width: 320)
     }
 }

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
 
 @main
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -7,6 +8,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var popover: NSPopover!
     let relay = RelayManager()
     let extractor = KeyExtractor()
+    let loginItem = LoginItemManager()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Create the status bar item
@@ -20,11 +22,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create the popover with SwiftUI content
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 340, height: 500)
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(
-            rootView: PopoverView(relay: relay, extractor: extractor)
+        let hostingController = NSHostingController(
+            rootView: PopoverView(relay: relay, extractor: extractor, loginItem: loginItem)
         )
+        // Let the SwiftUI view determine the popover size
+        hostingController.view.setFrameSize(NSSize(width: 340, height: 1))
+        popover.contentViewController = hostingController
 
         // Auto-start the relay
         relay.start()
