@@ -188,5 +188,6 @@ struct PopoverView: View {
         }
         .padding()
         .frame(width: 320)
+        .fixedSize()
     }
 }
