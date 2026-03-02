@@ -31,6 +31,27 @@ class HardwareExtractor: ObservableObject {
         }
     }
 
+    /// Enrich the current result by computing missing _enc fields.
+    func enrich() {
+        guard var result = result else { return }
+        var hw = result.config.inner
+        enrichMissingEncFields(&hw)
+        result.config.inner = hw
+        result.hasEncFields = !hw.platformSerialNumberEnc.isEmpty
+
+        // Regenerate base64 key
+        let jsonString = result.config.toOrderedJSON()
+        let jsonData = Data(jsonString.utf8)
+        result.base64Key = jsonData.base64EncodedString()
+
+        // Update warnings
+        result.warnings = result.warnings.filter {
+            !$0.contains("Enrich Key")
+        }
+
+        self.result = result
+    }
+
     // MARK: - Core extraction logic
 
     static func performExtraction() throws -> ExtractionResult {
@@ -143,9 +164,8 @@ class HardwareExtractor: ObservableObject {
             )
         } else if !hasEncFields {
             warnings.append(
-                "Encrypted IOKit properties (_enc fields) not present on this Mac. "
-                + "This is normal for older Intel models and macOS versions before Mojave. "
-                + "The bridge will compute them automatically."
+                "Encrypted IOKit properties (_enc fields) not present in IOKit on this Mac. "
+                + "Click \"Enrich Key\" to compute them."
             )
         }
 

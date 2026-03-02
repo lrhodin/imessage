@@ -13,8 +13,41 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# 1. Assemble the XNU encrypt function for x86_64 macOS
+echo "Assembling XNU encrypt function..."
+ENCRYPT_S="../../rustpush/open-absinthe/src/asm/encrypt.s"
+mkdir -p .build/lib
+
+# Patch the assembly for Mach-O:
+#   - Underscore prefix for global symbol (Mach-O convention)
+#   - Section directives (ELF → Mach-O)
+#   - Alignment directives (absolute → power-of-2)
+sed \
+    -e 's/\.global sub_ffffff8000ec7320/.globl _sub_ffffff8000ec7320/' \
+    -e 's/sub_ffffff8000ec7320:/_sub_ffffff8000ec7320:/' \
+    -e 's/^\.section \.data/.data/' \
+    -e 's/^\.section \.text/.text/' \
+    -e 's/\.align 0x100/.p2align 8/' \
+    -e 's/\.align 0x10$/.p2align 4/' \
+    "$ENCRYPT_S" > .build/encrypt_macos.s
+
+# Assemble for x86_64 (target 11.0 to match deployment target)
+clang -c -arch x86_64 -mmacosx-version-min=10.15 -o .build/encrypt.o .build/encrypt_macos.s
+
+# Create static library
+ar rcs .build/lib/libxnu_encrypt.a .build/encrypt.o
+echo "  Built .build/lib/libxnu_encrypt.a"
+
+# 2. Build the Swift app
+echo ""
+# Build for x86_64 regardless of host architecture
 echo "Building ExtractKeyApp for x86_64 (Intel)..."
-swift build -c release --arch x86_64
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then
+    swift build -c release
+else
+    swift build -c release --arch x86_64
+fi
 
 BINARY=".build/release/ExtractKeyApp"
 if [ ! -f "$BINARY" ]; then
@@ -31,7 +64,7 @@ echo ""
 echo "Binary: $BINARY"
 file "$BINARY"
 
-# Wrap in .app bundle
+# 3. Wrap in .app bundle
 APP="ExtractKey.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
@@ -57,7 +90,7 @@ cat > "$APP/Contents/Info.plist" << 'PLIST'
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
     <key>LSMinimumSystemVersion</key>
-    <string>11.0</string>
+    <string>10.15</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

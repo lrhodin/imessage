@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 #endif
 
 struct ContentView: View {
-    @StateObject private var extractor = HardwareExtractor()
+    @ObservedObject var extractor: HardwareExtractor
     @State private var copied = false
     @State private var saved = false
 
@@ -26,6 +26,9 @@ struct ContentView: View {
                     errorSection(error)
                 } else if let result = extractor.result {
                     hardwareInfoSection(result)
+                    if !result.hasEncFields && !result.isAppleSilicon {
+                        enrichSection
+                    }
                     if !result.warnings.isEmpty {
                         warningsSection(result.warnings)
                     }
@@ -37,7 +40,7 @@ struct ContentView: View {
             }
             .padding(24)
         }
-        .frame(minWidth: 600, idealWidth: 700, minHeight: 750, idealHeight: 850)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             extractor.extract()
         }
@@ -61,7 +64,7 @@ struct ContentView: View {
     private var appleSiliconWarning: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
+                SymbolOrText(systemName: "exclamationmark.triangle.fill", fallback: "⚠")
                     .foregroundColor(.orange)
                 Text("Apple Silicon Mac Detected")
                     .fontWeight(.semibold)
@@ -75,12 +78,38 @@ struct ContentView: View {
         .cornerRadius(8)
     }
 
+    // MARK: - Enrich
+
+    private var enrichSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                SymbolOrText(systemName: "lock.shield", fallback: "🔒")
+                    .foregroundColor(.blue)
+                Text("Encrypted Fields Missing")
+                    .fontWeight(.semibold)
+            }
+            Text("This Mac's IOKit doesn't expose encrypted hardware properties (_enc fields). "
+                + "You can compute them now to produce a complete key that looks identical to a newer Mac.")
+                .font(.callout)
+                .foregroundColor(.secondary)
+            Button(action: { extractor.enrich() }) {
+                HStack(spacing: 4) {
+                    SymbolOrText(systemName: "wand.and.stars", fallback: "✦")
+                    Text("Enrich Key")
+                }
+            }
+            .padding(.top, 2)
+        }
+        .padding()
+        .background(Color.blue.opacity(0.08))
+        .cornerRadius(8)
+    }
+
     // MARK: - Loading
 
     private var loadingSection: some View {
         HStack(spacing: 12) {
-            ProgressView()
-                .scaleEffect(0.8)
+            Text("⏳")
             Text("Reading hardware identifiers...")
                 .foregroundColor(.secondary)
         }
@@ -92,7 +121,7 @@ struct ContentView: View {
     private func errorSection(_ message: String) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                Image(systemName: "xmark.circle.fill")
+                SymbolOrText(systemName: "xmark.circle.fill", fallback: "✗")
                     .foregroundColor(.red)
                 Text("Extraction Failed")
                     .fontWeight(.semibold)
@@ -187,7 +216,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(warnings, id: \.self) { warning in
                 HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
+                    SymbolOrText(systemName: "exclamationmark.triangle.fill", fallback: "⚠")
                         .foregroundColor(.yellow)
                         .font(.callout)
                     Text(warning)
@@ -233,15 +262,13 @@ struct ContentView: View {
         HStack(spacing: 12) {
             Button(action: { copyToClipboard(key) }) {
                 HStack(spacing: 4) {
-                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                    Text(copied ? "Copied" : "Copy to Clipboard")
+                    Text(copied ? "✓ Copied" : "Copy to Clipboard")
                 }
             }
 
             Button(action: { saveToFile(key) }) {
                 HStack(spacing: 4) {
-                    Image(systemName: saved ? "checkmark" : "square.and.arrow.down")
-                    Text(saved ? "Saved" : "Save to File")
+                    Text(saved ? "✓ Saved" : "Save to File")
                 }
             }
 
@@ -253,7 +280,6 @@ struct ContentView: View {
                 extractor.extract()
             }) {
                 HStack(spacing: 4) {
-                    Image(systemName: "arrow.clockwise")
                     Text("Re-extract")
                 }
             }
