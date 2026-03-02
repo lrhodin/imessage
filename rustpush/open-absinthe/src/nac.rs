@@ -102,6 +102,24 @@ fn compute_missing_enc_fields(hw: &mut HardwareConfig) -> Result<(), AbsintheErr
     Ok(())
 }
 
+/// Public wrapper for `compute_missing_enc_fields`.
+/// On x86_64 Linux, derives any absent `_enc` fields from their plaintext
+/// counterparts using the XNU kernel encryption function.
+/// On other platforms, returns an error.
+pub fn enrich_missing_enc_fields(hw: &mut HardwareConfig) -> Result<(), AbsintheError> {
+    #[cfg(has_xnu_encrypt)]
+    {
+        compute_missing_enc_fields(hw)?;
+        Ok(())
+    }
+    #[cfg(not(has_xnu_encrypt))]
+    {
+        Err(AbsintheError::Other(
+            "Missing _enc field derivation is only supported on x86_64 Linux builds".into(),
+        ))
+    }
+}
+
 // ============================================================================
 // Serde helpers
 // ============================================================================

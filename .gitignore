@@ -34,4 +34,7 @@ mautrix-imessage-v2.app/
 .DS_Store
 .apl.history
 tools/apl/
+tools/extract-key-app/.build/
+tools/extract-key-app/ExtractKey.app/
+!rustpush/open-absinthe/src/bin/
 _todo/
