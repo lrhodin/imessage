@@ -130,25 +130,24 @@ private func jsonEscape(_ s: String) -> String {
 }
 
 extension HardwareConfig {
-    /// Serialize to JSON with keys in alphabetical order to match the Go tool output.
-    /// Swift's JSONEncoder uses NSDictionary internally which is unordered,
-    /// so we build the JSON string manually.
+    /// Serialize to JSON with key order matching the Go extract-key tool output.
+    /// This exact ordering is important — Apple's servers are sensitive to it.
     func toOrderedJSON() -> String {
         let pairs: [(String, String)] = [
-            ("board_id", "\"\(jsonEscape(boardID))\""),
-            ("io_mac_address", ioMacAddress.jsonArray),
-            ("mlb", "\"\(jsonEscape(mlb))\""),
-            ("mlb_enc", mlbEnc.jsonArray),
-            ("os_build_num", "\"\(jsonEscape(osBuildNum))\""),
-            ("platform_serial_number", "\"\(jsonEscape(platformSerialNumber))\""),
-            ("platform_serial_number_enc", platformSerialNumberEnc.jsonArray),
-            ("platform_uuid", "\"\(jsonEscape(platformUUID))\""),
-            ("platform_uuid_enc", platformUUIDEnc.jsonArray),
-            ("product_name", "\"\(jsonEscape(productName))\""),
-            ("rom", rom.jsonArray),
-            ("rom_enc", romEnc.jsonArray),
             ("root_disk_uuid", "\"\(jsonEscape(rootDiskUUID))\""),
+            ("mlb", "\"\(jsonEscape(mlb))\""),
+            ("product_name", "\"\(jsonEscape(productName))\""),
+            ("platform_uuid_enc", platformUUIDEnc.jsonArray),
+            ("rom", rom.jsonArray),
+            ("platform_serial_number", "\"\(jsonEscape(platformSerialNumber))\""),
+            ("io_mac_address", ioMacAddress.jsonArray),
+            ("platform_uuid", "\"\(jsonEscape(platformUUID))\""),
+            ("os_build_num", "\"\(jsonEscape(osBuildNum))\""),
+            ("platform_serial_number_enc", platformSerialNumberEnc.jsonArray),
+            ("board_id", "\"\(jsonEscape(boardID))\""),
             ("root_disk_uuid_enc", rootDiskUUIDEnc.jsonArray),
+            ("mlb_enc", mlbEnc.jsonArray),
+            ("rom_enc", romEnc.jsonArray),
         ]
         let body = pairs.map { "\"\($0.0)\":\($0.1)" }.joined(separator: ",")
         return "{\(body)}"
@@ -156,14 +155,15 @@ extension HardwareConfig {
 }
 
 extension MacOSConfig {
-    /// Serialize to JSON with keys in alphabetical order to match the Go tool output.
+    /// Serialize to JSON with key order matching the Go extract-key tool output.
+    /// This exact ordering is important — Apple's servers are sensitive to it.
     func toOrderedJSON() -> String {
         let pairs: [(String, String)] = [
             ("aoskit_version", "\"\(jsonEscape(aoskitVersion))\""),
-            ("device_id", "\"\(jsonEscape(deviceID))\""),
-            ("icloud_ua", "\"\(jsonEscape(icloudUA))\""),
             ("inner", inner.toOrderedJSON()),
             ("protocol_version", "\(protocolVersion)"),
+            ("device_id", "\"\(jsonEscape(deviceID))\""),
+            ("icloud_ua", "\"\(jsonEscape(icloudUA))\""),
             ("version", "\"\(jsonEscape(version))\""),
         ]
         let body = pairs.map { "\"\($0.0)\":\($0.1)" }.joined(separator: ",")
