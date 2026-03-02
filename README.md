@@ -114,14 +114,26 @@ This derives the missing `_enc` fields from plaintext values using the XNU encry
 
 **Apple Silicon Macs** lack the encrypted IOKit properties needed by the x86_64 NAC emulator. You must also run the NAC relay — a small HTTP server that generates Apple validation data using the Mac's native `AAAbsintheContext` framework.
 
-**Set up the relay:**
+**Option 1: GUI app (recommended)**
+
+Build and run the menubar app — it bundles the relay, key extraction, and status monitoring in one place:
+
+```bash
+cd tools/nac-relay-app
+./build.sh
+open NACRelay.app
+```
+
+The app appears as an antenna icon in the menubar (no dock icon). It auto-starts the relay on launch, shows the relay address and auth info, and lets you extract the hardware key with relay credentials embedded — all from the popover UI. Click **Extract Hardware Key**, then **Copy Key** to get the base64 key.
+
+**Option 2: CLI**
 
 ```bash
 go build -o ~/bin/nac-relay ./tools/nac-relay/
 ~/bin/nac-relay --setup
 ```
 
-This installs a LaunchAgent that starts on login and auto-restarts if it crashes. On first run, grant **Full Disk Access** and **Contacts** access when prompted — this enables chat history backfill (including images and attachments), contact name resolution, and SMS forwarding from the Mac.
+This installs a LaunchAgent that starts on login and auto-restarts if it crashes.
 
 The relay auto-generates a self-signed TLS certificate and a random bearer token on first start, stored in `~/Library/Application Support/nac-relay/`. All endpoints (except `/health`) require the token. The bridge verifies the relay's certificate fingerprint (Go side) and authenticates with the token (both Go and Rust sides).
 
@@ -130,7 +142,7 @@ The relay auto-generates a self-signed TLS certificate and a random bearer token
 tail -f /tmp/nac-relay.log
 ```
 
-**Extract the key with the relay URL:**
+**Extract the key with the relay URL (CLI only — the GUI app does this automatically):**
 
 ```bash
 go run tools/extract-key/main.go -relay https://<your-mac-ip>:5001/validation-data
@@ -331,7 +343,8 @@ nac-validation/              # Local NAC via AppleAccount.framework (macOS)
 tools/
   ├── extract-key/           # Hardware key extraction CLI (Go, run on Mac)
   ├── extract-key-app/       # Hardware key extraction GUI (SwiftUI, x86_64, run on Mac)
-  └── nac-relay/             # NAC validation + contacts + backfill relay (run on Mac)
+  ├── nac-relay/             # NAC validation relay CLI (Go, run on Mac)
+  └── nac-relay-app/         # NAC relay menubar app (SwiftUI, arm64, wraps nac-relay)
 rustpush/open-absinthe/
   └── src/bin/enrich_hw_key  # Enrich keys missing _enc fields (x86_64 Linux CLI)
 imessage/                    # macOS chat.db + Contacts reader
