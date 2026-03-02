@@ -23,12 +23,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create the popover with SwiftUI content
         popover = NSPopover()
         popover.behavior = .transient
-        let hostingController = NSHostingController(
+        popover.contentViewController = NSHostingController(
             rootView: PopoverView(relay: relay, extractor: extractor, loginItem: loginItem)
         )
-        // Let the SwiftUI view determine the popover size
-        hostingController.view.setFrameSize(NSSize(width: 340, height: 1))
-        popover.contentViewController = hostingController
 
         // Auto-start the relay
         relay.start()
