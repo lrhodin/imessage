@@ -36,5 +36,7 @@ mautrix-imessage-v2.app/
 tools/apl/
 tools/extract-key-app/.build/
 tools/extract-key-app/ExtractKey.app/
+tools/nac-relay-app/.build/
+tools/nac-relay-app/NACRelay.app/
 !rustpush/open-absinthe/src/bin/
 _todo/
