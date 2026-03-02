@@ -52,7 +52,7 @@ var caps = &event.RoomFeatures{
 			},
 		},
 	},
-	MaxTextLength:       -1,
+	MaxTextLength:       0,
 	Reply:               event.CapLevelFullySupported,
 	Edit:                event.CapLevelFullySupported,
 	Delete:              event.CapLevelFullySupported,
