@@ -180,10 +180,11 @@ class HardwareExtractor: ObservableObject {
         )
 
         // 12. JSON → base64
-        let encoder = JSONEncoder()
-        // Don't escape forward slashes (Go doesn't) — available since macOS 10.15
-        encoder.outputFormatting = [.withoutEscapingSlashes]
-        let jsonData = try encoder.encode(config)
+        // Use manual ordered JSON serialization instead of JSONEncoder,
+        // because JSONEncoder's keyed container uses NSDictionary internally
+        // which does not preserve key insertion order.
+        let jsonString = config.toOrderedJSON()
+        let jsonData = Data(jsonString.utf8)
         let base64Key = jsonData.base64EncodedString()
 
         return ExtractionResult(

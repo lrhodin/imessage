@@ -40,12 +40,16 @@ struct ByteArray: Codable, Equatable {
     var hexString: String {
         bytes.map { String(format: "%02x", $0) }.joined(separator: ":")
     }
+
+    /// JSON array string like [10,20,30] — matches Go/Rust output.
+    var jsonArray: String {
+        "[\(bytes.map { String($0) }.joined(separator: ","))]"
+    }
 }
 
 // MARK: - HardwareConfig
 
 /// Matches rustpush/open-absinthe/src/nac.rs HardwareConfig exactly.
-/// Uses a custom encode(to:) to guarantee field order matches Go/Rust output.
 struct HardwareConfig: Codable {
     var productName: String
     var ioMacAddress: ByteArray
@@ -78,33 +82,11 @@ struct HardwareConfig: Codable {
         case mlb
         case mlbEnc = "mlb_enc"
     }
-
-    // Explicit encode to guarantee key ordering matches Go struct field order.
-    // Swift's auto-synthesized Codable uses a dictionary-backed container
-    // that does NOT preserve insertion order.
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(productName, forKey: .productName)
-        try c.encode(ioMacAddress, forKey: .ioMacAddress)
-        try c.encode(platformSerialNumber, forKey: .platformSerialNumber)
-        try c.encode(platformUUID, forKey: .platformUUID)
-        try c.encode(rootDiskUUID, forKey: .rootDiskUUID)
-        try c.encode(boardID, forKey: .boardID)
-        try c.encode(osBuildNum, forKey: .osBuildNum)
-        try c.encode(platformSerialNumberEnc, forKey: .platformSerialNumberEnc)
-        try c.encode(platformUUIDEnc, forKey: .platformUUIDEnc)
-        try c.encode(rootDiskUUIDEnc, forKey: .rootDiskUUIDEnc)
-        try c.encode(rom, forKey: .rom)
-        try c.encode(romEnc, forKey: .romEnc)
-        try c.encode(mlb, forKey: .mlb)
-        try c.encode(mlbEnc, forKey: .mlbEnc)
-    }
 }
 
 // MARK: - MacOSConfig
 
 /// Matches rustpush/src/macos.rs MacOSConfig.
-/// Uses a custom encode(to:) to guarantee field order matches Go struct field order.
 struct MacOSConfig: Codable {
     var inner: HardwareConfig
     var version: String
@@ -121,16 +103,71 @@ struct MacOSConfig: Codable {
         case icloudUA = "icloud_ua"
         case aoskitVersion = "aoskit_version"
     }
+}
 
-    // Explicit encode to guarantee key ordering matches Go struct field order.
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(inner, forKey: .inner)
-        try c.encode(version, forKey: .version)
-        try c.encode(protocolVersion, forKey: .protocolVersion)
-        try c.encode(deviceID, forKey: .deviceID)
-        try c.encode(icloudUA, forKey: .icloudUA)
-        try c.encode(aoskitVersion, forKey: .aoskitVersion)
+// MARK: - Ordered JSON Serialization
+
+/// Escape a string for JSON output (handles quotes, backslashes, control chars).
+/// Does NOT escape forward slashes (matching Go's json.Marshal).
+private func jsonEscape(_ s: String) -> String {
+    var result = ""
+    for c in s {
+        switch c {
+        case "\"": result += "\\\""
+        case "\\": result += "\\\\"
+        case "\n": result += "\\n"
+        case "\r": result += "\\r"
+        case "\t": result += "\\t"
+        default:
+            if c.asciiValue != nil && c.asciiValue! < 0x20 {
+                result += String(format: "\\u%04x", c.asciiValue!)
+            } else {
+                result.append(c)
+            }
+        }
+    }
+    return result
+}
+
+extension HardwareConfig {
+    /// Serialize to JSON with key order matching Go's struct field declaration order.
+    /// Swift's JSONEncoder uses NSDictionary internally which is unordered,
+    /// so we build the JSON string manually.
+    func toOrderedJSON() -> String {
+        let pairs: [(String, String)] = [
+            ("product_name", "\"\(jsonEscape(productName))\""),
+            ("io_mac_address", ioMacAddress.jsonArray),
+            ("platform_serial_number", "\"\(jsonEscape(platformSerialNumber))\""),
+            ("platform_uuid", "\"\(jsonEscape(platformUUID))\""),
+            ("root_disk_uuid", "\"\(jsonEscape(rootDiskUUID))\""),
+            ("board_id", "\"\(jsonEscape(boardID))\""),
+            ("os_build_num", "\"\(jsonEscape(osBuildNum))\""),
+            ("platform_serial_number_enc", platformSerialNumberEnc.jsonArray),
+            ("platform_uuid_enc", platformUUIDEnc.jsonArray),
+            ("root_disk_uuid_enc", rootDiskUUIDEnc.jsonArray),
+            ("rom", rom.jsonArray),
+            ("rom_enc", romEnc.jsonArray),
+            ("mlb", "\"\(jsonEscape(mlb))\""),
+            ("mlb_enc", mlbEnc.jsonArray),
+        ]
+        let body = pairs.map { "\"\($0.0)\":\($0.1)" }.joined(separator: ",")
+        return "{\(body)}"
+    }
+}
+
+extension MacOSConfig {
+    /// Serialize to JSON with key order matching Go's struct field declaration order.
+    func toOrderedJSON() -> String {
+        let pairs: [(String, String)] = [
+            ("inner", inner.toOrderedJSON()),
+            ("version", "\"\(jsonEscape(version))\""),
+            ("protocol_version", "\(protocolVersion)"),
+            ("device_id", "\"\(jsonEscape(deviceID))\""),
+            ("icloud_ua", "\"\(jsonEscape(icloudUA))\""),
+            ("aoskit_version", "\"\(jsonEscape(aoskitVersion))\""),
+        ]
+        let body = pairs.map { "\"\($0.0)\":\($0.1)" }.joined(separator: ",")
+        return "{\(body)}"
     }
 }
 
