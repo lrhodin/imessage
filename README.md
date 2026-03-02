@@ -15,7 +15,7 @@ This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustp
 
 **Features**: text, images, video, audio, files, reactions/tapbacks, edits, unsends, typing indicators, read receipts, group chats, SMS forwarding, and contact name resolution.
 
-**Platforms**: macOS (full features) and Linux (via hardware key extracted from a Mac once).
+**Platforms**: macOS (full features) and Linux (via hardware key extracted from a Mac once). Please note, Contact Key Verification must be disabled for the bridge to function.
 
 ## Quick Start (macOS)
 
