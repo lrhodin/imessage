@@ -979,6 +979,31 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		}
 	}
 
+	// Catch late-arriving APNs messages that backfill missed due to CloudKit
+	// propagation delay. If the message timestamp predates backfill completion,
+	// ingest it into cloud_message and trigger a re-backfill for correct ordering.
+	flushedAt := atomic.LoadInt64(&c.apnsBufferFlushedAt)
+	if flushedAt > 0 && int64(msg.TimestampMs) < flushedAt && msg.Uuid != "" && c.cloudStore != nil {
+		// Already bridged → duplicate, drop
+		if dbMsgs, err := c.Main.Bridge.DB.Message.GetAllPartsByID(
+			context.Background(), c.UserLogin.ID, makeMessageID(msg.Uuid),
+		); err == nil && len(dbMsgs) > 0 {
+			log.Debug().Str("uuid", msg.Uuid).Msg("Dropping late APNs message already bridged")
+			return
+		}
+		// Already in cloud_message → will be (or was) picked up by backfill
+		if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+			log.Debug().Str("uuid", msg.Uuid).Msg("Dropping late APNs message already in cloud_message")
+			return
+		}
+		// New late message → ingest into backfill pipeline for correct ordering
+		sender := c.makeEventSender(msg.Sender)
+		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+		sender = c.canonicalizeDMSender(portalKey, sender)
+		c.ingestLateAPNsForBackfill(log, msg, portalKey, sender)
+		return
+	}
+
 	sender := c.makeEventSender(msg.Sender)
 	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	sender = c.canonicalizeDMSender(portalKey, sender)
@@ -1174,6 +1199,174 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			ConvertMessageFunc: convertAttachment,
 		})
 	}
+}
+
+// ingestLateAPNsForBackfill handles APNs messages that arrive after backfill
+// completed but have timestamps older than the backfill window. Instead of
+// bridging them as real-time events (which lands at the bottom of the timeline),
+// it writes them to cloud_message and triggers a re-backfill so they appear at
+// the correct chronological position.
+func (c *IMClient) ingestLateAPNsForBackfill(log zerolog.Logger, msg rustpushgo.WrappedMessage, portalKey networkid.PortalKey, sender bridgev2.EventSender) {
+	ctx := context.Background()
+	portalID := string(portalKey.ID)
+	intent := c.Main.Bridge.Bot
+
+	// Step 1: Upload attachments to Matrix and cache with synthetic record_names.
+	var attRows []cloudAttachmentRow
+	attIndex := 0
+	for _, att := range msg.Attachments {
+		if att.MimeType == "x-richlink/meta" || att.MimeType == "x-richlink/image" {
+			continue
+		}
+		if att.InlineData == nil {
+			attIndex++
+			continue
+		}
+
+		syntheticKey := fmt.Sprintf("apns:%s_att%d", msg.Uuid, attIndex)
+		data := *att.InlineData
+		mimeType := att.MimeType
+		fileName := att.Filename
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		if fileName == "" {
+			fileName = "attachment"
+		}
+
+		// Convert CAF Opus voice messages
+		var durationMs int
+		if mimeType == "audio/x-caf" {
+			data, mimeType, fileName, durationMs = convertAudioForMatrix(data, mimeType, fileName)
+		}
+
+		// Transcode non-MP4 videos
+		if strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+			data, mimeType, fileName = convertVideoForMatrix(ctx, data, mimeType, fileName)
+		}
+
+		// Process images
+		var imgWidth, imgHeight int
+		var thumbData []byte
+		var thumbW, thumbH int
+		if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
+			if mimeType == "image/gif" {
+				if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+					imgWidth, imgHeight = cfg.Width, cfg.Height
+				}
+			} else if img, _, isJPEG := decodeImageData(data); img != nil {
+				b := img.Bounds()
+				imgWidth, imgHeight = b.Dx(), b.Dy()
+				if !isJPEG {
+					var buf bytes.Buffer
+					if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
+						data = buf.Bytes()
+						mimeType = "image/jpeg"
+						fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
+					}
+				}
+				if imgWidth > 800 || imgHeight > 800 {
+					thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, imgWidth, imgHeight)
+				}
+			}
+		}
+
+		msgType := mimeToMsgType(mimeType)
+		content := &event.MessageEventContent{
+			MsgType: msgType,
+			Body:    fileName,
+			Info: &event.FileInfo{
+				MimeType: mimeType,
+				Size:     len(data),
+				Width:    imgWidth,
+				Height:   imgHeight,
+			},
+		}
+		if durationMs > 0 {
+			content.MSC3245Voice = &event.MSC3245Voice{}
+			content.MSC1767Audio = &event.MSC1767Audio{Duration: durationMs}
+		}
+
+		url, encFile, uploadErr := intent.UploadMedia(ctx, "", data, fileName, mimeType)
+		if uploadErr != nil {
+			log.Warn().Err(uploadErr).Str("att_key", syntheticKey).Msg("Failed to upload late APNs attachment to Matrix")
+			attIndex++
+			continue
+		}
+		if encFile != nil {
+			content.File = encFile
+		} else {
+			content.URL = url
+		}
+
+		if thumbData != nil {
+			thumbURL, thumbEnc, thumbErr := intent.UploadMedia(ctx, "", thumbData, "thumbnail.jpg", "image/jpeg")
+			if thumbErr == nil {
+				if thumbEnc != nil {
+					content.Info.ThumbnailFile = thumbEnc
+				} else {
+					content.Info.ThumbnailURL = thumbURL
+				}
+				content.Info.ThumbnailInfo = &event.FileInfo{
+					MimeType: "image/jpeg",
+					Size:     len(thumbData),
+					Width:    thumbW,
+					Height:   thumbH,
+				}
+			}
+		}
+
+		c.attachmentContentCache.Store(syntheticKey, content)
+		attRows = append(attRows, cloudAttachmentRow{
+			GUID:       fmt.Sprintf("%s_att%d", msg.Uuid, attIndex),
+			MimeType:   mimeType,
+			Filename:   fileName,
+			FileSize:   int64(len(data)),
+			RecordName: syntheticKey,
+		})
+		attIndex++
+	}
+
+	// Step 2: Write to cloud_message.
+	var attachmentsJSON string
+	if len(attRows) > 0 {
+		if jsonBytes, err := json.Marshal(attRows); err == nil {
+			attachmentsJSON = string(jsonBytes)
+		}
+	}
+	msgText := ""
+	if msg.Text != nil {
+		msgText = *msg.Text
+	}
+	senderStr := ""
+	if msg.Sender != nil {
+		senderStr = *msg.Sender
+	}
+
+	err := c.cloudStore.ingestAPNsMessage(ctx, msg.Uuid, portalID, int64(msg.TimestampMs), senderStr, sender.IsFromMe, msgText, attachmentsJSON)
+	if err != nil {
+		log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to ingest late APNs message into cloud_message")
+		return
+	}
+
+	// Step 3: Reset forward backfill and trigger ChatResync.
+	c.cloudStore.resetForwardBackfillDone(ctx, portalID)
+
+	log.Info().
+		Str("uuid", msg.Uuid).
+		Str("portal_id", portalID).
+		Uint64("msg_ts", msg.TimestampMs).
+		Int64("flushed_at", atomic.LoadInt64(&c.apnsBufferFlushedAt)).
+		Int("attachments", len(attRows)).
+		Msg("Late APNs message ingested into cloud_message for backfill")
+
+	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatResync{
+		EventMeta: simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventChatResync,
+			PortalKey: portalKey,
+		},
+		GetChatInfoFunc: c.GetChatInfo,
+	})
 }
 
 func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessage) {

@@ -1823,3 +1823,26 @@ func (s *cloudBackfillStore) deleteOrphanedMessages(ctx context.Context) (int64,
 	n, _ := result.RowsAffected()
 	return n, nil
 }
+
+// ingestAPNsMessage writes an APNs-delivered message into cloud_message so that
+// FetchMessages (forward backfill) can pick it up with correct chronological ordering.
+// attachmentsJSON should be a JSON-serialized []cloudAttachmentRow with synthetic
+// record_names that match keys pre-populated in attachmentContentCache.
+func (s *cloudBackfillStore) ingestAPNsMessage(ctx context.Context, uuid, portalID string, timestampMS int64, sender string, isFromMe bool, text string, attachmentsJSON string) error {
+	nowMS := time.Now().UnixMilli()
+	_, err := s.db.Exec(ctx, `
+		INSERT OR IGNORE INTO cloud_message (login_id, guid, portal_id, timestamp_ms, sender, is_from_me, text, attachments_json, has_body, created_ts, updated_ts)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`, s.loginID, uuid, portalID, timestampMS, sender, isFromMe, text, attachmentsJSON, text != "", nowMS, nowMS)
+	return err
+}
+
+// resetForwardBackfillDone clears the fwd_backfill_done flag for a portal so
+// that a subsequent ChatResync triggers FetchMessages(forward=true) again.
+// Used when a late APNs message is ingested into cloud_message post-backfill.
+func (s *cloudBackfillStore) resetForwardBackfillDone(ctx context.Context, portalID string) {
+	_, _ = s.db.Exec(ctx,
+		`UPDATE cloud_chat SET fwd_backfill_done=0 WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, portalID,
+	)
+}
