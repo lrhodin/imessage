@@ -127,6 +127,42 @@ func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 	return nil
 }
 
+// getUniqueParticipantCount counts the number of unique *people* in a
+// participant list by collapsing multiple self-handles into one and merging
+// handles that belong to the same contact.
+func (c *IMClient) getUniqueParticipantCount(participants []string) int {
+	seen := make(map[string]bool)
+	selfSeen := false
+	count := 0
+	for _, p := range participants {
+		normalized := normalizeIdentifierForPortalID(p)
+		if normalized == "" {
+			count++
+			continue
+		}
+		if c.isMyHandle(normalized) {
+			if !selfSeen {
+				selfSeen = true
+				count++
+			}
+			continue
+		}
+		if seen[normalized] {
+			continue
+		}
+		count++
+		seen[normalized] = true
+		contact := c.lookupContact(normalized)
+		if contact == nil {
+			continue
+		}
+		for _, altID := range contactPortalIDs(contact) {
+			seen[altID] = true
+		}
+	}
+	return count
+}
+
 // getContactChatGUIDs returns all possible chat.db GUIDs for a DM portal,
 // including GUIDs for alternate phone numbers/emails belonging to the same contact.
 func (c *IMClient) getContactChatGUIDs(portalID string) []string {

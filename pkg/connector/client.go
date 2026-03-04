@@ -4430,7 +4430,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 }
 
 func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
-	isGroup := len(participants) > 2 || groupName != nil
+	isGroup := c.getUniqueParticipantCount(participants) > 2 || groupName != nil
 
 	if isGroup {
 		// When a persistent group UUID (sender_guid / gid) is available,
