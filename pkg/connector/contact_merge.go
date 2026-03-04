@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 
+	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 
 	"github.com/lrhodin/imessage/imessage"
@@ -253,4 +254,44 @@ func normalizePhoneForPortalID(phone string) string {
 		return "+" + n
 	}
 	return "+" + n
+}
+
+// canonicalContactHandle returns a deterministic canonical handle for a contact
+// that has multiple iMessage handles (phone + email). This ensures CloudKit
+// backfill creates a single portal per contact rather than one per handle.
+// If the identifier doesn't resolve to a multi-handle contact, returns it unchanged.
+func (c *IMClient) canonicalContactHandle(identifier string) string {
+	contact := c.lookupContact(identifier)
+	if contact == nil || !contact.HasName() {
+		return identifier
+	}
+	altIDs := contactPortalIDs(contact)
+	if len(altIDs) <= 1 {
+		return identifier
+	}
+	sort.Strings(altIDs)
+	return altIDs[0]
+}
+
+// canonicalizeDMSender remaps the sender identity for DM events so that the
+// ghost matches the portal's canonical handle. Without this, a contact sending
+// from their email handle into a phone-based DM portal causes a phantom ghost
+// to briefly join the room.
+func (c *IMClient) canonicalizeDMSender(portalKey networkid.PortalKey, sender bridgev2.EventSender) bridgev2.EventSender {
+	if sender.IsFromMe {
+		return sender
+	}
+	portalID := string(portalKey.ID)
+	// Only remap for DM portals (not groups or gid: portals).
+	if strings.Contains(portalID, ",") || strings.HasPrefix(portalID, "gid:") {
+		return sender
+	}
+	canonicalUserID := makeUserID(portalID)
+	if sender.Sender != canonicalUserID {
+		return bridgev2.EventSender{
+			IsFromMe: false,
+			Sender:   canonicalUserID,
+		}
+	}
+	return sender
 }

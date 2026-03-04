@@ -946,6 +946,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 
 	sender := c.makeEventSender(msg.Sender)
 	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	sender = c.canonicalizeDMSender(portalKey, sender)
 
 	// Drop messages that couldn't be resolved to a real portal.
 	// makePortalKey returns ID:"unknown" when participants and sender are both
@@ -1161,7 +1162,7 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		EventMeta: simplevent.EventMeta{
 			Type:      evtType,
 			PortalKey: portalKey,
-			Sender:    c.makeEventSender(msg.Sender),
+			Sender:    c.canonicalizeDMSender(portalKey, c.makeEventSender(msg.Sender)),
 			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
 		},
 		TargetMessage: makeMessageID(targetGUID),
@@ -1185,7 +1186,7 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventEdit,
 			PortalKey: portalKey,
-			Sender:    c.makeEventSender(msg.Sender),
+			Sender:    c.canonicalizeDMSender(portalKey, c.makeEventSender(msg.Sender)),
 			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
 		},
 		Data:          newText,
@@ -1233,7 +1234,7 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventMessageRemove,
 			PortalKey: portalKey,
-			Sender:    c.makeEventSender(msg.Sender),
+			Sender:    c.canonicalizeDMSender(portalKey, c.makeEventSender(msg.Sender)),
 			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
 		},
 		TargetMessage: makeMessageID(targetGUID),
@@ -1601,6 +1602,7 @@ resolved:
 
 	readTime := time.UnixMilli(int64(msg.TimestampMs))
 	sender := c.makeEventSender(msg.Sender)
+	sender = c.canonicalizeDMSender(portalKey, sender)
 
 	if !sender.IsFromMe {
 		// Skip ghost receipts for messages that were backfilled from CloudKit.
@@ -1667,6 +1669,12 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 	}
 
 	normalizedSender := normalizeIdentifierForPortalID(ptrStringOr(msg.Sender, ""))
+	// For DM portals, use the portal ID as the sender identity so the ghost
+	// matches the canonical handle (avoids phantom ghost from alternate handles).
+	portalID := string(portalKey.ID)
+	if !strings.Contains(portalID, ",") && !strings.HasPrefix(portalID, "gid:") {
+		normalizedSender = portalID
+	}
 	senderUserID := makeUserID(normalizedSender)
 	ghost, err := c.Main.Bridge.GetGhostByID(ctx, senderUserID)
 	if err != nil || ghost == nil {
@@ -1735,7 +1743,7 @@ found:
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventTyping,
 			PortalKey: portalKey,
-			Sender:    c.makeEventSender(msg.Sender),
+			Sender:    c.canonicalizeDMSender(portalKey, c.makeEventSender(msg.Sender)),
 			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
 		},
 		Timeout: 60 * time.Second,
@@ -4460,7 +4468,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 }
 
 func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
-	isGroup := c.getUniqueParticipantCount(participants) > 2 || groupName != nil
+	isGroup := c.getUniqueParticipantCount(participants) > 2 || (groupName != nil && *groupName != "")
 
 	if isGroup {
 		// When a persistent group UUID (sender_guid / gid) is available,
@@ -4735,12 +4743,24 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 
 	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
 	if isGroup {
-		// For gid: portals, get the sender_guid from the portal ID itself
-		// and look up participants from the cloud store or portal metadata.
 		var participants []string
 		var guid string
 		if strings.HasPrefix(portalID, "gid:") {
-			guid = strings.TrimPrefix(portalID, "gid:")
+			// Prefer original-case sender_guid from cache (populated by
+			// makePortalKey on incoming messages and loadSenderGuidsFromDB
+			// on restart). Falls back to metadata, then portal ID (lossy).
+			c.imGroupGuidsMu.RLock()
+			guid = c.imGroupGuids[portalID]
+			c.imGroupGuidsMu.RUnlock()
+			if guid == "" {
+				if meta, ok := portal.Metadata.(*PortalMetadata); ok && meta.SenderGuid != "" {
+					guid = meta.SenderGuid
+				}
+			}
+			if guid == "" {
+				// Last resort: extract from portal ID (lowercase, lossy)
+				guid = strings.TrimPrefix(portalID, "gid:")
+			}
 			// Look up participants from cloud store
 			if c.cloudStore != nil {
 				ctx := context.Background()
@@ -4772,7 +4792,7 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 			groupName = &name
 		}
 
-		// For gid: portals, guid is already set from portal ID.
+		// For gid: portals, guid is already set above (cache/metadata/portal ID).
 		// For legacy comma-separated portals, look up from cache/metadata.
 		if guid == "" {
 			c.imGroupGuidsMu.RLock()
