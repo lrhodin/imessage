@@ -270,6 +270,11 @@ func (c *IMClient) canonicalContactHandle(identifier string) string {
 		return identifier
 	}
 	sort.Strings(altIDs)
+	for _, id := range altIDs {
+		if strings.HasPrefix(id, "tel:") {
+			return id
+		}
+	}
 	return altIDs[0]
 }
 
