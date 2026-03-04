@@ -78,13 +78,48 @@ type failedAttachmentEntry struct {
 const maxAttachmentRetries = 5
 
 
+// isPermanentAttachmentError returns true if the error message indicates a
+// permanently broken record that will never succeed on retry (corrupt data,
+// missing fields, bad encryption keys).
+func isPermanentAttachmentError(errMsg string) bool {
+	permanentPatterns := []string{
+		"has no bundled_request_id",
+		"has no body",
+		"has no signature",
+		"has no item",          // FordChunk
+		"has no meta",
+		"has no encryption metadata",
+		"wrong length",
+		"signature mismatch",
+		"CmacSiv decrypt failed",
+		"Ford protobuf decode",
+		"MMCS authorize error",
+		"OOB",
+		"chunk count mismatch",
+		"all chunks decrypted to zero",
+		"decrypt panic",
+		"no results",
+	}
+	for _, p := range permanentPatterns {
+		if strings.Contains(errMsg, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // recordAttachmentFailure increments the retry count for a failed attachment.
+// Permanent errors (corrupt data, missing fields) immediately hit maxAttachmentRetries
+// so the Go-side retry loop abandons them without wasting time.
 // Returns the updated entry so callers can log the retry count.
 func (c *IMClient) recordAttachmentFailure(recordName, errMsg string) *failedAttachmentEntry {
 	entry := &failedAttachmentEntry{lastError: errMsg, retries: 1}
 	if prev, loaded := c.failedAttachments.Load(recordName); loaded {
 		old := prev.(*failedAttachmentEntry)
 		entry.retries = old.retries + 1
+	}
+	if isPermanentAttachmentError(errMsg) {
+		entry.retries = maxAttachmentRetries
 	}
 	c.failedAttachments.Store(recordName, entry)
 	return entry
