@@ -1074,7 +1074,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 		batch = append(batch, cloudChatUpsertRow{
 			CloudChatID:      chat.CloudChatId,
 			RecordName:       chat.RecordName,
-			GroupID:          strings.ToLower(chat.GroupId),
+			GroupID:          chat.GroupId,
 			PortalID:         portalID,
 			Service:          chat.Service,
 			DisplayName:      nullableString(chat.DisplayName),
@@ -1453,8 +1453,16 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	}
 
 	if len(remoteParticipants) == 1 {
-		// Standard DM — portal ID is the remote participant
-		return remoteParticipants[0]
+		// Standard DM — portal ID is the remote participant.
+		// Use contact merging so that separate CloudKit chat records for
+		// the same contact (one per handle) resolve to a single portal.
+		handle := remoteParticipants[0]
+		resolved := c.resolveContactPortalID(handle)
+		if string(resolved) == handle {
+			resolved = networkid.PortalID(c.canonicalContactHandle(handle))
+		}
+		resolved = c.resolveExistingDMPortalID(string(resolved))
+		return string(resolved)
 	}
 
 	// Self-chat (Notes to Self): all participants are our own handle.
