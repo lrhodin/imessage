@@ -3246,16 +3246,69 @@ impl Client {
         &self,
         record_name: String,
     ) -> Result<Vec<u8>, WrappedError> {
-        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS, pcs_keys_for_record};
+        use rustpush::cloud_messages::{CloudAttachment, MESSAGES_SERVICE};
+        use cloudkit_proto::CloudKitRecord;
 
-        // download_attachment consumes the writer via into_values().
-        // Use a SharedWriter so we can recover the written bytes after the call.
-        let shared = SharedWriter::new();
-        let mut files = HashMap::new();
-        files.insert(record_name.clone(), shared.clone());
-        cloud_messages.download_attachment(files).await
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
             .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to download CloudKit attachment {}: {}", record_name, e),
+                msg: format!("Failed to get CloudKit container for {}: {}", record_name, e),
+            })?;
+        let zone = container.private_zone("attachmentManateeZone".to_string());
+        let key = container.get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE).await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to get zone encryption config for {}: {}", record_name, e),
+            })?;
+
+        // Fetch the record individually and handle errors gracefully instead of
+        // relying on rustpush's get_record which panics on missing records.
+        let results = container.perform_operations(
+            &CloudKitSession::new(),
+            &FetchRecordOperation::many(&ALL_ASSETS, &zone, &[record_name.clone()]),
+            IsolationLevel::Operation,
+        ).await.map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to fetch CloudKit record {}: {}", record_name, e),
+        })?;
+
+        // Check if the record fetch succeeded (rustpush silently drops errors
+        // in FetchedRecords::new, then panics in get_record).
+        if results.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: format!("CloudKit returned no results for attachment {}", record_name),
+            });
+        }
+        let fetched = match &results[0] {
+            Ok(record) => record,
+            Err(e) => {
+                return Err(WrappedError::GenericError {
+                    msg: format!("CloudKit record fetch failed for {}: {}", record_name, e),
+                });
+            }
+        };
+
+        // Decrypt the record to get the CloudAttachment with the asset reference.
+        let attachment: CloudAttachment = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| fetched.get_record(Some(&key)))
+        ).map_err(|panic_info| {
+            let panic_msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "unknown panic".to_string()
+            };
+            WrappedError::GenericError {
+                msg: format!("Failed to decrypt CloudKit attachment {}: {}", record_name, panic_msg),
+            }
+        })?;
+
+        // Download the actual asset data.
+        let shared = SharedWriter::new();
+        let records = FetchedRecords::new(&results);
+        container.get_assets(&records.assets, vec![(&attachment.lqa, shared.clone())]).await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to download CloudKit asset for {}: {}", record_name, e),
             })?;
         Ok(shared.into_bytes())
     }
