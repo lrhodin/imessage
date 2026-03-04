@@ -36,6 +36,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"go.mau.fi/util/ffmpeg"
 	"go.mau.fi/util/ptr"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
@@ -1107,6 +1108,18 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			WrappedMessage: &msg,
 			Attachment:     &att,
 			Index:          attIndex,
+		}
+		// Start background video transcoding for inline non-MP4 videos
+		if att.IsInline && att.InlineData != nil && strings.HasPrefix(att.MimeType, "video/") && att.MimeType != "video/mp4" {
+			ch := make(chan *transcodedVideo, 1)
+			attMsg.transcodeCh = ch
+			inData := *att.InlineData
+			attMime := att.MimeType
+			attName := att.Filename
+			go func() {
+				d, m, n := convertVideoForMatrix(context.Background(), inData, attMime, attName)
+				ch <- &transcodedVideo{data: d, mimeType: m, fileName: n}
+			}()
 		}
 		attIndex++
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*attachmentMessage]{
@@ -3336,6 +3349,11 @@ func (c *IMClient) downloadAndUploadAttachment(
 		data, mimeType, fileName, durationMs = convertAudioForMatrix(data, mimeType, fileName)
 	}
 
+	// Transcode non-MP4 videos (e.g. MOV/HEVC) to MP4/H.264 for Matrix clients
+	if strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+		data, mimeType, fileName = convertVideoForMatrix(ctx, data, mimeType, fileName)
+	}
+
 	// Convert non-JPEG images to JPEG and extract dimensions/thumbnail
 	var imgWidth, imgHeight int
 	var thumbData []byte
@@ -4877,10 +4895,41 @@ func (c *IMClient) buildGroupName(members []string) string {
 // Message conversion
 // ============================================================================
 
+type transcodedVideo struct {
+	data     []byte
+	mimeType string
+	fileName string
+}
+
 type attachmentMessage struct {
 	*rustpushgo.WrappedMessage
-	Attachment *rustpushgo.WrappedAttachment
-	Index      int
+	Attachment  *rustpushgo.WrappedAttachment
+	Index       int
+	transcodeCh <-chan *transcodedVideo
+}
+
+func convertVideoForMatrix(ctx context.Context, data []byte, mimeType, fileName string) ([]byte, string, string) {
+	if !ffmpeg.Supported() {
+		return data, mimeType, fileName
+	}
+	converted, err := ffmpeg.ConvertBytes(ctx, data, ".mp4", nil, []string{
+		"-pix_fmt", "yuv420p",
+		"-c:v", "libx264",
+		"-preset", "fast",
+		"-crf", "23",
+		"-c:a", "aac",
+		"-movflags", "+faststart",
+	}, mimeType)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to transcode video to MP4")
+		return data, mimeType, fileName
+	}
+	newName := strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".mp4"
+	zerolog.Ctx(ctx).Debug().
+		Int("original_size", len(data)).
+		Int("converted_size", len(converted)).
+		Msg("Transcoded video to MP4/H.264")
+	return converted, "video/mp4", newName
 }
 
 // convertURLPreviewToBeeper parses rich link sideband attachments from an
@@ -5024,6 +5073,19 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		inlineData = *att.InlineData
 		if att.UtiType == "com.apple.coreaudio-format" || mimeType == "audio/x-caf" {
 			inlineData, mimeType, fileName, durationMs = convertAudioForMatrix(inlineData, mimeType, fileName)
+		}
+	}
+
+	// Transcode non-MP4 videos (e.g. MOV/HEVC) to MP4/H.264 for Matrix clients
+	if inlineData != nil && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+		if attMsg.transcodeCh != nil {
+			if result := <-attMsg.transcodeCh; result != nil {
+				inlineData = result.data
+				mimeType = result.mimeType
+				fileName = result.fileName
+			}
+		} else {
+			inlineData, mimeType, fileName = convertVideoForMatrix(ctx, inlineData, mimeType, fileName)
 		}
 	}
 

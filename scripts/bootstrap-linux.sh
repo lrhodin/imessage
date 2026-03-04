@@ -29,6 +29,7 @@ dpkg -s libssl-dev   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libssl-dev"
 # which often fails on WSL2 due to qemu/configure issues.
 dpkg -s libunicorn-dev >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libunicorn-dev"
 command -v sqlite3 >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES sqlite3"
+command -v ffmpeg  >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES ffmpeg"
 
 # Deduplicate
 APT_PACKAGES=$(echo "$APT_PACKAGES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
