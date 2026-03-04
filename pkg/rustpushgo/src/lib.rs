@@ -3253,20 +3253,35 @@ impl Client {
         use rustpush::cloud_messages::{CloudAttachment, MESSAGES_SERVICE};
         use cloudkit_proto::CloudKitRecord;
 
-        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-        let container = cloud_messages.get_container().await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to get CloudKit container for {}: {}", record_name, e),
-            })?;
-        let zone = container.private_zone("attachmentManateeZone".to_string());
-        let key = container.get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE).await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to get zone encryption config for {}: {}", record_name, e),
-            })?;
-
         let mut last_err = String::new();
+        // Backoff: 2s, 8s, 30s — enough time for rate limits / auth expiry to clear.
+        let backoffs = [2000u64, 8000, 30000];
 
         for attempt in 1..=3u64 {
+            // Re-initialize container + auth on each attempt so retries get fresh
+            // MMCS tokens. Stale tokens cause protobuf decode panics when Apple
+            // returns an error page instead of a valid AuthorizeGetResponse.
+            let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+            let container = match cloud_messages.get_container().await {
+                Ok(c) => c,
+                Err(e) => {
+                    last_err = format!("attempt {} container init: {}", attempt, e);
+                    log::warn!("CloudKit container init error for {} (attempt {}): {}", record_name, attempt, e);
+                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
+                    continue;
+                }
+            };
+            let zone = container.private_zone("attachmentManateeZone".to_string());
+            let key = match container.get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE).await {
+                Ok(k) => k,
+                Err(e) => {
+                    last_err = format!("attempt {} zone config: {}", attempt, e);
+                    log::warn!("CloudKit zone config error for {} (attempt {}): {}", record_name, attempt, e);
+                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
+                    continue;
+                }
+            };
+
             // Fetch the record individually and check for errors before get_record.
             let results = match container.perform_operations(
                 &CloudKitSession::new(),
@@ -3277,7 +3292,7 @@ impl Client {
                 Err(e) => {
                     last_err = format!("attempt {} fetch: {}", attempt, e);
                     log::warn!("CloudKit fetch error for {} (attempt {}): {}", record_name, attempt, e);
-                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await; }
+                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
                     continue;
                 }
             };
@@ -3285,7 +3300,7 @@ impl Client {
             if results.is_empty() {
                 last_err = format!("attempt {}: no results returned", attempt);
                 log::warn!("CloudKit returned no results for {} (attempt {})", record_name, attempt);
-                if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await; }
+                if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
                 continue;
             }
 
@@ -3294,7 +3309,7 @@ impl Client {
                 Err(e) => {
                     last_err = format!("attempt {} record error: {}", attempt, e);
                     log::warn!("CloudKit record error for {} (attempt {}): {}", record_name, attempt, e);
-                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await; }
+                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
                     continue;
                 }
             };
@@ -3314,7 +3329,7 @@ impl Client {
                     };
                     last_err = format!("attempt {} decrypt panic: {}", attempt, panic_msg);
                     log::warn!("CloudKit decrypt panic for {} (attempt {}): {}", record_name, attempt, panic_msg);
-                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await; }
+                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
                     continue;
                 }
             };
@@ -3356,7 +3371,7 @@ impl Client {
             }
 
             if attempt < 3 {
-                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await;
             }
         }
 

@@ -75,7 +75,7 @@ type failedAttachmentEntry struct {
 	retries   int
 }
 
-const maxAttachmentRetries = 3
+const maxAttachmentRetries = 5
 
 
 // recordAttachmentFailure increments the retry count for a failed attachment.
