@@ -2348,7 +2348,14 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 		// metadata — NOT auto-generated contact-resolved names — since
 		// the metadata GroupName is used for outbound message routing.
 		if strings.HasPrefix(portalID, "gid:") {
+			// Prefer original-case sender_guid from cache (populated by
+			// makePortalKey synchronously before GetChatInfo runs).
 			gid := strings.TrimPrefix(portalID, "gid:")
+			c.imGroupGuidsMu.RLock()
+			if cached := c.imGroupGuids[portalID]; cached != "" {
+				gid = cached
+			}
+			c.imGroupGuidsMu.RUnlock()
 			c.imGroupNamesMu.RLock()
 			protocolName := c.imGroupNames[portalID]
 			c.imGroupNamesMu.RUnlock()
@@ -4569,13 +4576,21 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 		}
 		portalKey := networkid.PortalKey{ID: portalID, Receiver: c.UserLogin.ID}
 
-		// Cache the persistent group UUID (sender_guid/gid) so outbound
-		// messages reuse the same UUID and Apple Messages recipients match
-		// them to the existing group thread. Only for multi-member groups.
-		if senderGuid != nil && *senderGuid != "" && strings.Contains(string(portalID), ",") {
-			c.imGroupGuidsMu.Lock()
-			c.imGroupGuids[string(portalID)] = *senderGuid
-			c.imGroupGuidsMu.Unlock()
+		// Cache the original-case sender_guid so outbound messages reuse the
+		// same UUID casing and Apple Messages recipients match them to the
+		// existing group thread (Apple matches case-sensitively).
+		if senderGuid != nil && *senderGuid != "" {
+			// Cache for legacy comma portals and for gid: portals where the
+			// portal ID directly corresponds to this sender_guid. Skip aliased
+			// portals (where resolveExistingGroupByGid mapped this gid to a
+			// different existing portal) to avoid overwriting the original
+			// portal's sender_guid.
+			isOwnGidPortal := string(portalID) == "gid:"+strings.ToLower(*senderGuid)
+			if strings.Contains(string(portalID), ",") || isOwnGidPortal {
+				c.imGroupGuidsMu.Lock()
+				c.imGroupGuids[string(portalID)] = *senderGuid
+				c.imGroupGuidsMu.Unlock()
+			}
 		}
 
 		// Persist sender_guid and group name to database so they survive restarts
