@@ -2604,27 +2604,13 @@ pub async fn new_client(
                                     }
                                 }
 
-                                // Check if this message needs MMCS downloads
-                                let needs_mmcs = wrapped.attachments.iter().any(|a| !a.is_inline);
-                                let needs_icon = wrapped.is_icon_change && !wrapped.group_photo_cleared;
-
-                                if needs_mmcs || needs_icon {
-                                    // Spawn MMCS download in a separate task so the
-                                    // process loop can continue with the next message.
-                                    // Prevents large video downloads from blocking
-                                    // all subsequent messages in the queue.
-                                    let dl_conn = conn_for_download.clone();
-                                    let dl_callback = callback.clone();
-                                    tokio::spawn(async move {
-                                        download_mmcs_attachments(&mut wrapped, &msg_inst, &dl_conn).await;
-                                        if needs_icon {
-                                            download_icon_change_photo(&mut wrapped, &msg_inst, &dl_conn).await;
-                                        }
-                                        dl_callback.on_message(wrapped);
-                                    });
-                                } else {
-                                    callback.on_message(wrapped);
+                                // Download MMCS attachments so Go receives inline data
+                                download_mmcs_attachments(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                // Download group photo for IconChange messages via MMCS
+                                if wrapped.is_icon_change && !wrapped.group_photo_cleared {
+                                    download_icon_change_photo(&mut wrapped, &msg_inst, &conn_for_download).await;
                                 }
+                                callback.on_message(wrapped);
                             }
                             break; // success
                         }
