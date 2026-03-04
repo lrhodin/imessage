@@ -3241,7 +3241,10 @@ impl Client {
     }
 
     /// Download an attachment from CloudKit by its record name.
-    /// Returns the raw file bytes.
+    /// Returns the raw file bytes. Fetches records individually with proper error
+    /// checking instead of relying on rustpush's FetchedRecords::new (which silently
+    /// drops errors) and get_record (which panics on missing records).
+    /// Retries up to 3 times on transient failures.
     pub async fn cloud_download_attachment(
         &self,
         record_name: String,
@@ -3261,56 +3264,105 @@ impl Client {
                 msg: format!("Failed to get zone encryption config for {}: {}", record_name, e),
             })?;
 
-        // Fetch the record individually and handle errors gracefully instead of
-        // relying on rustpush's get_record which panics on missing records.
-        let results = container.perform_operations(
-            &CloudKitSession::new(),
-            &FetchRecordOperation::many(&ALL_ASSETS, &zone, &[record_name.clone()]),
-            IsolationLevel::Operation,
-        ).await.map_err(|e| WrappedError::GenericError {
-            msg: format!("Failed to fetch CloudKit record {}: {}", record_name, e),
-        })?;
+        let mut last_err = String::new();
 
-        // Check if the record fetch succeeded (rustpush silently drops errors
-        // in FetchedRecords::new, then panics in get_record).
-        if results.is_empty() {
-            return Err(WrappedError::GenericError {
-                msg: format!("CloudKit returned no results for attachment {}", record_name),
-            });
-        }
-        let fetched = match &results[0] {
-            Ok(record) => record,
-            Err(e) => {
-                return Err(WrappedError::GenericError {
-                    msg: format!("CloudKit record fetch failed for {}: {}", record_name, e),
-                });
-            }
-        };
-
-        // Decrypt the record to get the CloudAttachment with the asset reference.
-        let attachment: CloudAttachment = std::panic::catch_unwind(
-            std::panic::AssertUnwindSafe(|| fetched.get_record(Some(&key)))
-        ).map_err(|panic_info| {
-            let panic_msg = if let Some(s) = panic_info.downcast_ref::<String>() {
-                s.clone()
-            } else if let Some(s) = panic_info.downcast_ref::<&str>() {
-                s.to_string()
-            } else {
-                "unknown panic".to_string()
+        for attempt in 1..=3u64 {
+            // Fetch the record individually and check for errors before get_record.
+            let results = match container.perform_operations(
+                &CloudKitSession::new(),
+                &FetchRecordOperation::many(&ALL_ASSETS, &zone, &[record_name.clone()]),
+                IsolationLevel::Operation,
+            ).await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = format!("attempt {} fetch: {}", attempt, e);
+                    log::warn!("CloudKit fetch error for {} (attempt {}): {}", record_name, attempt, e);
+                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await; }
+                    continue;
+                }
             };
-            WrappedError::GenericError {
-                msg: format!("Failed to decrypt CloudKit attachment {}: {}", record_name, panic_msg),
-            }
-        })?;
 
-        // Download the actual asset data.
-        let shared = SharedWriter::new();
-        let records = FetchedRecords::new(&results);
-        container.get_assets(&records.assets, vec![(&attachment.lqa, shared.clone())]).await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to download CloudKit asset for {}: {}", record_name, e),
-            })?;
-        Ok(shared.into_bytes())
+            if results.is_empty() {
+                last_err = format!("attempt {}: no results returned", attempt);
+                log::warn!("CloudKit returned no results for {} (attempt {})", record_name, attempt);
+                if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await; }
+                continue;
+            }
+
+            let fetched = match &results[0] {
+                Ok(record) => record,
+                Err(e) => {
+                    last_err = format!("attempt {} record error: {}", attempt, e);
+                    log::warn!("CloudKit record error for {} (attempt {}): {}", record_name, attempt, e);
+                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await; }
+                    continue;
+                }
+            };
+
+            // Decrypt the record — catch_unwind in case get_record panics on bad data.
+            let attachment: CloudAttachment = match std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| fetched.get_record(Some(&key)))
+            ) {
+                Ok(att) => att,
+                Err(panic_info) => {
+                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    last_err = format!("attempt {} decrypt panic: {}", attempt, panic_msg);
+                    log::warn!("CloudKit decrypt panic for {} (attempt {}): {}", record_name, attempt, panic_msg);
+                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await; }
+                    continue;
+                }
+            };
+
+            // Download the actual asset data via MMCS — spawn in tokio task to catch
+            // any panics from rustpush's MMCS internals (e.g. "Ford chunks missing?").
+            let shared = SharedWriter::new();
+            let records = FetchedRecords::new(&results);
+            let shared_clone = shared.clone();
+            let lqa = attachment.lqa.clone();
+            let assets = records.assets.clone();
+            let container_clone = container.clone();
+
+            let handle = tokio::spawn(async move {
+                container_clone.get_assets(&assets, vec![(&lqa, shared_clone)]).await
+            });
+
+            match handle.await {
+                Ok(Ok(())) => return Ok(shared.into_bytes()),
+                Ok(Err(e)) => {
+                    last_err = format!("attempt {} asset download: {}", attempt, e);
+                    log::warn!("CloudKit asset download error for {} (attempt {}): {}", record_name, attempt, e);
+                }
+                Err(join_err) => {
+                    let panic_msg = if let Ok(reason) = join_err.try_into_panic() {
+                        if let Some(s) = reason.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = reason.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "unknown panic".to_string()
+                        }
+                    } else {
+                        "task cancelled".to_string()
+                    };
+                    last_err = format!("attempt {} asset panic: {}", attempt, panic_msg);
+                    log::warn!("CloudKit asset panic for {} (attempt {}): {}", record_name, attempt, panic_msg);
+                }
+            }
+
+            if attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+            }
+        }
+
+        Err(WrappedError::GenericError {
+            msg: format!("Failed to download CloudKit attachment {} after 3 attempts: {}", record_name, last_err),
+        })
     }
 
     /// Download a group photo from CloudKit by the chat's record name.
