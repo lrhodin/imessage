@@ -3298,18 +3298,26 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// Cache hit: preUploadCloudAttachments already downloaded and uploaded this
 	// attachment in the cloud sync goroutine. Return immediately without touching
 	// CloudKit, keeping the portal event loop unblocked.
+	// NOTE: Skip cache for non-MP4 videos that need transcoding — they may have
+	// been cached before transcoding support was added.
 	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok {
-		return []*bridgev2.BackfillMessage{{
-			Sender:    sender,
-			ID:        makeMessageID(attID),
-			Timestamp: ts,
-			ConvertedMessage: &bridgev2.ConvertedMessage{
-				Parts: []*bridgev2.ConvertedMessagePart{{
-					Type:    event.EventMessage,
-					Content: cached.(*event.MessageEventContent),
-				}},
-			},
-		}}
+		cachedContent := cached.(*event.MessageEventContent)
+		if cachedContent.Info != nil && strings.HasPrefix(cachedContent.Info.MimeType, "video/") && cachedContent.Info.MimeType != "video/mp4" {
+			// Stale cache entry — video needs transcoding. Fall through to re-download.
+			c.attachmentContentCache.Delete(att.RecordName)
+		} else {
+			return []*bridgev2.BackfillMessage{{
+				Sender:    sender,
+				ID:        makeMessageID(attID),
+				Timestamp: ts,
+				ConvertedMessage: &bridgev2.ConvertedMessage{
+					Parts: []*bridgev2.ConvertedMessagePart{{
+						Type:    event.EventMessage,
+						Content: cachedContent,
+					}},
+				},
+			}}
+		}
 	}
 
 	data, err := safeCloudDownloadAttachment(c.client, att.RecordName)
@@ -3498,6 +3506,10 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		for recordName, jsonBytes := range cachedJSON {
 			var content event.MessageEventContent
 			if err := json.Unmarshal(jsonBytes, &content); err == nil {
+				// Skip stale cache entries for non-MP4 videos that need transcoding
+				if content.Info != nil && strings.HasPrefix(content.Info.MimeType, "video/") && content.Info.MimeType != "video/mp4" {
+					continue
+				}
 				c.attachmentContentCache.Store(recordName, &content)
 				loaded++
 			}
