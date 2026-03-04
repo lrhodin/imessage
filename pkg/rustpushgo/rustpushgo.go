@@ -690,6 +690,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedapsconnection_flush_pending(uniffiStatus)
+		})
+		if checksum != 23271 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedapsconnection_flush_pending: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedapsstate_to_string(uniffiStatus)
 		})
 		if checksum != 2386 {
@@ -1987,6 +1996,27 @@ func (_self *WrappedApsConnection) State() *WrappedApsState {
 		return C.uniffi_rustpushgo_fn_method_wrappedapsconnection_state(
 			_pointer, _uniffiStatus)
 	}))
+}
+
+func (_self *WrappedApsConnection) FlushPending() error {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedApsConnection")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedapsconnection_flush_pending(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
 }
 
 func (object *WrappedApsConnection) Destroy() {

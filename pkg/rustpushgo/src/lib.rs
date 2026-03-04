@@ -64,6 +64,14 @@ impl WrappedAPSConnection {
             inner: Some(self.inner.state.blocking_read().clone()),
         })
     }
+
+    /// Re-sends SetState(1) to APNs, which signals "foreground/active" and
+    /// causes Apple to flush any pending stored notifications. Call during
+    /// backfill to capture messages sitting in Apple's queue.
+    pub async fn flush_pending(&self) -> Result<(), WrappedError> {
+        self.inner.send(rustpush::APSMessage::SetState { state: 1 }).await?;
+        Ok(())
+    }
 }
 
 #[derive(uniffi::Record)]

@@ -296,6 +296,11 @@ void* uniffi_rustpushgo_fn_method_wrappedapsconnection_state(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_wrappedapsconnection_flush_pending(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void uniffi_rustpushgo_fn_free_wrappedapsstate(
 	void* ptr,
 	RustCallStatus* out_status
@@ -941,6 +946,10 @@ uint16_t uniffi_rustpushgo_checksum_method_loginsession_submit_2fa(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedapsconnection_state(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedapsconnection_flush_pending(
 	RustCallStatus* out_status
 );
 

@@ -19,6 +19,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
+	"maunium.net/go/mautrix/event"
 )
 
 // No periodic polling needed: real-time messages arrive via APNs push
@@ -409,6 +410,13 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// (which runs inside the portal event loop goroutine) gets instant cache
 	// hits instead of blocking on CloudKit for 30+ minutes.
 	c.preUploadCloudAttachments(ctx)
+
+	// Flush APNs pending messages: re-send SetState(1) to nudge Apple into
+	// delivering any queued notifications, wait briefly for them to arrive,
+	// then ingest any held messages into cloud_message so FetchMessages picks
+	// them up with correct chronological ordering (instead of arriving as
+	// out-of-order real-time events after backfill).
+	c.flushAPNsIntoBackfill(ctx, log)
 
 	// Create portals and queue forward backfill for all of them.
 	// Skip portals that are tombstoned or recently deleted this session.
@@ -1697,4 +1705,133 @@ func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {
 		return fmt.Errorf("cloud store not initialized")
 	}
 	return c.cloudStore.ensureSchema(ctx)
+}
+
+// flushAPNsIntoBackfill nudges APNs to deliver pending messages, waits briefly,
+// then ingests any held messages into cloud_message so FetchMessages picks them
+// up as part of the backfill batch with correct chronological ordering.
+func (c *IMClient) flushAPNsIntoBackfill(ctx context.Context, log zerolog.Logger) {
+	if c.connection == nil || c.cloudStore == nil {
+		return
+	}
+
+	// Nudge APNs to flush its queue.
+	if err := c.connection.FlushPending(); err != nil {
+		log.Warn().Err(err).Msg("Failed to flush APNs pending messages")
+	} else {
+		log.Info().Msg("Sent APNs SetState(1) to flush pending messages")
+	}
+
+	// Wait briefly for messages to arrive through the callback pipeline
+	// and accumulate in pendingPortalMsgs.
+	time.Sleep(3 * time.Second)
+
+	// Take all held messages and ingest them into cloud_message.
+	c.pendingPortalMsgsMu.Lock()
+	held := c.pendingPortalMsgs
+	c.pendingPortalMsgs = nil
+	c.pendingPortalMsgsMu.Unlock()
+
+	if len(held) == 0 {
+		log.Debug().Msg("No held APNs messages to ingest into backfill")
+		return
+	}
+
+	ingested := 0
+	for _, msg := range held {
+		if msg.Uuid == "" {
+			continue
+		}
+		// Skip if already in cloud_message (CloudKit already has it).
+		if known, _ := c.cloudStore.hasMessageUUID(ctx, msg.Uuid); known {
+			continue
+		}
+
+		sender := c.makeEventSender(msg.Sender)
+		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+		sender = c.canonicalizeDMSender(portalKey, sender)
+		portalID := string(portalKey.ID)
+
+		// Upload attachments and cache them.
+		var attRows []cloudAttachmentRow
+		attIndex := 0
+		for _, att := range msg.Attachments {
+			if att.MimeType == "x-richlink/meta" || att.MimeType == "x-richlink/image" {
+				continue
+			}
+			if att.InlineData == nil {
+				attIndex++
+				continue
+			}
+			syntheticKey := fmt.Sprintf("apns:%s_att%d", msg.Uuid, attIndex)
+			data := *att.InlineData
+			mimeType := att.MimeType
+			fileName := att.Filename
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
+			if fileName == "" {
+				fileName = "attachment"
+			}
+
+			// Transcode non-MP4 videos
+			if strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+				data, mimeType, fileName = convertVideoForMatrix(ctx, data, mimeType, fileName)
+			}
+
+			msgType := mimeToMsgType(mimeType)
+			content := &event.MessageEventContent{
+				MsgType: msgType,
+				Body:    fileName,
+				Info: &event.FileInfo{
+					MimeType: mimeType,
+					Size:     len(data),
+				},
+			}
+			url, encFile, uploadErr := c.Main.Bridge.Bot.UploadMedia(ctx, "", data, fileName, mimeType)
+			if uploadErr != nil {
+				log.Warn().Err(uploadErr).Str("att_key", syntheticKey).Msg("Failed to upload held APNs attachment")
+				attIndex++
+				continue
+			}
+			if encFile != nil {
+				content.File = encFile
+			} else {
+				content.URL = url
+			}
+			c.attachmentContentCache.Store(syntheticKey, content)
+			attRows = append(attRows, cloudAttachmentRow{
+				GUID:       fmt.Sprintf("%s_att%d", msg.Uuid, attIndex),
+				MimeType:   mimeType,
+				Filename:   fileName,
+				FileSize:   int64(len(data)),
+				RecordName: syntheticKey,
+			})
+			attIndex++
+		}
+
+		var attachmentsJSON string
+		if len(attRows) > 0 {
+			if jsonBytes, err := json.Marshal(attRows); err == nil {
+				attachmentsJSON = string(jsonBytes)
+			}
+		}
+		msgText := ""
+		if msg.Text != nil {
+			msgText = *msg.Text
+		}
+		senderStr := ""
+		if msg.Sender != nil {
+			senderStr = *msg.Sender
+		}
+
+		if err := c.cloudStore.ingestAPNsMessage(ctx, msg.Uuid, portalID, int64(msg.TimestampMs), senderStr, sender.IsFromMe, msgText, attachmentsJSON); err != nil {
+			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to ingest held APNs message")
+			continue
+		}
+		ingested++
+	}
+
+	log.Info().Int("held", len(held)).Int("ingested", ingested).
+		Msg("Ingested held APNs messages into cloud_message for backfill")
 }
