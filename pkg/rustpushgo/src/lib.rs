@@ -1080,6 +1080,425 @@ impl std::io::Write for SharedWriter {
     }
 }
 
+// ============================================================================
+// Safe MMCS asset download — reimplements rustpush's get_mmcs with ? instead
+// of .unwrap()/.expect() to avoid panics on malformed data.
+// ============================================================================
+
+/// Chunk encryption key variants (mirrors mmcs.rs ChunkEncryption).
+#[derive(Clone)]
+enum SafeChunkEncryption {
+    V1([u8; 17]),
+    V2([u8; 33], [u8; 4]),
+    None,
+}
+
+/// Descriptor for one chunk in an MMCS container (mirrors mmcs.rs ChunkDesc).
+#[derive(Clone)]
+struct SafeChunkDesc {
+    id: [u8; 21],
+    size: usize,
+    key: SafeChunkEncryption,
+    offset: Option<usize>,
+}
+
+impl SafeChunkDesc {
+    /// Decrypt chunk data. Mirrors mmcs.rs ChunkDesc::decrypt but returns
+    /// errors instead of panicking.
+    fn decrypt(&self, data: Vec<u8>) -> Result<Vec<u8>, String> {
+        use openssl::symm::{decrypt, Cipher};
+        use openssl::hash::MessageDigest;
+        use openssl::pkey::PKey;
+        use openssl::sign::Signer;
+        use openssl::sha::sha256;
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+
+        match &self.key {
+            SafeChunkEncryption::V1(key) => {
+                decrypt(Cipher::aes_128_cfb128(), &key[1..], Option::None, &data)
+                    .map_err(|e| format!("AES-128-CFB decrypt: {}", e))
+            }
+            SafeChunkEncryption::V2(key, len) => {
+                let hk = Hkdf::<Sha256>::new(Option::None, &key[1..]);
+                let mut expanded_key = [0u8; 0x60];
+                hk.expand("signature-key".as_bytes(), &mut expanded_key)
+                    .map_err(|e| format!("HKDF expand: {}", e))?;
+
+                let hmac = PKey::hmac(&expanded_key[0x20..0x40])
+                    .map_err(|e| format!("HMAC key: {}", e))?;
+
+                let mut id = self.id[1..].to_vec();
+                id.resize(40, 0);
+                id[32..36].copy_from_slice(&(data.len() as u32).to_le_bytes());
+
+                let h = Signer::new(MessageDigest::sha256(), &hmac)
+                    .and_then(|mut s| s.sign_oneshot_to_vec(&id))
+                    .map_err(|e| format!("IV HMAC sign: {}", e))?;
+
+                let mut result = decrypt(Cipher::aes_256_ctr(), &expanded_key[0x40..0x60], Some(&h[..16]), &data)
+                    .map_err(|e| format!("AES-256-CTR decrypt: {}", e))?;
+
+                let length = u32::from_le_bytes(*len) as usize;
+                result.resize(length, 0);
+
+                // Verify signature
+                let plaintext_hash = sha256(&result);
+                let sig_hmac = PKey::hmac(&expanded_key[0x00..0x20])
+                    .map_err(|e| format!("sig HMAC key: {}", e))?;
+                let h = Signer::new(MessageDigest::sha256(), &sig_hmac)
+                    .and_then(|mut s| s.sign_oneshot_to_vec(&plaintext_hash))
+                    .map_err(|e| format!("sig HMAC sign: {}", e))?;
+
+                if h.len() < self.id.len() - 1 || h[..self.id.len() - 1] != self.id[1..] {
+                    return Err("chunk signature mismatch".into());
+                }
+
+                Ok(result)
+            }
+            SafeChunkEncryption::None => Ok(data),
+        }
+    }
+}
+
+/// Safe reimplementation of rustpush's get_mmcs + get_assets for a single
+/// CloudKit attachment download. All fallible steps use `?` / `ok_or` instead
+/// of `.unwrap()` / `.expect()` so callers get errors rather than panics.
+///
+/// Parameters:
+///   - `asset`: the cloudkit_proto::Asset (lqa) from the attachment record
+///   - `responses`: the AssetGetResponse vec from FetchedRecords
+///   - `container`: the open CloudKit container (for config / state)
+///   - `writer`: destination for the decrypted file bytes
+async fn safe_download_mmcs_asset<P: omnisette::AnisetteProvider, W: std::io::Write + Send + Sync>(
+    asset: &cloudkit_proto::Asset,
+    responses: &[cloudkit_proto::AssetGetResponse],
+    container: &rustpush::cloudkit::CloudKitOpenContainer<'_, P>,
+    mut writer: W,
+) -> Result<(), String> {
+    use prost::Message;
+    use rustpush::mmcsp::{self, authorize_get_response};
+    use rustpush::mmcs::{MMCSConfig, AuthorizedOperation, transfer_mmcs_container, DataCacher};
+    use rustpush::util::REQWEST;
+
+    // ── Step 1: Match asset to bundled response (replaces get_assets matching) ──
+    let bundled_id = asset.bundled_request_id.as_ref()
+        .ok_or("asset has no bundled_request_id")?;
+
+    let response = responses.iter()
+        .find(|r| r.asset_id.as_ref() == Some(bundled_id))
+        .ok_or_else(|| format!("no AssetGetResponse for bundled_request_id {:?}", bundled_id))?;
+
+    let auth_body = response.body.as_ref()
+        .ok_or("AssetGetResponse has no body")?;
+
+    let file_signature = asset.signature.as_ref()
+        .ok_or("asset has no signature")?;
+
+    let ford_key: Option<Vec<u8>> = asset.protection_info.as_ref()
+        .and_then(|p| p.protection_info.clone());
+
+    // Build MMCS config from the container's client config.
+    // dsid is only needed for getComplete (which CloudKit skips — url is ""),
+    // so we leave it None to avoid accessing the private CloudKitState.dsid field.
+    let config = {
+        let os_config = &container.client.config;
+        MMCSConfig {
+            mme_client_info: os_config.get_mme_clientinfo("com.apple.cloudkit.CloudKitDaemon/1970 (com.apple.cloudd/1970)"),
+            user_agent: os_config.get_normal_ua("CloudKit/1970"),
+            dataclass: "com.apple.Dataclass.CloudKit",
+            mini_ua: os_config.get_version_ua(),
+            dsid: Option::None,
+            cloudkit_headers: Default::default(),
+            extra_1: Option::None,
+            extra_2: Option::None,
+        }
+    };
+
+    // ── Step 2: Decode AuthorizeGetResponse protobuf ──
+    let auth_resp = mmcsp::AuthorizeGetResponse::decode(&mut std::io::Cursor::new(auth_body))
+        .map_err(|e| format!("protobuf decode AuthorizeGetResponse: {}", e))?;
+
+    let f1 = match auth_resp.f1 {
+        Some(f1) => f1,
+        None => {
+            // Extract error reason if available
+            if let Some(authorize_get_response::Error {
+                f2: Some(authorize_get_response::error::F2 { reason }),
+            }) = auth_resp.error {
+                return Err(format!("MMCS authorize error: {}", reason));
+            }
+            return Err("MMCS authorize failed: no f1 and no error detail".into());
+        }
+    };
+
+    let containers = &f1.containers;
+    if containers.is_empty() {
+        return Err("AuthorizeGetResponse has no containers".into());
+    }
+
+    // ── Step 3: Find matching file references ──
+    let wanted = f1.references.iter()
+        .find(|r| r.file_checksum == *file_signature)
+        .ok_or_else(|| format!("no chunk references for file signature {}", rustpush::util::encode_hex(file_signature)))?;
+
+    // ── Step 4: Handle Ford decryption if present ──
+    let mut ford_keymap: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = HashMap::new();
+
+    if let Some(ford_ref) = &wanted.ford_reference {
+        let ford_key = ford_key.ok_or("Ford chunk reference present but asset has no protection_info key")?;
+
+        // Get the Ford container and its encryption metadata
+        let ford_container = containers.get(ford_ref.container_index as usize)
+            .ok_or_else(|| format!("Ford container_index {} OOB (have {} containers)",
+                ford_ref.container_index, containers.len()))?;
+        let ford_chunk_wrapper = ford_container.chunks.get(ford_ref.chunk_index as usize)
+            .ok_or_else(|| format!("Ford chunk_index {} OOB (have {} chunks)",
+                ford_ref.chunk_index, ford_container.chunks.len()))?;
+        let ford_enc_meta = ford_chunk_wrapper.encryption.as_ref()
+            .ok_or("Ford chunk has no encryption metadata")?;
+        let ford_keys_id = ford_enc_meta.for_chunks.as_ref()
+            .ok_or("Ford encryption metadata has no for_chunks")?
+            .keys_container.clone();
+
+        let ford_chunk_size = ford_enc_meta.size as usize;
+
+        // Download Ford chunks from the container
+        // We need to stream from the container that holds the Ford chunk data,
+        // reading at the right offset and size.
+        let ford_chunk_id: [u8; 21] = ford_keys_id.try_into()
+            .map_err(|v: Vec<u8>| format!("Ford keys_container checksum wrong length: {} (expected 21)", v.len()))?;
+
+        // Find which container holds the Ford data by scanning for the matching ford chunk
+        let mut ford_data: Option<Vec<u8>> = None;
+        for proto_container in containers.iter() {
+            // Check if any chunk's encryption metadata has this keys_container
+            let has_ford = proto_container.chunks.iter().any(|cw| {
+                cw.encryption.as_ref()
+                    .and_then(|e| e.for_chunks.as_ref())
+                    .map(|fc| fc.keys_container == ford_chunk_id.to_vec())
+                    .unwrap_or(false)
+            });
+            if !has_ford {
+                continue;
+            }
+
+            // Stream this container's HTTP response and extract the Ford chunk
+            let request = proto_container.request.as_ref()
+                .ok_or("Ford's proto container has no HTTP request")?;
+            let resp = transfer_mmcs_container(&REQWEST, request, Option::None, &config.user_agent).await
+                .map_err(|e| format!("Ford container HTTP transfer: {}", e))?;
+
+            // Read all bytes from the response and extract the ford chunk at the right offset
+            let all_bytes = resp.bytes().await
+                .map_err(|e| format!("Ford container read bytes: {}", e))?;
+
+            // Find the ford chunk's offset within this container
+            let ford_offset = ford_enc_meta.offset as usize;
+            if ford_offset + ford_chunk_size > all_bytes.len() {
+                return Err(format!("Ford chunk offset {}+size {} exceeds container data len {}",
+                    ford_offset, ford_chunk_size, all_bytes.len()));
+            }
+            ford_data = Some(all_bytes[ford_offset..ford_offset + ford_chunk_size].to_vec());
+            break;
+        }
+
+        let ford_encrypted = ford_data.ok_or("could not find container holding Ford chunk data")?;
+
+        // Decrypt Ford data using HKDF + CmacSiv
+        use aes::Aes256;
+        use aes_siv::siv::CmacSiv;
+        use aes_siv::KeyInit;
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+
+        let hk = Hkdf::<Sha256>::new(Some("PCSMMCS2".as_bytes()), &ford_key);
+        let mut derived = [0u8; 64];
+        hk.expand(&[], &mut derived)
+            .map_err(|e| format!("Ford HKDF expand: {}", e))?;
+
+        let mut cipher = CmacSiv::<Aes256>::new_from_slice(&derived)
+            .map_err(|e| format!("Ford CmacSiv init: {}", e))?;
+
+        if ford_encrypted.len() < 17 {
+            return Err(format!("Ford encrypted data too short: {} bytes", ford_encrypted.len()));
+        }
+        // first byte is 4 if initial key is 256 bit, 3 otherwise
+        let ford_decrypted = cipher.decrypt::<&[&[u8]], &&[u8]>(
+            &[&ford_encrypted[1..17], &ford_encrypted[..1]],
+            &ford_encrypted[17..],
+        ).map_err(|_| "Ford CmacSiv decrypt failed")?;
+
+        let ford_chunks = mmcsp::FordChunk::decode(&mut std::io::Cursor::new(&ford_decrypted))
+            .map_err(|e| format!("Ford protobuf decode: {}", e))?;
+        let ford_item = ford_chunks.item
+            .ok_or("FordChunk has no item")?;
+
+        for (ford_chunk_item, reference) in ford_item.chunks.into_iter().zip(wanted.chunk_references.iter()) {
+            let ref_container = containers.get(reference.container_index as usize)
+                .ok_or_else(|| format!("Ford ref container_index {} OOB", reference.container_index))?;
+            let ref_chunk = ref_container.chunks.get(reference.chunk_index as usize)
+                .ok_or_else(|| format!("Ford ref chunk_index {} OOB", reference.chunk_index))?;
+            let checksum = ref_chunk.meta.as_ref()
+                .ok_or("Ford referenced chunk has no meta")?
+                .checksum.clone();
+            ford_keymap.insert(checksum, (ford_chunk_item.key, ford_chunk_item.chunk_len));
+        }
+    }
+
+    // ── Step 5: Build chunk descriptors for the actual file data ──
+    let mut file_chunks: Vec<SafeChunkDesc> = Vec::new();
+    for reference in &wanted.chunk_references {
+        let proto_container = containers.get(reference.container_index as usize)
+            .ok_or_else(|| format!("container_index {} OOB (have {} containers)",
+                reference.container_index, containers.len()))?;
+        let chunk_wrapper = proto_container.chunks.get(reference.chunk_index as usize)
+            .ok_or_else(|| format!("chunk_index {} OOB (have {} chunks in container {})",
+                reference.chunk_index, proto_container.chunks.len(), reference.container_index))?;
+        let meta = chunk_wrapper.meta.as_ref()
+            .ok_or("chunk has no meta")?;
+
+        let checksum_arr: [u8; 21] = meta.checksum.clone().try_into()
+            .map_err(|v: Vec<u8>| format!("chunk checksum wrong length: {} (expected 21)", v.len()))?;
+
+        // Determine encryption: Ford key takes priority, then encryption_key from meta
+        let key = if let Some((ford_k, ford_len)) = ford_keymap.get(&meta.checksum) {
+            let k: [u8; 33] = ford_k.clone().try_into()
+                .map_err(|v: Vec<u8>| format!("Ford key wrong length: {} (expected 33)", v.len()))?;
+            let l: [u8; 4] = ford_len.clone().try_into()
+                .map_err(|v: Vec<u8>| format!("Ford chunk_len wrong length: {} (expected 4)", v.len()))?;
+            SafeChunkEncryption::V2(k, l)
+        } else if let Some(enc_key) = &meta.encryption_key {
+            let k: [u8; 17] = enc_key.clone().try_into()
+                .map_err(|v: Vec<u8>| format!("V1 encryption key wrong length: {} (expected 17)", v.len()))?;
+            SafeChunkEncryption::V1(k)
+        } else {
+            SafeChunkEncryption::None
+        };
+
+        file_chunks.push(SafeChunkDesc {
+            id: checksum_arr,
+            size: meta.size as usize,
+            key,
+            offset: Some(meta.offset as usize),
+        });
+    }
+
+    // ── Step 6: Stream + decrypt chunks from each container ──
+    // Group file_chunks by which container they come from.
+    // Build a map: container_index → [(chunk_order_in_file, SafeChunkDesc)]
+    let mut chunks_by_container: HashMap<u32, Vec<(usize, &SafeChunkDesc)>> = HashMap::new();
+    for (file_order, reference) in wanted.chunk_references.iter().enumerate() {
+        chunks_by_container.entry(reference.container_index)
+            .or_default()
+            .push((file_order, &file_chunks[file_order]));
+    }
+
+    // For single-file downloads we typically get chunks in order from one or
+    // a few containers.  Collect all decrypted chunks into an ordered vec.
+    let mut decrypted_chunks: Vec<(usize, Vec<u8>)> = Vec::new();
+
+    for (container_idx, mut container_chunks) in chunks_by_container {
+        let proto_container = containers.get(container_idx as usize)
+            .ok_or_else(|| format!("container_index {} OOB in streaming phase", container_idx))?;
+
+        let request = proto_container.request.as_ref()
+            .ok_or_else(|| format!("container {} has no HTTP request", container_idx))?;
+
+        let resp = transfer_mmcs_container(&REQWEST, request, Option::None, &config.user_agent).await
+            .map_err(|e| format!("container {} HTTP transfer: {}", container_idx, e))?;
+
+        // Sort chunks by their offset within this container so we read sequentially
+        container_chunks.sort_by_key(|(_, desc)| desc.offset.unwrap_or(0));
+
+        let mut cacher = DataCacher::new();
+        let mut response = resp;
+        let mut current_offset: usize = 0;
+
+        for (file_order, chunk_desc) in container_chunks {
+            // Seek past any gap (Ford chunks sit between data chunks)
+            if let Some(chunk_offset) = chunk_desc.offset {
+                if chunk_offset > current_offset {
+                    let skip = chunk_offset - current_offset;
+                    let mut remaining = skip;
+                    // Drain from cacher first
+                    if let Some(cached) = cacher.read_exact(remaining) {
+                        remaining -= cached.len();
+                    }
+                    // Then stream more if needed
+                    while remaining > 0 {
+                        let bytes = response.chunk().await
+                            .map_err(|e| format!("HTTP read during seek: {}", e))?
+                            .ok_or("HTTP stream ended during seek")?;
+                        if bytes.len() <= remaining {
+                            remaining -= bytes.len();
+                        } else {
+                            // Put excess into cacher
+                            cacher.data_avail(&bytes[remaining..]);
+                            remaining = 0;
+                        }
+                    }
+                    current_offset = chunk_offset;
+                }
+            }
+
+            // Read exactly chunk_desc.size bytes
+            let mut chunk_data = Vec::with_capacity(chunk_desc.size);
+            // Try cacher first
+            if let Some(cached) = cacher.read_exact(chunk_desc.size) {
+                chunk_data = cached;
+            } else {
+                // Drain whatever the cacher has
+                let partial = cacher.read_all();
+                chunk_data.extend_from_slice(&partial);
+                // Stream the rest
+                while chunk_data.len() < chunk_desc.size {
+                    let bytes = response.chunk().await
+                        .map_err(|e| format!("HTTP read chunk data: {}", e))?
+                        .ok_or_else(|| format!("HTTP stream ended mid-chunk (got {}/{})", chunk_data.len(), chunk_desc.size))?;
+                    chunk_data.extend_from_slice(&bytes);
+                }
+                // If we over-read, put excess back
+                if chunk_data.len() > chunk_desc.size {
+                    cacher.data_avail(&chunk_data[chunk_desc.size..]);
+                    chunk_data.truncate(chunk_desc.size);
+                }
+            }
+            current_offset += chunk_desc.size;
+
+            // Decrypt
+            let plaintext = chunk_desc.decrypt(chunk_data)?;
+            decrypted_chunks.push((file_order, plaintext));
+        }
+    }
+
+    // ── Step 7: Write chunks in file order and validate ──
+    if !file_chunks.is_empty() && decrypted_chunks.is_empty() {
+        return Err(format!("expected {} chunks but decoded none", file_chunks.len()));
+    }
+    if decrypted_chunks.len() != file_chunks.len() {
+        return Err(format!("chunk count mismatch: decoded {} but expected {}",
+            decrypted_chunks.len(), file_chunks.len()));
+    }
+
+    decrypted_chunks.sort_by_key(|(order, _)| *order);
+    let mut total_written: usize = 0;
+    for (_, data) in &decrypted_chunks {
+        writer.write_all(data).map_err(|e| format!("write output: {}", e))?;
+        total_written += data.len();
+    }
+
+    if total_written == 0 && !file_chunks.is_empty() {
+        return Err("all chunks decrypted to zero bytes".into());
+    }
+
+    log::info!("safe MMCS download complete: {} chunks, {} bytes", decrypted_chunks.len(), total_written);
+
+    // Skip getComplete — CloudKit sets url="" so it's a no-op (see mmcs.rs:1146)
+
+    Ok(())
+}
+
 /// Extract attachment GUIDs from a CloudKit message's attributedBody.
 /// The attributedBody is an NSAttributedString containing ranges with
 /// __kIMFileTransferGUIDAttributeName → attachment GUID.
@@ -3334,39 +3753,21 @@ impl Client {
                 }
             };
 
-            // Download the actual asset data via MMCS — spawn in tokio task to catch
-            // any panics from rustpush's MMCS internals (e.g. "Ford chunks missing?").
+            // Download the actual asset data via safe MMCS reimplementation
+            // (no .unwrap()/.expect() — returns errors instead of panicking).
             let shared = SharedWriter::new();
             let records = FetchedRecords::new(&results);
-            let shared_clone = shared.clone();
-            let lqa = attachment.lqa.clone();
-            let assets = records.assets.clone();
-            let container_clone = container.clone();
 
-            let handle = tokio::spawn(async move {
-                container_clone.get_assets(&assets, vec![(&lqa, shared_clone)]).await
-            });
-
-            match handle.await {
-                Ok(Ok(())) => return Ok(shared.into_bytes()),
-                Ok(Err(e)) => {
-                    last_err = format!("attempt {} asset download: {}", attempt, e);
-                    log::warn!("CloudKit asset download error for {} (attempt {}): {}", record_name, attempt, e);
-                }
-                Err(join_err) => {
-                    let panic_msg = if let Ok(reason) = join_err.try_into_panic() {
-                        if let Some(s) = reason.downcast_ref::<String>() {
-                            s.clone()
-                        } else if let Some(s) = reason.downcast_ref::<&str>() {
-                            s.to_string()
-                        } else {
-                            "unknown panic".to_string()
-                        }
-                    } else {
-                        "task cancelled".to_string()
-                    };
-                    last_err = format!("attempt {} asset panic: {}", attempt, panic_msg);
-                    log::warn!("CloudKit asset panic for {} (attempt {}): {}", record_name, attempt, panic_msg);
+            match safe_download_mmcs_asset(
+                &attachment.lqa,
+                &records.assets,
+                &container,
+                shared.clone(),
+            ).await {
+                Ok(()) => return Ok(shared.into_bytes()),
+                Err(e) => {
+                    last_err = format!("attempt {} safe MMCS: {}", attempt, e);
+                    log::warn!("CloudKit safe MMCS error for {} (attempt {}): {}", record_name, attempt, e);
                 }
             }
 
