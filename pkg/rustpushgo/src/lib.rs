@@ -3664,10 +3664,8 @@ impl Client {
     }
 
     /// Download an attachment from CloudKit by its record name.
-    /// Returns the raw file bytes. Fetches records individually with proper error
-    /// checking instead of relying on rustpush's FetchedRecords::new (which silently
-    /// drops errors) and get_record (which panics on missing records).
-    /// Retries up to 3 times on transient failures.
+    /// Returns the raw file bytes. Fails fast on data errors (corrupt records,
+    /// missing fields); no retries since safe MMCS handles errors without panicking.
     pub async fn cloud_download_attachment(
         &self,
         record_name: String,
@@ -3676,113 +3674,69 @@ impl Client {
         use rustpush::cloud_messages::{CloudAttachment, MESSAGES_SERVICE};
         use cloudkit_proto::CloudKitRecord;
 
-        let mut last_err = String::new();
-        // Backoff: 2s, 8s, 30s — enough time for rate limits / auth expiry to clear.
-        let backoffs = [2000u64, 8000, 30000];
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("CloudKit container init for {}: {}", record_name, e),
+            })?;
+        let zone = container.private_zone("attachmentManateeZone".to_string());
+        let key = container.get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE).await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("CloudKit zone config for {}: {}", record_name, e),
+            })?;
 
-        for attempt in 1..=3u64 {
-            // Re-initialize container + auth on each attempt so retries get fresh
-            // MMCS tokens. Stale tokens cause protobuf decode panics when Apple
-            // returns an error page instead of a valid AuthorizeGetResponse.
-            let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-            let container = match cloud_messages.get_container().await {
-                Ok(c) => c,
-                Err(e) => {
-                    last_err = format!("attempt {} container init: {}", attempt, e);
-                    log::warn!("CloudKit container init error for {} (attempt {}): {}", record_name, attempt, e);
-                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
-                    continue;
-                }
-            };
-            let zone = container.private_zone("attachmentManateeZone".to_string());
-            let key = match container.get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE).await {
-                Ok(k) => k,
-                Err(e) => {
-                    last_err = format!("attempt {} zone config: {}", attempt, e);
-                    log::warn!("CloudKit zone config error for {} (attempt {}): {}", record_name, attempt, e);
-                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
-                    continue;
-                }
-            };
+        let results = container.perform_operations(
+            &CloudKitSession::new(),
+            &FetchRecordOperation::many(&ALL_ASSETS, &zone, &[record_name.clone()]),
+            IsolationLevel::Operation,
+        ).await.map_err(|e| WrappedError::GenericError {
+            msg: format!("CloudKit fetch for {}: {}", record_name, e),
+        })?;
 
-            // Fetch the record individually and check for errors before get_record.
-            let results = match container.perform_operations(
-                &CloudKitSession::new(),
-                &FetchRecordOperation::many(&ALL_ASSETS, &zone, &[record_name.clone()]),
-                IsolationLevel::Operation,
-            ).await {
-                Ok(r) => r,
-                Err(e) => {
-                    last_err = format!("attempt {} fetch: {}", attempt, e);
-                    log::warn!("CloudKit fetch error for {} (attempt {}): {}", record_name, attempt, e);
-                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
-                    continue;
-                }
-            };
-
-            if results.is_empty() {
-                last_err = format!("attempt {}: no results returned", attempt);
-                log::warn!("CloudKit returned no results for {} (attempt {})", record_name, attempt);
-                if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
-                continue;
-            }
-
-            let fetched = match &results[0] {
-                Ok(record) => record,
-                Err(e) => {
-                    last_err = format!("attempt {} record error: {}", attempt, e);
-                    log::warn!("CloudKit record error for {} (attempt {}): {}", record_name, attempt, e);
-                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
-                    continue;
-                }
-            };
-
-            // Decrypt the record — catch_unwind in case get_record panics on bad data.
-            let attachment: CloudAttachment = match std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| fetched.get_record(Some(&key)))
-            ) {
-                Ok(att) => att,
-                Err(panic_info) => {
-                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<String>() {
-                        s.clone()
-                    } else if let Some(s) = panic_info.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else {
-                        "unknown panic".to_string()
-                    };
-                    last_err = format!("attempt {} decrypt panic: {}", attempt, panic_msg);
-                    log::warn!("CloudKit decrypt panic for {} (attempt {}): {}", record_name, attempt, panic_msg);
-                    if attempt < 3 { tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await; }
-                    continue;
-                }
-            };
-
-            // Download the actual asset data via safe MMCS reimplementation
-            // (no .unwrap()/.expect() — returns errors instead of panicking).
-            let shared = SharedWriter::new();
-            let records = FetchedRecords::new(&results);
-
-            match safe_download_mmcs_asset(
-                &attachment.lqa,
-                &records.assets,
-                &container,
-                shared.clone(),
-            ).await {
-                Ok(()) => return Ok(shared.into_bytes()),
-                Err(e) => {
-                    last_err = format!("attempt {} safe MMCS: {}", attempt, e);
-                    log::warn!("CloudKit safe MMCS error for {} (attempt {}): {}", record_name, attempt, e);
-                }
-            }
-
-            if attempt < 3 {
-                tokio::time::sleep(std::time::Duration::from_millis(backoffs[attempt as usize - 1])).await;
-            }
+        if results.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: format!("CloudKit returned no results for {}", record_name),
+            });
         }
 
-        Err(WrappedError::GenericError {
-            msg: format!("Failed to download CloudKit attachment {} after 3 attempts: {}", record_name, last_err),
-        })
+        let fetched = results[0].as_ref().map_err(|e| WrappedError::GenericError {
+            msg: format!("CloudKit record error for {}: {}", record_name, e),
+        })?;
+
+        // Decrypt the record — catch_unwind in case get_record panics on bad data.
+        let attachment: CloudAttachment = match std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| fetched.get_record(Some(&key)))
+        ) {
+            Ok(att) => att,
+            Err(panic_info) => {
+                let panic_msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown panic".to_string()
+                };
+                return Err(WrappedError::GenericError {
+                    msg: format!("CloudKit decrypt panic for {}: {}", record_name, panic_msg),
+                });
+            }
+        };
+
+        // Download the actual asset data via safe MMCS reimplementation
+        // (no .unwrap()/.expect() — returns errors instead of panicking).
+        let shared = SharedWriter::new();
+        let records = FetchedRecords::new(&results);
+
+        safe_download_mmcs_asset(
+            &attachment.lqa,
+            &records.assets,
+            &container,
+            shared.clone(),
+        ).await.map_err(|e| WrappedError::GenericError {
+            msg: format!("CloudKit MMCS download for {}: {}", record_name, e),
+        })?;
+
+        Ok(shared.into_bytes())
     }
 
     /// Download a group photo from CloudKit by the chat's record name.
