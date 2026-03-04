@@ -1244,6 +1244,8 @@ async fn safe_download_mmcs_asset<P: omnisette::AnisetteProvider, W: std::io::Wr
 
     // ── Step 4: Handle Ford decryption if present ──
     let mut ford_keymap: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = HashMap::new();
+    // Cache container bytes downloaded during Ford phase so we don't re-download in step 6.
+    let mut container_bytes_cache: HashMap<usize, Vec<u8>> = HashMap::new();
 
     if let Some(ford_ref) = &wanted.ford_reference {
         let ford_key = ford_key.ok_or("Ford chunk reference present but asset has no protection_info key")?;
@@ -1263,16 +1265,12 @@ async fn safe_download_mmcs_asset<P: omnisette::AnisetteProvider, W: std::io::Wr
 
         let ford_chunk_size = ford_enc_meta.size as usize;
 
-        // Download Ford chunks from the container
-        // We need to stream from the container that holds the Ford chunk data,
-        // reading at the right offset and size.
         let ford_chunk_id: [u8; 21] = ford_keys_id.try_into()
             .map_err(|v: Vec<u8>| format!("Ford keys_container checksum wrong length: {} (expected 21)", v.len()))?;
 
-        // Find which container holds the Ford data by scanning for the matching ford chunk
+        // Find which container holds the Ford data, download it, and cache the bytes
         let mut ford_data: Option<Vec<u8>> = None;
-        for proto_container in containers.iter() {
-            // Check if any chunk's encryption metadata has this keys_container
+        for (ci, proto_container) in containers.iter().enumerate() {
             let has_ford = proto_container.chunks.iter().any(|cw| {
                 cw.encryption.as_ref()
                     .and_then(|e| e.for_chunks.as_ref())
@@ -1283,23 +1281,22 @@ async fn safe_download_mmcs_asset<P: omnisette::AnisetteProvider, W: std::io::Wr
                 continue;
             }
 
-            // Stream this container's HTTP response and extract the Ford chunk
             let request = proto_container.request.as_ref()
                 .ok_or("Ford's proto container has no HTTP request")?;
             let resp = transfer_mmcs_container(&REQWEST, request, Option::None, &config.user_agent).await
                 .map_err(|e| format!("Ford container HTTP transfer: {}", e))?;
 
-            // Read all bytes from the response and extract the ford chunk at the right offset
-            let all_bytes = resp.bytes().await
-                .map_err(|e| format!("Ford container read bytes: {}", e))?;
+            let all_bytes: Vec<u8> = resp.bytes().await
+                .map_err(|e| format!("Ford container read bytes: {}", e))?.into();
 
-            // Find the ford chunk's offset within this container
             let ford_offset = ford_enc_meta.offset as usize;
             if ford_offset + ford_chunk_size > all_bytes.len() {
                 return Err(format!("Ford chunk offset {}+size {} exceeds container data len {}",
                     ford_offset, ford_chunk_size, all_bytes.len()));
             }
             ford_data = Some(all_bytes[ford_offset..ford_offset + ford_chunk_size].to_vec());
+            // Cache the full container bytes so step 6 doesn't re-download
+            container_bytes_cache.insert(ci, all_bytes);
             break;
         }
 
@@ -1402,73 +1399,80 @@ async fn safe_download_mmcs_asset<P: omnisette::AnisetteProvider, W: std::io::Wr
         let proto_container = containers.get(container_idx as usize)
             .ok_or_else(|| format!("container_index {} OOB in streaming phase", container_idx))?;
 
-        let request = proto_container.request.as_ref()
-            .ok_or_else(|| format!("container {} has no HTTP request", container_idx))?;
-
-        let resp = transfer_mmcs_container(&REQWEST, request, Option::None, &config.user_agent).await
-            .map_err(|e| format!("container {} HTTP transfer: {}", container_idx, e))?;
-
         // Sort chunks by their offset within this container so we read sequentially
         container_chunks.sort_by_key(|(_, desc)| desc.offset.unwrap_or(0));
 
-        let mut cacher = DataCacher::new();
-        let mut response = resp;
-        let mut current_offset: usize = 0;
+        // Use cached bytes from Ford phase if available, otherwise open a new HTTP stream
+        if let Some(all_bytes) = container_bytes_cache.remove(&(container_idx as usize)) {
+            // Fast path: extract chunks directly from cached bytes
+            for (file_order, chunk_desc) in container_chunks {
+                let offset = chunk_desc.offset.unwrap_or(0);
+                if offset + chunk_desc.size > all_bytes.len() {
+                    return Err(format!("chunk offset {}+size {} exceeds cached container len {}",
+                        offset, chunk_desc.size, all_bytes.len()));
+                }
+                let chunk_data = all_bytes[offset..offset + chunk_desc.size].to_vec();
+                let plaintext = chunk_desc.decrypt(chunk_data)?;
+                decrypted_chunks.push((file_order, plaintext));
+            }
+        } else {
+            // Stream from HTTP
+            let request = proto_container.request.as_ref()
+                .ok_or_else(|| format!("container {} has no HTTP request", container_idx))?;
+            let resp = transfer_mmcs_container(&REQWEST, request, Option::None, &config.user_agent).await
+                .map_err(|e| format!("container {} HTTP transfer: {}", container_idx, e))?;
 
-        for (file_order, chunk_desc) in container_chunks {
-            // Seek past any gap (Ford chunks sit between data chunks)
-            if let Some(chunk_offset) = chunk_desc.offset {
-                if chunk_offset > current_offset {
-                    let skip = chunk_offset - current_offset;
-                    let mut remaining = skip;
-                    // Drain from cacher first
-                    if let Some(cached) = cacher.read_exact(remaining) {
-                        remaining -= cached.len();
-                    }
-                    // Then stream more if needed
-                    while remaining > 0 {
-                        let bytes = response.chunk().await
-                            .map_err(|e| format!("HTTP read during seek: {}", e))?
-                            .ok_or("HTTP stream ended during seek")?;
-                        if bytes.len() <= remaining {
-                            remaining -= bytes.len();
-                        } else {
-                            // Put excess into cacher
-                            cacher.data_avail(&bytes[remaining..]);
-                            remaining = 0;
+            let mut cacher = DataCacher::new();
+            let mut response = resp;
+            let mut current_offset: usize = 0;
+
+            for (file_order, chunk_desc) in container_chunks {
+                // Seek past any gap (Ford chunks sit between data chunks)
+                if let Some(chunk_offset) = chunk_desc.offset {
+                    if chunk_offset > current_offset {
+                        let skip = chunk_offset - current_offset;
+                        let mut remaining = skip;
+                        if let Some(cached) = cacher.read_exact(remaining) {
+                            remaining -= cached.len();
                         }
+                        while remaining > 0 {
+                            let bytes = response.chunk().await
+                                .map_err(|e| format!("HTTP read during seek: {}", e))?
+                                .ok_or("HTTP stream ended during seek")?;
+                            if bytes.len() <= remaining {
+                                remaining -= bytes.len();
+                            } else {
+                                cacher.data_avail(&bytes[remaining..]);
+                                remaining = 0;
+                            }
+                        }
+                        current_offset = chunk_offset;
                     }
-                    current_offset = chunk_offset;
                 }
-            }
 
-            // Read exactly chunk_desc.size bytes
-            let mut chunk_data = Vec::with_capacity(chunk_desc.size);
-            // Try cacher first
-            if let Some(cached) = cacher.read_exact(chunk_desc.size) {
-                chunk_data = cached;
-            } else {
-                // Drain whatever the cacher has
-                let partial = cacher.read_all();
-                chunk_data.extend_from_slice(&partial);
-                // Stream the rest
-                while chunk_data.len() < chunk_desc.size {
-                    let bytes = response.chunk().await
-                        .map_err(|e| format!("HTTP read chunk data: {}", e))?
-                        .ok_or_else(|| format!("HTTP stream ended mid-chunk (got {}/{})", chunk_data.len(), chunk_desc.size))?;
-                    chunk_data.extend_from_slice(&bytes);
+                // Read exactly chunk_desc.size bytes
+                let mut chunk_data = Vec::with_capacity(chunk_desc.size);
+                if let Some(cached) = cacher.read_exact(chunk_desc.size) {
+                    chunk_data = cached;
+                } else {
+                    let partial = cacher.read_all();
+                    chunk_data.extend_from_slice(&partial);
+                    while chunk_data.len() < chunk_desc.size {
+                        let bytes = response.chunk().await
+                            .map_err(|e| format!("HTTP read chunk data: {}", e))?
+                            .ok_or_else(|| format!("HTTP stream ended mid-chunk (got {}/{})", chunk_data.len(), chunk_desc.size))?;
+                        chunk_data.extend_from_slice(&bytes);
+                    }
+                    if chunk_data.len() > chunk_desc.size {
+                        cacher.data_avail(&chunk_data[chunk_desc.size..]);
+                        chunk_data.truncate(chunk_desc.size);
+                    }
                 }
-                // If we over-read, put excess back
-                if chunk_data.len() > chunk_desc.size {
-                    cacher.data_avail(&chunk_data[chunk_desc.size..]);
-                    chunk_data.truncate(chunk_desc.size);
-                }
-            }
-            current_offset += chunk_desc.size;
+                current_offset += chunk_desc.size;
 
-            // Decrypt
-            let plaintext = chunk_desc.decrypt(chunk_data)?;
-            decrypted_chunks.push((file_order, plaintext));
+                let plaintext = chunk_desc.decrypt(chunk_data)?;
+                decrypted_chunks.push((file_order, plaintext));
+            }
         }
     }
 
