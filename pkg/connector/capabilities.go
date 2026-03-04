@@ -13,8 +13,10 @@ import (
 	"maunium.net/go/mautrix/event"
 )
 
+const iMessageMaxFileSize = 2000 * 1024 * 1024 // 2 GB
+
 var caps = &event.RoomFeatures{
-	ID: "fi.mau.imessage.capabilities.2025_02",
+	ID: "fi.mau.imessage.capabilities.2025_03",
 
 	Formatting: map[event.FormattingFeature]event.CapabilitySupportLevel{
 		event.FmtBold:   event.CapLevelDropped,
@@ -23,33 +25,69 @@ var caps = &event.RoomFeatures{
 	File: map[event.CapabilityMsgType]*event.FileFeatures{
 		event.MsgImage: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
-				"*/*": event.CapLevelFullySupported,
+				"image/jpeg": event.CapLevelFullySupported,
+				"image/png":  event.CapLevelFullySupported,
+				"image/gif":  event.CapLevelFullySupported,
+				"image/heic": event.CapLevelFullySupported,
+				"image/heif": event.CapLevelFullySupported,
+				"image/webp": event.CapLevelFullySupported,
+				"image/tiff": event.CapLevelFullySupported,
+				"image/bmp":  event.CapLevelFullySupported,
+				"image/avif": event.CapLevelFullySupported,
 			},
+			Caption: event.CapLevelDropped,
+			MaxSize: iMessageMaxFileSize,
 		},
 		event.CapMsgGIF: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
 				"image/gif": event.CapLevelFullySupported,
 			},
+			Caption: event.CapLevelDropped,
+			MaxSize: iMessageMaxFileSize,
 		},
 		event.MsgVideo: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
-				"*/*": event.CapLevelFullySupported,
+				"video/mp4":       event.CapLevelFullySupported,
+				"video/quicktime": event.CapLevelFullySupported,
+				"video/x-m4v":    event.CapLevelFullySupported,
+				"video/3gpp":     event.CapLevelPartialSupport,
 			},
+			Caption: event.CapLevelDropped,
+			MaxSize: iMessageMaxFileSize,
 		},
 		event.MsgAudio: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
-				"*/*": event.CapLevelFullySupported,
+				"audio/mpeg":   event.CapLevelFullySupported,
+				"audio/mp3":    event.CapLevelFullySupported,
+				"audio/aac":    event.CapLevelFullySupported,
+				"audio/mp4":    event.CapLevelFullySupported,
+				"audio/x-caf":  event.CapLevelFullySupported,
+				"audio/ogg":    event.CapLevelFullySupported,
+				"audio/wav":    event.CapLevelFullySupported,
+				"audio/x-wav":  event.CapLevelFullySupported,
+				"audio/aiff":   event.CapLevelFullySupported,
+				"audio/x-aiff": event.CapLevelFullySupported,
+				"audio/x-m4a":  event.CapLevelFullySupported,
 			},
+			Caption: event.CapLevelDropped,
+			MaxSize: iMessageMaxFileSize,
 		},
 		event.CapMsgVoice: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
-				"*/*": event.CapLevelFullySupported,
+				"audio/ogg":   event.CapLevelFullySupported,
+				"audio/x-caf": event.CapLevelFullySupported,
+				"audio/aac":   event.CapLevelFullySupported,
+				"audio/mp4":   event.CapLevelFullySupported,
 			},
+			Caption: event.CapLevelDropped,
+			MaxSize: iMessageMaxFileSize,
 		},
 		event.MsgFile: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
 				"*/*": event.CapLevelFullySupported,
 			},
+			Caption: event.CapLevelDropped,
+			MaxSize: iMessageMaxFileSize,
 		},
 	},
 	Reply:               event.CapLevelFullySupported,
@@ -67,7 +105,7 @@ var capsDM *event.RoomFeatures
 func init() {
 	c := *caps
 	capsDM = &c
-	capsDM.ID = "fi.mau.imessage.capabilities.2025_02+dm"
+	capsDM.ID = "fi.mau.imessage.capabilities.2025_03+dm"
 }
 
 var generalCaps = &bridgev2.NetworkGeneralCapabilities{
