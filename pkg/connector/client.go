@@ -5789,25 +5789,41 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 		chatInfo.Members = members
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
-		otherUser := makeUserID(addIdentifierPrefix(parsed.LocalID))
+		portalID := addIdentifierPrefix(parsed.LocalID)
+		otherUser := makeUserID(portalID)
+		isSelfChat := c.isMyHandle(portalID)
+
+		memberMap := map[networkid.UserID]bridgev2.ChatMember{
+			makeUserID(c.handle): {
+				EventSender: bridgev2.EventSender{
+					IsFromMe:    true,
+					SenderLogin: c.UserLogin.ID,
+					Sender:      makeUserID(c.handle),
+				},
+				Membership: event.MembershipJoin,
+			},
+		}
+		// Only add the other user if it's not a self-chat, to avoid
+		// overwriting the IsFromMe entry with a duplicate map key.
+		if !isSelfChat {
+			memberMap[otherUser] = bridgev2.ChatMember{
+				EventSender: bridgev2.EventSender{Sender: otherUser},
+				Membership:  event.MembershipJoin,
+			}
+		}
+
 		members := &bridgev2.ChatMemberList{
 			IsFull:      true,
 			OtherUserID: otherUser,
-			MemberMap: map[networkid.UserID]bridgev2.ChatMember{
-				makeUserID(c.handle): {
-					EventSender: bridgev2.EventSender{
-						IsFromMe:    true,
-						SenderLogin: c.UserLogin.ID,
-						Sender:      makeUserID(c.handle),
-					},
-					Membership: event.MembershipJoin,
-				},
-				otherUser: {
-					EventSender: bridgev2.EventSender{Sender: otherUser},
-					Membership:  event.MembershipJoin,
-				},
-			},
+			MemberMap:   memberMap,
 		}
+
+		// For self-chats, set an explicit name so the room isn't blank.
+		if isSelfChat {
+			selfName := c.resolveContactDisplayname(portalID)
+			chatInfo.Name = &selfName
+		}
+
 		chatInfo.Members = members
 	}
 
