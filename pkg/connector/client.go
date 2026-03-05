@@ -5365,7 +5365,7 @@ func tapbackTypeToEmoji(tapbackType *uint32, tapbackEmoji *string) string {
 	case 3:
 		return "😂"
 	case 4:
-		return "❗"
+		return "‼️"
 	case 5:
 		return "❓"
 	case 6:
