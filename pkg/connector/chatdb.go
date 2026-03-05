@@ -11,11 +11,13 @@ package connector
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/ffmpeg"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
@@ -337,6 +339,36 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 	var durationMs int
 	if mimeType == "audio/x-caf" || strings.HasSuffix(strings.ToLower(fileName), ".caf") {
 		data, mimeType, fileName, durationMs = convertAudioForMatrix(data, mimeType, fileName)
+	}
+
+	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
+	log := zerolog.Ctx(ctx)
+	if ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+		origMime := mimeType
+		origSize := len(data)
+		method := "remux"
+		converted, convertErr := ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
+			[]string{"-c", "copy", "-movflags", "+faststart"},
+			mimeType)
+		if convertErr != nil {
+			// Remux failed — try full re-encode
+			method = "re-encode"
+			converted, convertErr = ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
+				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
+					"-c:a", "aac", "-movflags", "+faststart"},
+				mimeType)
+		}
+		if convertErr != nil {
+			log.Warn().Err(convertErr).Str("guid", msg.GUID).Str("original_mime", origMime).
+				Msg("FFmpeg video conversion failed, uploading original")
+		} else {
+			log.Info().Str("guid", msg.GUID).Str("original_mime", origMime).
+				Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).
+				Msg("Video transcoded to MP4")
+			data = converted
+			mimeType = "video/mp4"
+			fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".mp4"
+		}
 	}
 
 	content := &event.MessageEventContent{
