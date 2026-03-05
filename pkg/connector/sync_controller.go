@@ -7,7 +7,6 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -664,23 +663,35 @@ func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) 
 		Bool("msg_token_saved", savedMsgTok != nil).
 		Msg("CloudKit backfill starting (attachment zone always fresh)")
 
-	// Phase 1: Sync chats and attachments in parallel — they are independent.
-	// Messages depend on both (chats for portal ID resolution, attachments for
-	// GUID→record_name mapping), so they must wait.
+	// Phase 0: Sync attachments first (with ALL_ASSETS) to populate the
+	// Ford key cache before any downloads happen. MMCS deduplication can
+	// serve Ford blobs encrypted with a different record's key, so the
+	// cache must be fully populated before downloads start.
+	phase0Start := time.Now()
+	var attMap map[string]cloudAttachmentRow
+	var attToken *string
+	var attErr error
+	{
+		attMap, attToken, attErr = c.syncCloudAttachments(ctx)
+		attCount := 0
+		if attMap != nil {
+			attCount = len(attMap)
+		}
+		log.Info().
+			Dur("elapsed", time.Since(phase0Start)).
+			Int("attachments", attCount).
+			Err(attErr).
+			Msg("CloudKit attachment sync complete (Ford key cache populated)")
+	}
+
+	// Phase 1: Sync chats. Messages depend on chats (portal ID resolution)
+	// and attachments (GUID→record_name mapping), so they must wait.
 	phase1Start := time.Now()
 
 	var chatCounts cloudSyncCounters
 	var chatToken *string
 	var chatErr error
-	var attMap map[string]cloudAttachmentRow
-	var attToken *string
-	var attErr error
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
+	{
 		chatStart := time.Now()
 		chatCounts, chatToken, chatErr = c.syncCloudChats(ctx)
 		log.Info().
@@ -690,25 +701,8 @@ func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) 
 			Int("skipped", chatCounts.Skipped).
 			Err(chatErr).
 			Msg("CloudKit chat sync complete")
-	}()
-
-	go func() {
-		defer wg.Done()
-		attStart := time.Now()
-		attMap, attToken, attErr = c.syncCloudAttachments(ctx)
-		attCount := 0
-		if attMap != nil {
-			attCount = len(attMap)
-		}
-		log.Info().
-			Dur("elapsed", time.Since(attStart)).
-			Int("attachments", attCount).
-			Err(attErr).
-			Msg("CloudKit attachment sync complete")
-	}()
-
-	wg.Wait()
-	log.Info().Dur("phase1_elapsed", time.Since(phase1Start)).Msg("CloudKit phase 1 (chats + attachments) complete")
+	}
+	log.Info().Dur("phase1_elapsed", time.Since(phase1Start)).Msg("CloudKit phase 1 (chats) complete")
 
 	if chatErr != nil {
 		_ = c.cloudStore.setSyncStateError(ctx, cloudZoneChats, chatErr.Error())

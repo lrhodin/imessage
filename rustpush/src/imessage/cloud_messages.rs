@@ -27,7 +27,7 @@ use cloudkit_proto::RecordIdentifier;
 use log::{info, warn};
 use uuid::Uuid;
 use crate::cloud_messages::cloudmessagesp::{ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4};
-use crate::cloudkit::{pcs_keys_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
+use crate::cloudkit::{pcs_keys_for_record, record_identifier, AssetsToDownload, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
 use crate::mmcs::{prepare_put_v2, PreparedPut};
 use crate::pcs::{get_boundary_key, PCSKey, PCSService};
 use bitflags::bitflags;
@@ -265,6 +265,9 @@ pub struct CloudChat {
     #[serde(default, serialize_with = "proto_serialize_opt", deserialize_with = "proto_deserialize_opt")]
     #[cloudkit(rename = "gp")]
     pub group_photo: Option<Asset>,
+    #[serde(default)]
+    #[cloudkit(unencrypted)]
+    pub dids: Vec<String>,
 }
 
 pub fn proto_deserialize_opt_gzip<'de, D, T>(d: D) -> Result<Option<GZipWrapper<T>>, D::Error>
@@ -473,6 +476,7 @@ impl CloudKitBytesKind for AttachmentMeta {
 pub struct CloudAttachment {
     pub cm: GZipWrapper<AttachmentMeta>,
     pub lqa: Asset,
+    pub avid: Asset,
 }
 
 pub struct CloudMessagesClient<P: AnisetteProvider> {
@@ -504,6 +508,15 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         zone: &str,
         continuation_token: Option<Vec<u8>>,
     ) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
+        self.sync_records_with_assets::<T>(zone, continuation_token, &NO_ASSETS).await
+    }
+
+    async fn sync_records_with_assets<T: CloudKitRecord>(
+        &self,
+        zone: &str,
+        continuation_token: Option<Vec<u8>>,
+        assets: &AssetsToDownload,
+    ) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
         let container = self.get_container().await?;
 
         let zone_id = container.private_zone(zone.to_string());
@@ -513,7 +526,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let (_assets, response) = container
             .perform(
                 &CloudKitSession::new(),
-                FetchRecordChangesOperation::new(zone_id.clone(), continuation_token, &NO_ASSETS),
+                FetchRecordChangesOperation::new(zone_id.clone(), continuation_token, assets),
             )
             .await?;
 
@@ -792,7 +805,22 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     pub async fn sync_attachments(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudAttachment>>, i32), PushError> {
-        self.sync_records("attachmentManateeZone", continuation_token).await
+        let result = self.sync_records_with_assets::<CloudAttachment>("attachmentManateeZone", continuation_token, &ALL_ASSETS).await?;
+        // Pre-populate Ford key cache from synced records so MMCS dedup can resolve key mismatches.
+        let mut cached = 0usize;
+        let total = result.1.values().filter(|v| v.is_some()).count();
+        for record in result.1.values().flatten() {
+            if let Some(pi) = record.lqa.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
+                crate::icloud::mmcs::register_ford_key(pi);
+                cached += 1;
+            }
+            if let Some(pi) = record.avid.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
+                crate::icloud::mmcs::register_ford_key(pi);
+                cached += 1;
+            }
+        }
+        log::info!("sync_attachments: {} Ford keys cached from {} records", cached, total);
+        Ok(result)
     }
 
     pub async fn save_attachments(&self, attachments: HashMap<String, CloudAttachment>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
@@ -817,6 +845,16 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let records = FetchedRecords::new(&invoke);
 
         let record: Vec<CloudAttachment> = files.keys().map(|f| records.get_record(f, Some(&key))).collect::<Vec<_>>();
+
+        // Pre-populate Ford key cache from all records so MMCS dedup can resolve key mismatches.
+        for r in &record {
+            if let Some(pi) = r.lqa.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
+                crate::icloud::mmcs::register_ford_key(pi);
+            }
+            if let Some(pi) = r.avid.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
+                crate::icloud::mmcs::register_ford_key(pi);
+            }
+        }
 
         container.get_assets(&records.assets, record.iter().map(|i| &i.lqa).zip(files.into_values()).collect::<Vec<_>>()).await?;
         Ok(())

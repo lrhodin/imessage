@@ -180,6 +180,8 @@ pub enum PushError {
     Bad2FaCode,
     #[error("PCS record key id not found!")]
     PCSRecordKeyMissing,
+    #[error("PCS decrypt error: {0}")]
+    PCSDecryptError(String),
     #[error("Circle is over!")]
     CircleOver,
     #[error("Too many requests!")]

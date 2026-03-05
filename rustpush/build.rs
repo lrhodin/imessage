@@ -62,9 +62,14 @@ fn download(url: &str) -> Vec<u8> {
 fn main() -> Result<()> {
     bootstrap_fairplay_certs();
 
+    let proto_files = &["src/icloud/mmcs.proto", "src/ids/ids.proto", "src/facetime.proto", "src/statuskit.proto", "src/imessage/cloud_messages.proto"];
+    for proto in proto_files {
+        println!("cargo:rerun-if-changed={}", proto);
+    }
+
     let mut prost_build = prost_build::Config::new();
     // Enable a protoc experimental feature.
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
-    prost_build.compile_protos(&["src/icloud/mmcs.proto", "src/ids/ids.proto", "src/facetime.proto", "src/statuskit.proto", "src/imessage/cloud_messages.proto"], &["src/"])?;
+    prost_build.compile_protos(proto_files, &["src/"])?;
     Ok(())
 }

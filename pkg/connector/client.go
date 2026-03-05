@@ -36,6 +36,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"go.mau.fi/util/ffmpeg"
 	"go.mau.fi/util/ptr"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
@@ -3093,8 +3094,27 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	attMessages := c.cloudAttachmentsToBackfill(ctx, row, sender, ts, hasText)
 	messages = append(messages, attMessages...)
 
-	// No text, no attachments, no tapback → likely a deleted/unsent message
-	// whose content was wiped from CloudKit.  Skip silently.
+	// Attachment-only message where all downloads failed: produce a notice
+	// placeholder so the message isn't silently dropped. Without this, the
+	// message never enters the Matrix `message` table but stays in
+	// cloud_message, so it's permanently lost — retries hit the same failure
+	// and the user never knows a message existed.
+	if len(messages) == 0 && row.AttachmentsJSON != "" {
+		messages = append(messages, &bridgev2.BackfillMessage{
+			Sender:    sender,
+			ID:        makeMessageID(row.GUID),
+			Timestamp: ts,
+			ConvertedMessage: &bridgev2.ConvertedMessage{
+				Parts: []*bridgev2.ConvertedMessagePart{{
+					Type: event.EventMessage,
+					Content: &event.MessageEventContent{
+						MsgType: event.MsgNotice,
+						Body:    "Attachment could not be downloaded from iCloud.",
+					},
+				}},
+			},
+		})
+	}
 
 	return messages
 }
@@ -3304,7 +3324,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// been cached before transcoding support was added.
 	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok {
 		cachedContent := cached.(*event.MessageEventContent)
-		if cachedContent.Info != nil && strings.HasPrefix(cachedContent.Info.MimeType, "video/") && cachedContent.Info.MimeType != "video/mp4" {
+		if cachedContent.Info != nil && cachedContent.Info.MimeType == "video/quicktime" {
 			// Stale cache entry — video needs transcoding. Fall through to re-download.
 			c.attachmentContentCache.Delete(att.RecordName)
 		} else {
@@ -3357,6 +3377,35 @@ func (c *IMClient) downloadAndUploadAttachment(
 	var durationMs int
 	if att.UTIType == "com.apple.coreaudio-format" || mimeType == "audio/x-caf" {
 		data, mimeType, fileName, durationMs = convertAudioForMatrix(data, mimeType, fileName)
+	}
+
+	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
+	if ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+		origMime := mimeType
+		origSize := len(data)
+		method := "remux"
+		converted, convertErr := ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
+			[]string{"-c", "copy", "-movflags", "+faststart"},
+			mimeType)
+		if convertErr != nil {
+			// Remux failed — try full re-encode
+			method = "re-encode"
+			converted, convertErr = ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
+				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
+					"-c:a", "aac", "-movflags", "+faststart"},
+				mimeType)
+		}
+		if convertErr != nil {
+			log.Warn().Err(convertErr).Str("guid", row.GUID).Str("original_mime", origMime).
+				Msg("FFmpeg video conversion failed, uploading original")
+		} else {
+			log.Info().Str("guid", row.GUID).Str("original_mime", origMime).
+				Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).
+				Msg("Video transcoded to MP4")
+			data = converted
+			mimeType = "video/mp4"
+			fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".mp4"
+		}
 	}
 
 	// Convert non-JPEG images to JPEG and extract dimensions/thumbnail
@@ -3504,7 +3553,7 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 			var content event.MessageEventContent
 			if err := json.Unmarshal(jsonBytes, &content); err == nil {
 				// Skip stale cache entries for non-MP4 videos that need transcoding
-				if content.Info != nil && strings.HasPrefix(content.Info.MimeType, "video/") && content.Info.MimeType != "video/mp4" {
+				if content.Info != nil && content.Info.MimeType == "video/quicktime" {
 					continue
 				}
 				c.attachmentContentCache.Store(recordName, &content)

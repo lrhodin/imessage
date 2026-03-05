@@ -1,4 +1,17 @@
-use std::{io::Cursor, collections::HashMap};
+use std::{io::Cursor, collections::{HashMap, HashSet}};
+use std::sync::{Mutex, OnceLock};
+
+fn ford_key_cache() -> &'static Mutex<HashMap<Vec<u8>, Vec<u8>>> {
+    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Vec<u8>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register a Ford key so deduplicated downloads can find it by fordChecksum.
+pub fn register_ford_key(key: &[u8]) {
+    let mut cs = vec![0x01u8];
+    cs.extend_from_slice(&sha1(key));
+    ford_key_cache().lock().unwrap().insert(cs, key.to_vec());
+}
 
 use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_get_response, authorize_put::put_data::{Chunk, FordDesc}, authorize_put_response::{upload_target::ChunkIdentifier, UploadTarget}, Container as ProtoContainer, FordChunk, FordChunkItem, FordItem, HttpRequest}, util::{decode_hex, encode_hex, plist_to_bin, REQWEST}, APSConnectionResource};
 use aes::Aes256;
@@ -215,7 +228,8 @@ pub async fn prepare_put_v2(mut reader: impl ReadContainer + Send + Sync, bounda
         item: Some(FordItem {
             chunks: ford_references,
             checksum: checksum.to_vec()
-        })
+        }),
+        item_v2: None,
     };
     let ford_key: [u8; 32] = rand::random();
 
@@ -945,17 +959,26 @@ impl MMCSGetContainer {
         }
     }
 
-    fn get_chunks(&self, keys: &HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>) -> Vec<ChunkDesc> {
-        self.container.chunks.iter().filter_map(|chunk| chunk.meta.as_ref().map(|meta| ChunkDesc {
-            id: meta.checksum.clone().try_into().unwrap(),
-            size: meta.size as usize,
-            key: if let Some((key, len)) = keys.get(&meta.checksum) {
+    fn get_chunks(&self, keys: &HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>, ford_failed: &HashSet<Vec<u8>>) -> Vec<ChunkDesc> {
+        self.container.chunks.iter().filter_map(|chunk| {
+            let meta = chunk.meta.as_ref()?;
+            let key = if let Some((key, len)) = keys.get(&meta.checksum) {
                 ChunkEncryption::V2(key.clone().try_into().unwrap(), len.clone().try_into().unwrap())
+            } else if chunk.encryption.is_some() || ford_failed.contains(&meta.checksum) {
+                // Ford-encrypted chunk but no key available (SIV decrypt failed for this file).
+                // Skip to prevent writing encrypted garbage as plaintext.
+                warn!("Skipping Ford chunk with no key (checksum={})", encode_hex(&meta.checksum));
+                return None;
             } else if let Some(key) = &meta.encryption_key {
                 ChunkEncryption::V1(key.clone().try_into().unwrap())
-            } else { ChunkEncryption::None },
-            offset: Some(meta.offset as usize)
-        })).collect()
+            } else { ChunkEncryption::None };
+            Some(ChunkDesc {
+                id: meta.checksum.clone().try_into().unwrap(),
+                size: meta.size as usize,
+                key,
+                offset: Some(meta.offset as usize)
+            })
+        }).collect()
     }
     
     fn get_ford_chunks(&self) -> Vec<ChunkDesc> {
@@ -1031,6 +1054,18 @@ pub async fn authorize_get(config: &MMCSConfig, url: &str, files: &[(Vec<u8>, &s
 pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, files: Vec<(Vec<u8>, &str, impl WriteContainer + Send + Sync, Option<Vec<u8>>)>, progress: impl FnMut(usize, usize) + Send + Sync, ford: bool) -> Result<(), PushError> {
     let mut files = files.into_iter().map(|(a, b, c, k)| (a, b, Some(c), k)).collect::<Vec<_>>();
 
+    // Populate global Ford key cache with all keys from this batch
+    {
+        let mut cache = ford_key_cache().lock().unwrap();
+        for file in &files {
+            if let Some(ref key) = file.3 {
+                let mut cs = vec![0x01u8];
+                cs.extend_from_slice(&sha1(key));
+                cache.insert(cs, key.clone());
+            }
+        }
+    }
+
     let AuthorizedOperation { url, body, dsid } = authorized;
 
     debug!("get response hex {}", encode_hex(&body));
@@ -1056,7 +1091,7 @@ pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, file
         let Some(container) = files.iter_mut().find(|container| &container.0 == &wanted_chunks.file_checksum && container.2.is_some()) else { return None };
 
         if let Some(ford) = &wanted_chunks.ford_reference {
-            ford_containers.push((wanted_chunks.chunk_references.clone(), ford.clone(), vec![0u8; 0], container.3.clone().expect("Ford chunk has no key!")));
+            ford_containers.push((wanted_chunks.chunk_references.clone(), ford.clone(), vec![0u8; 0], container.3.clone().expect("Ford chunk has no key!"), wanted_chunks.ford_checksum.clone()));
         }
 
         Some(ChunkedContainer::new(wanted_chunks.chunk_references.iter().map(|chunk| {
@@ -1074,6 +1109,7 @@ pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, file
     }).collect();
 
     let mut ford_keymap: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = HashMap::new();
+    let mut ford_failed_chunks: HashSet<Vec<u8>> = HashSet::new();
     if !ford_containers.is_empty() {
         let ford_sources: Vec<ChunkedContainer<MMCSGetContainer>> = response.f1.as_ref().unwrap().containers.iter().map(|container| {
             let container = MMCSGetContainer::new(container.clone(), config.user_agent.clone());
@@ -1102,35 +1138,113 @@ pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, file
         };
         matcher.transfer_chunks(config, |a, b| { }).await?;
 
-        for (references, _ford_ref, ford, key) in ford_containers {
-        
-            let hk = Hkdf::<Sha256>::new(Some("PCSMMCS2".as_bytes()), &key);
-            let mut result = [0u8; 64];
-            hk.expand(&[], &mut result).unwrap();
-
-            let mut cipher = CmacSiv::<Aes256>::new_from_slice(&result).unwrap();
-            // first byte is 4 if initial key is 256 bit, 3 otherwise
-            let data = cipher.decrypt::<&[&[u8]], &&[u8]>(&[&ford[1..17], &ford[..1]], &ford[17..]).unwrap();
-            println!("{}", encode_hex(&data));
-
-            let chunks = FordChunk::decode(Cursor::new(&data))?;
-            let item = chunks.item.expect("Ford chunks missing?");
-            for (ford, reference) in item.chunks.into_iter().zip(references.iter()) {
-                let container = containers.get(reference.container_index as usize).unwrap();
-                let chunk = &container.chunks[reference.chunk_index as usize];
-
-                ford_keymap.insert(chunk.meta.as_ref().unwrap().checksum.clone(), (ford.key, ford.chunk_len));
+        for (references, _ford_ref, ford, key, ford_checksum) in ford_containers {
+            if ford.len() < 17 {
+                warn!("Ford blob too short ({} bytes), skipping", ford.len());
+                for reference in &references {
+                    let chunk = &containers[reference.container_index as usize].chunks[reference.chunk_index as usize];
+                    if let Some(meta) = &chunk.meta {
+                        ford_failed_chunks.insert(meta.checksum.clone());
+                    }
+                }
+                continue;
             }
 
-            let mut total_hasher = Sha1::new();
-            total_hasher.update(&ford);
-            println!("{}", encode_hex(&total_hasher.finish()))
+            let try_ford_siv = |k: &[u8]| -> Option<Vec<u8>> {
+                let hk = Hkdf::<Sha256>::new(Some("PCSMMCS2".as_bytes()), k);
+                let mut result = [0u8; 64];
+                hk.expand(&[], &mut result).unwrap();
+                let mut cipher = CmacSiv::<Aes256>::new_from_slice(&result).unwrap();
+                cipher.decrypt::<&[&[u8]], &&[u8]>(&[&ford[1..17], &ford[..1]], &ford[17..]).ok()
+            };
+
+            let data = if let Some(d) = try_ford_siv(&key) {
+                d
+            } else {
+                // Primary key failed — MMCS deduplication likely served a Ford blob
+                // encrypted with a different key. Try fordChecksum cache lookup first.
+                let cache_size = ford_key_cache().lock().unwrap().len();
+                warn!("Ford SIV failed with primary key (key_hex={}, ford_len={}), cache has {} keys, fordChecksum={}",
+                    encode_hex(&key), ford.len(), cache_size, encode_hex(&ford_checksum));
+                let cached_hit = if !ford_checksum.is_empty() {
+                    let cache = ford_key_cache().lock().unwrap();
+                    let alt_key = cache.get(&ford_checksum).cloned();
+                    drop(cache);
+                    if let Some(ref alt) = alt_key {
+                        try_ford_siv(alt)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(d) = cached_hit {
+                    info!("Ford SIV succeeded with cached key (dedup resolved)");
+                    d
+                } else {
+                    // fordChecksum lookup failed or missed — brute-force all cached keys via SIV.
+                    let all_keys: Vec<Vec<u8>> = {
+                        let cache = ford_key_cache().lock().unwrap();
+                        cache.values().cloned().collect()
+                    };
+                    let mut found = None;
+                    for alt in &all_keys {
+                        if let Some(d) = try_ford_siv(alt) {
+                            found = Some(d);
+                            break;
+                        }
+                    }
+                    if let Some(d) = found {
+                        info!("Ford SIV succeeded with brute-force cached key (dedup resolved, {} keys tried)", all_keys.len());
+                        d
+                    } else {
+                        // Log all cached fordChecksums so we can compare formats
+                        let cached_checksums: Vec<String> = {
+                            let cache = ford_key_cache().lock().unwrap();
+                            cache.keys().take(5).map(|k| encode_hex(k)).collect()
+                        };
+                        warn!("Ford SIV failed with primary key and all {} cached keys. fordChecksum={} sample_cached={:?}", all_keys.len(), encode_hex(&ford_checksum), cached_checksums);
+                        for reference in &references {
+                            let chunk = &containers[reference.container_index as usize].chunks[reference.chunk_index as usize];
+                            if let Some(meta) = &chunk.meta {
+                                ford_failed_chunks.insert(meta.checksum.clone());
+                            }
+                        }
+                        continue;
+                    }
+                }
+            };
+
+            let chunks = FordChunk::decode(Cursor::new(&data))?;
+
+            // V1: single FordItem in field 1 — flat list of (key, chunk_len) pairs
+            // V2: FordItemV2 in field 2 — chunks grouped by size, each group has multiple keys
+            let ford_entries: Vec<FordChunkItem> = if let Some(item) = chunks.item {
+                item.chunks
+            } else if let Some(item_v2) = chunks.item_v2 {
+                item_v2.chunks.into_iter().flat_map(|group| {
+                    let chunk_len = group.chunk_len.clone();
+                    group.keys.into_iter().map(move |kw| FordChunkItem {
+                        key: kw.key,
+                        chunk_len: chunk_len.clone(),
+                    })
+                }).collect()
+            } else {
+                warn!("Ford decode: neither v1 nor v2 item present, skipping");
+                continue;
+            };
+
+            for (ford, reference) in ford_entries.into_iter().zip(references.iter()) {
+                let container = containers.get(reference.container_index as usize).unwrap();
+                let chunk = &container.chunks[reference.chunk_index as usize];
+                ford_keymap.insert(chunk.meta.as_ref().unwrap().checksum.clone(), (ford.key, ford.chunk_len));
+            }
         }
     }
 
     let sources: Vec<ChunkedContainer<MMCSGetContainer>> = response.f1.as_ref().unwrap().containers.iter().map(|container| {
         let container = MMCSGetContainer::new(container.clone(), config.user_agent.clone());
-        ChunkedContainer::new(container.get_chunks(&ford_keymap), container)
+        ChunkedContainer::new(container.get_chunks(&ford_keymap, &ford_failed_chunks), container)
     }).collect();
 
 

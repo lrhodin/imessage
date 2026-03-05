@@ -695,7 +695,7 @@ impl PCSShareProtection {
                 );
                 let decoded = PCSPrivateKey::from_dict(item, keychain);
                 let key = decoded.key();
-                return self.decode(&key);
+                return self.decode(&key, pub_key);
             }
         }
 
@@ -802,9 +802,12 @@ impl PCSShareProtection {
         Ok(protection)
     }
 
-    pub fn decode(&self, key: &CompactECKey<Private>) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
+    pub fn decode(&self, key: &CompactECKey<Private>, matched_pub_key: &[u8]) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
         info!("Decoding share protection!");
-        let rm_master_key = PCSKey::new(key, &self.keyset.keyset.first().unwrap().ciphertext)?;
+        let share_key = self.keyset.keyset.iter()
+            .find(|sk| sk.decryption_key.pub_key.as_ref() == matched_pub_key)
+            .unwrap_or_else(|| self.keyset.keyset.first().unwrap());
+        let rm_master_key = PCSKey::new(key, &share_key.ciphertext)?;
 
         let sig = self.signature_data();
         
@@ -814,7 +817,7 @@ impl PCSShareProtection {
         let mut verifier = Verifier::new(MessageDigest::sha256(), &key)?;
         verifier.update(&digest_data)?;
         if !verifier.verify(&self.signature.signature)? {
-            panic!("sig check failed")
+            return Err(PushError::PCSDecryptError("sig check failed".into()));
         }
 
         let key = PKey::from_ec_key(rm_master_key.master_ec_key()?)?;
@@ -825,10 +828,10 @@ impl PCSShareProtection {
                 let mut verifier = Verifier::new(MessageDigest::sha256(), &key)?;
                 verifier.update(&digest_data)?;
                 if !verifier.verify(&past_signature.signature)? {
-                    panic!("self sig 1 and 2 check failed")
+                    return Err(PushError::PCSDecryptError("self sig 1 and 2 check failed".into()));
                 }
             } else {
-                panic!("self sig check failed")
+                return Err(PushError::PCSDecryptError("self sig check failed".into()));
             }
         }
 
@@ -841,7 +844,7 @@ impl PCSShareProtection {
         let hmac = PKey::hmac(&hmackey)?;
         let signature = Signer::new(MessageDigest::sha256(), &hmac).unwrap().sign_oneshot_to_vec(&self.hmac_data()).unwrap();
         if &signature != &self.hmac {
-            panic!("HMAC check failed");
+            return Err(PushError::PCSDecryptError("HMAC check failed".into()));
         }
 
         let decrypted = master_key.decrypt(&self.meta, &[])?;

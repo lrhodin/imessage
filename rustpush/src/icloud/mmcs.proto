@@ -114,8 +114,23 @@ message FordItem {
     bytes checksum = 2;
 }
 
+message FordKeyWrapper {
+    bytes key = 1;
+}
+
+message FordChunkGroup {
+    bytes chunk_len = 1;
+    repeated FordKeyWrapper keys = 2;
+}
+
+message FordItemV2 {
+    bytes checksum = 1;
+    repeated FordChunkGroup chunks = 2;
+}
+
 message FordChunk {
     FordItem item = 1;
+    FordItemV2 item_v2 = 2;
 }
 
 message AuthorizeGetResponse {

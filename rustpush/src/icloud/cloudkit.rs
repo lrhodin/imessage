@@ -3,7 +3,8 @@ use std::{collections::HashMap, io::{Cursor, Read, Write}, marker::PhantomData, 
 use aes::{cipher::consts::U12, Aes128, Aes256};
 use aes_gcm::{AesGcm, Nonce, Tag};
 use aes_siv::siv::CmacSiv;
-use cloudkit_proto::{record, request_operation::header::IsolationLevel, retrieve_changes_response::RecordChange, AssetGetResponse, AssetsToDownload, CloudKitRecord, ProtectionInfo, Record, RecordIdentifier, RecordZoneIdentifier, ResponseOperation, Zone};
+pub use cloudkit_proto::AssetsToDownload;
+use cloudkit_proto::{record, request_operation::header::IsolationLevel, retrieve_changes_response::RecordChange, AssetGetResponse, CloudKitRecord, ProtectionInfo, Record, RecordIdentifier, RecordZoneIdentifier, ResponseOperation, Zone};
 use hkdf::Hkdf;
 use log::info;
 use omnisette::{AnisetteProvider, ArcAnisetteClient};
@@ -825,7 +826,7 @@ impl PCSZoneConfig {
                     Ok(true)
                 )
             }) {
-                let (keys, _record_keys) = record_protection.decode(item)?;
+                let (keys, _record_keys) = record_protection.decode(item, &pub_key)?;
                 return Ok(keys);
             }
         }
