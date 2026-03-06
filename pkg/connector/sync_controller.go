@@ -802,7 +802,6 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 				Filename:       filename,
 				FileSize:       att.FileSize,
 				RecordName:     att.RecordName,
-				HideAttachment: att.HideAttachment,
 				HasAvid:        att.HasAvid,
 			}
 		}
@@ -1370,13 +1369,6 @@ func (c *IMClient) ingestCloudMessages(
 						Msg("Attachment GUID not found in attachment zone")
 				}
 			}
-			// Live Photo companion discovery: if a message has an HEIC still,
-			// search the attachment zone for a MOV video with the same base
-			// filename (e.g., IMG_5551.HEIC → IMG_5551.MOV). CloudKit doesn't
-			// reference the MOV GUID from the message, but the record exists
-			// in the attachment zone. We inject it with HideAttachment=true so
-			// cloudAttachmentsToBackfill skips the HEIC and bridges the video.
-			attRows = injectLivePhotoCompanion(attRows, attMap, log, msg.Guid)
 			if len(attRows) > 0 {
 				if attJSON, jsonErr := json.Marshal(attRows); jsonErr == nil {
 					attachmentsJSON = string(attJSON)
@@ -1703,66 +1695,6 @@ func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {
 		return fmt.Errorf("cloud store not initialized")
 	}
 	return c.cloudStore.ensureSchema(ctx)
-}
-
-// injectLivePhotoCompanion searches the attachment zone for a Live Photo MOV
-// companion when a message has an HEIC still image. Apple Live Photos store
-// two files: a still HEIC and a short MOV video with matching base filename
-// (e.g., IMG_5551.HEIC + IMG_5551.MOV). In CloudKit, only the HEIC GUID is
-// referenced by the message; the MOV exists in the attachment zone but is
-// orphaned. This function finds the MOV by filename match and injects it into
-// the attachment list with HideAttachment=true so downstream filtering
-// (cloudAttachmentsToBackfill) drops the HEIC and bridges only the video.
-func injectLivePhotoCompanion(attRows []cloudAttachmentRow, attMap map[string]cloudAttachmentRow, log zerolog.Logger, msgGUID string) []cloudAttachmentRow {
-	// Find HEIC/image attachments with filenames we can match.
-	var heicBases []string
-	heicGUIDs := make(map[string]bool)
-	for _, att := range attRows {
-		if strings.HasPrefix(att.MimeType, "image/") && att.Filename != "" {
-			base := filenameBase(att.Filename)
-			if base != "" {
-				heicBases = append(heicBases, base)
-				heicGUIDs[att.GUID] = true
-			}
-		}
-	}
-	if len(heicBases) == 0 {
-		return attRows
-	}
-
-	// Build a set of base names for quick lookup.
-	baseSet := make(map[string]bool, len(heicBases))
-	for _, b := range heicBases {
-		baseSet[strings.ToLower(b)] = true
-	}
-
-	// Search the entire attachment zone for videos with matching base filenames.
-	// Existing attachment GUIDs are skipped to avoid duplicates.
-	existingGUIDs := make(map[string]bool, len(attRows))
-	for _, att := range attRows {
-		existingGUIDs[att.GUID] = true
-	}
-
-	for _, att := range attMap {
-		if existingGUIDs[att.GUID] {
-			continue
-		}
-		if !strings.HasPrefix(att.MimeType, "video/") || att.Filename == "" {
-			continue
-		}
-		base := filenameBase(att.Filename)
-		if base != "" && baseSet[strings.ToLower(base)] {
-			// Found a Live Photo MOV companion. Mark it as hidden so
-			// cloudAttachmentsToBackfill will drop the HEIC still.
-			att.HideAttachment = true
-			attRows = append(attRows, att)
-			log.Info().Str("msg_guid", msgGUID).Str("mov_guid", att.GUID).
-				Str("filename", att.Filename).
-				Msg("Live Photo: injected MOV companion from attachment zone")
-		}
-	}
-
-	return attRows
 }
 
 // filenameBase returns the filename without its extension.

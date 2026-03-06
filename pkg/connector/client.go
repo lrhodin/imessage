@@ -1103,24 +1103,11 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		})
 	}
 
-	// Live Photo handling: when a message has both an iris (Live Photo) video
-	// and a still image, skip the still so only the motion video is bridged.
-	hasIrisVideo := false
-	for _, att := range msg.Attachments {
-		if att.Iris && strings.HasPrefix(att.MimeType, "video/") {
-			hasIrisVideo = true
-			break
-		}
-	}
-
+	// Live Photo handling: bridge both the still image and the video.
 	attIndex := 0
 	for _, att := range msg.Attachments {
 		// Skip rich link sideband attachments (handled in convertMessage)
 		if att.MimeType == "x-richlink/meta" || att.MimeType == "x-richlink/image" {
-			continue
-		}
-		// Skip the HEIC still when we have the Live Photo video
-		if hasIrisVideo && !att.Iris && strings.HasPrefix(att.MimeType, "image/") {
 			continue
 		}
 		attID := msg.Uuid
@@ -3231,36 +3218,9 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 		}
 	}
 
-	// Live Photo handling: when a message has a companion MOV (HideAttachment
-	// from filename matching) or an avid-backed HEIC (HasAvid), filter out
-	// redundant stills/companions so only one video per Live Photo is bridged.
-	hasHiddenVideo := false
-	hasAvid := false
-	for _, da := range downloadable {
-		if da.att.HideAttachment && strings.HasPrefix(da.att.MimeType, "video/") {
-			hasHiddenVideo = true
-		}
-		if da.att.HasAvid {
-			hasAvid = true
-		}
-	}
-	if hasHiddenVideo || hasAvid {
-		var filtered []indexedAtt
-		for _, da := range downloadable {
-			// When we have avid, drop filename-matched companion MOVs
-			// (they're redundant — avid on the HEIC record IS the video).
-			if hasAvid && da.att.HideAttachment {
-				continue
-			}
-			// When we have a hidden MOV companion (but no avid), drop
-			// the HEIC still so only the MOV is bridged.
-			if hasHiddenVideo && !hasAvid && !da.att.HideAttachment && strings.HasPrefix(da.att.MimeType, "image/") {
-				continue
-			}
-			filtered = append(filtered, da)
-		}
-		downloadable = filtered
-	}
+	// Live Photo handling: when HasAvid is true on an attachment, the download
+	// step will fetch both the lqa (HEIC still) and avid (video) from the same
+	// CloudKit record and return two BackfillMessages.
 	if len(downloadable) == 0 {
 		return nil
 	}
@@ -3410,9 +3370,9 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// Cache hit: preUploadCloudAttachments already downloaded and uploaded this
 	// attachment in the cloud sync goroutine. Return immediately without touching
 	// CloudKit, keeping the portal event loop unblocked.
-	// NOTE: Skip cache for non-MP4 videos that need transcoding — they may have
-	// been cached before transcoding support was added.
-	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok {
+	// NOTE: Skip cache for non-MP4 videos that need transcoding, and for
+	// HasAvid records (old cache entries only have one part, not both still+video).
+	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok && !att.HasAvid {
 		cachedContent := cached.(*event.MessageEventContent)
 		if cachedContent.Info != nil && cachedContent.Info.MimeType == "video/quicktime" {
 			// Stale cache entry — video needs transcoding. Fall through to re-download.
@@ -3432,24 +3392,8 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
-	// Live Photo: if the attachment has an avid (video) asset, download that
-	// instead of the lqa (HEIC still). This gives recipients the motion video
-	// as intended on iOS. Falls back to lqa if avid download fails.
-	var data []byte
-	var err error
-	usedAvid := false
-	if att.HasAvid {
-		data, err = safeCloudDownloadAttachmentAvid(c.client, att.RecordName)
-		if err != nil || len(data) == 0 {
-			log.Warn().Err(err).Str("guid", row.GUID).Str("record_name", att.RecordName).
-				Msg("Live Photo avid download failed, falling back to lqa")
-			data, err = safeCloudDownloadAttachment(c.client, att.RecordName)
-		} else {
-			usedAvid = true
-		}
-	} else {
-		data, err = safeCloudDownloadAttachment(c.client, att.RecordName)
-	}
+	// Download the lqa (still image) — this is always the baseline.
+	data, err := safeCloudDownloadAttachment(c.client, att.RecordName)
 	if err != nil {
 		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
 		log.Warn().Err(err).
@@ -3470,23 +3414,6 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	mimeType := att.MimeType
 	fileName := att.Filename
-	if usedAvid {
-		// Downloaded the Live Photo video — override metadata from the HEIC still.
-		mimeType = "video/quicktime"
-		if fileName != "" {
-			base := filenameBase(fileName)
-			if base != "" {
-				fileName = base + ".MOV"
-			} else {
-				fileName = "livephoto.MOV"
-			}
-		} else {
-			fileName = "livephoto.MOV"
-		}
-		log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
-			Int("bytes", len(data)).
-			Msg("Live Photo: downloaded avid video instead of HEIC still")
-	}
 	if mimeType == "" {
 		mimeType = utiToMIME(att.UTIType)
 	}
@@ -3624,7 +3551,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
-	return []*bridgev2.BackfillMessage{{
+	messages := []*bridgev2.BackfillMessage{{
 		Sender:    sender,
 		ID:        makeMessageID(attID),
 		Timestamp: ts,
@@ -3635,6 +3562,91 @@ func (c *IMClient) downloadAndUploadAttachment(
 			}},
 		},
 	}}
+
+	// Live Photo: if this attachment has an avid (video) asset, also download
+	// and bridge the video so recipients see both the still and the motion.
+	if att.HasAvid {
+		avidData, avidErr := safeCloudDownloadAttachmentAvid(c.client, att.RecordName)
+		if avidErr != nil || len(avidData) == 0 {
+			log.Warn().Err(avidErr).Str("guid", row.GUID).Str("record_name", att.RecordName).
+				Msg("Live Photo avid download failed, bridging still only")
+			return messages
+		}
+		avidMime := "video/quicktime"
+		avidFileName := "livephoto.MOV"
+		if fileName != "" {
+			base := filenameBase(fileName)
+			if base != "" {
+				avidFileName = base + ".MOV"
+			}
+		}
+
+		// Remux/transcode the avid video if enabled.
+		if c.Main.Config.VideoTranscoding && ffmpeg.Supported() {
+			origSize := len(avidData)
+			method := "remux"
+			converted, convertErr := ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
+				[]string{"-c", "copy", "-movflags", "+faststart"},
+				avidMime)
+			if convertErr != nil {
+				method = "re-encode"
+				converted, convertErr = ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
+					[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
+						"-c:a", "aac", "-movflags", "+faststart"},
+					avidMime)
+			}
+			if convertErr != nil {
+				log.Warn().Err(convertErr).Str("guid", row.GUID).
+					Msg("Live Photo avid ffmpeg conversion failed, uploading original")
+			} else {
+				log.Info().Str("guid", row.GUID).
+					Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).
+					Msg("Live Photo avid transcoded to MP4")
+				avidData = converted
+				avidMime = "video/mp4"
+				avidFileName = strings.TrimSuffix(avidFileName, filepath.Ext(avidFileName)) + ".mp4"
+			}
+		}
+
+		avidMsgType := mimeToMsgType(avidMime)
+		avidContent := &event.MessageEventContent{
+			MsgType: avidMsgType,
+			Body:    avidFileName,
+			Info: &event.FileInfo{
+				MimeType: avidMime,
+				Size:     len(avidData),
+			},
+		}
+		avidURL, avidEnc, avidUploadErr := intent.UploadMedia(ctx, "", avidData, avidFileName, avidMime)
+		if avidUploadErr != nil {
+			log.Warn().Err(avidUploadErr).Str("guid", row.GUID).
+				Msg("Live Photo avid upload failed, bridging still only")
+			return messages
+		}
+		if avidEnc != nil {
+			avidContent.File = avidEnc
+		} else {
+			avidContent.URL = avidURL
+		}
+
+		log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
+			Int("bytes", len(avidData)).
+			Msg("Live Photo: bridging both HEIC still and avid video")
+
+		messages = append(messages, &bridgev2.BackfillMessage{
+			Sender:    sender,
+			ID:        makeMessageID(attID + "_avid"),
+			Timestamp: ts,
+			ConvertedMessage: &bridgev2.ConvertedMessage{
+				Parts: []*bridgev2.ConvertedMessagePart{{
+					Type:    event.EventMessage,
+					Content: avidContent,
+				}},
+			},
+		})
+	}
+
+	return messages
 }
 
 // preUploadCloudAttachments downloads every CloudKit attachment recorded in the

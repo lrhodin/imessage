@@ -208,13 +208,12 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 		// Live Photo handling: macOS stores the MOV companion as a sibling
 		// file next to the HEIC on disk, but does NOT list it in the
-		// attachment table. For each HEIC, check if a .MOV exists in the
-		// same directory. If so, bridge the MOV instead of the HEIC.
+		// attachment table. Bridge the original attachment first, then
+		// check for and bridge any companion MOV alongside it.
 		for i, att := range msg.Attachments {
 			if att == nil {
 				continue
 			}
-			att = chatDBResolveLivePhoto(att, log)
 			attCm, err := convertChatDBAttachment(ctx, params.Portal, intent, msg, att, c.Main.Config.VideoTranscoding)
 			if err != nil {
 				log.Warn().Err(err).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert attachment, skipping")
@@ -229,6 +228,25 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 				Timestamp:        msg.Time.Add(time.Duration(i+1) * time.Millisecond),
 				StreamOrder:      msg.Time.UnixMilli() + int64(i+1),
 			})
+
+			// If there's a Live Photo MOV companion on disk, bridge it too.
+			movAtt := chatDBResolveLivePhoto(att, log)
+			if movAtt.PathOnDisk != att.PathOnDisk {
+				movCm, movErr := convertChatDBAttachment(ctx, params.Portal, intent, msg, movAtt, c.Main.Config.VideoTranscoding)
+				if movErr != nil {
+					log.Warn().Err(movErr).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert Live Photo MOV companion, skipping")
+				} else {
+					movID := fmt.Sprintf("%s_att%d_mov", msg.GUID, i)
+					backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
+						ConvertedMessage: movCm,
+						Sender:           sender,
+						ID:               makeMessageID(movID),
+						TxnID:            networkid.TransactionID(movID),
+						Timestamp:        msg.Time.Add(time.Duration(i+1)*time.Millisecond + 500*time.Microsecond),
+						StreamOrder:      msg.Time.UnixMilli() + int64(i+1),
+					})
+				}
+			}
 		}
 	}
 
@@ -417,7 +435,8 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 // chatDBResolveLivePhoto checks if a HEIC/JPG attachment has a companion .MOV
 // file on disk (Apple stores Live Photo videos as sibling files but doesn't
 // list them in the attachment table). If found, returns a new Attachment
-// pointing to the MOV instead.
+// pointing to the MOV. Returns the original attachment unchanged if no
+// companion is found.
 func chatDBResolveLivePhoto(att *imessage.Attachment, log *zerolog.Logger) *imessage.Attachment {
 	path := att.PathOnDisk
 	if strings.HasPrefix(path, "~/") {
