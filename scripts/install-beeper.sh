@@ -776,7 +776,7 @@ fi
 # ── Ensure video_transcoding key exists in config ──────────────
 if ! grep -q 'video_transcoding:' "$CONFIG" 2>/dev/null; then
     sed -i '' '/cloudkit_backfill:/i\
-\    video_transcoding: false' "$CONFIG"
+    video_transcoding: false' "$CONFIG"
 fi
 
 # ── Video transcoding (ffmpeg) ─────────────────────────────────
