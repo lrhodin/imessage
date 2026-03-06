@@ -49,12 +49,14 @@ type cloudMessageRow struct {
 
 // cloudAttachmentRow holds CloudKit attachment metadata for a single attachment.
 type cloudAttachmentRow struct {
-	GUID       string `json:"guid"`
-	MimeType   string `json:"mime_type,omitempty"`
-	UTIType    string `json:"uti_type,omitempty"`
-	Filename   string `json:"filename,omitempty"`
-	FileSize   int64  `json:"file_size"`
-	RecordName string `json:"record_name"`
+	GUID           string `json:"guid"`
+	MimeType       string `json:"mime_type,omitempty"`
+	UTIType        string `json:"uti_type,omitempty"`
+	Filename       string `json:"filename,omitempty"`
+	FileSize       int64  `json:"file_size"`
+	RecordName     string `json:"record_name"`
+	HideAttachment bool   `json:"hide_attachment,omitempty"`
+	HasAvid        bool   `json:"has_avid,omitempty"`
 }
 
 const (

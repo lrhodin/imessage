@@ -690,6 +690,77 @@ if [ -n "${CURRENT_HANDLE:-}" ]; then
     echo "$CURRENT_HANDLE" > "$HANDLE_BACKUP"
 fi
 
+# ── Ensure video_transcoding key exists in config ──────────────
+if ! grep -q 'video_transcoding:' "$CONFIG" 2>/dev/null; then
+    sed -i '/cloudkit_backfill:/i\    video_transcoding: false' "$CONFIG"
+fi
+
+# ── Video transcoding (ffmpeg) ─────────────────────────────────
+CURRENT_VIDEO_TRANSCODING=$(grep 'video_transcoding:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*video_transcoding: *//' || true)
+if [ -t 0 ]; then
+    echo ""
+    echo "Video Transcoding:"
+    echo "  When enabled, non-MP4 videos (e.g. QuickTime .mov) are automatically"
+    echo "  converted to MP4 for broad Matrix client compatibility."
+    echo "  Requires ffmpeg."
+    echo ""
+    if [ "$CURRENT_VIDEO_TRANSCODING" = "true" ]; then
+        read -p "Enable video transcoding/remuxing? [Y/n]: " ENABLE_VT
+        case "$ENABLE_VT" in
+            [nN]*)
+                sed -i "s/video_transcoding: .*/video_transcoding: false/" "$CONFIG"
+                echo "✓ Video transcoding disabled"
+                ;;
+            *)
+                if ! command -v ffmpeg >/dev/null 2>&1; then
+                    echo "  ffmpeg not found — installing..."
+                    if command -v apt >/dev/null 2>&1; then
+                        sudo apt install -y ffmpeg
+                    elif command -v dnf >/dev/null 2>&1; then
+                        sudo dnf install -y ffmpeg
+                    elif command -v pacman >/dev/null 2>&1; then
+                        sudo pacman -S --noconfirm ffmpeg
+                    elif command -v zypper >/dev/null 2>&1; then
+                        sudo zypper install -y ffmpeg
+                    elif command -v apk >/dev/null 2>&1; then
+                        sudo apk add ffmpeg
+                    else
+                        echo "  ⚠ Could not detect package manager — please install ffmpeg manually"
+                    fi
+                fi
+                echo "✓ Video transcoding enabled"
+                ;;
+        esac
+    else
+        read -p "Enable video transcoding/remuxing? [y/N]: " ENABLE_VT
+        case "$ENABLE_VT" in
+            [yY]*)
+                sed -i "s/video_transcoding: .*/video_transcoding: true/" "$CONFIG"
+                if ! command -v ffmpeg >/dev/null 2>&1; then
+                    echo "  ffmpeg not found — installing..."
+                    if command -v apt >/dev/null 2>&1; then
+                        sudo apt install -y ffmpeg
+                    elif command -v dnf >/dev/null 2>&1; then
+                        sudo dnf install -y ffmpeg
+                    elif command -v pacman >/dev/null 2>&1; then
+                        sudo pacman -S --noconfirm ffmpeg
+                    elif command -v zypper >/dev/null 2>&1; then
+                        sudo zypper install -y ffmpeg
+                    elif command -v apk >/dev/null 2>&1; then
+                        sudo apk add ffmpeg
+                    else
+                        echo "  ⚠ Could not detect package manager — please install ffmpeg manually"
+                    fi
+                fi
+                echo "✓ Video transcoding enabled"
+                ;;
+            *)
+                echo "✓ Video transcoding disabled"
+                ;;
+        esac
+    fi
+fi
+
 # ── Write auto-update wrapper ─────────────────────────────────
 cat > "$DATA_DIR/start.sh" << HEADER_EOF
 #!/bin/bash

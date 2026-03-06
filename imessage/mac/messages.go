@@ -50,7 +50,7 @@ LEFT JOIN handle target_handle ON message.other_handle = target_handle.ROWID
 `
 
 const attachmentsQuery = `
-SELECT guid, COALESCE(filename, ''), COALESCE(mime_type, ''), transfer_name FROM attachment
+SELECT guid, COALESCE(filename, ''), COALESCE(mime_type, ''), COALESCE(transfer_name, ''), COALESCE(hide_attachment, 0), COALESCE(created_date, 0) FROM attachment
 JOIN message_attachment_join ON message_attachment_join.attachment_id = attachment.ROWID
 WHERE message_attachment_join.message_id = $1
 ORDER BY ROWID
@@ -286,7 +286,7 @@ func (mac *macOSDatabase) scanMessages(res *sql.Rows) (messages []*imessage.Mess
 		}
 		for ares.Next() {
 			var attachment imessage.Attachment
-			err = ares.Scan(&attachment.GUID, &attachment.PathOnDisk, &attachment.MimeType, &attachment.FileName)
+			err = ares.Scan(&attachment.GUID, &attachment.PathOnDisk, &attachment.MimeType, &attachment.FileName, &attachment.HideAttachment, &attachment.CreatedDate)
 			if err != nil {
 				err = fmt.Errorf("error scanning attachment row for %d: %w", message.RowID, err)
 				return

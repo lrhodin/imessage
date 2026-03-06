@@ -13,6 +13,11 @@ cloudkit_backfill: false
 # "chatdb" reads the local macOS chat.db (requires Full Disk Access).
 backfill_source: cloudkit
 
+# Enable automatic video transcoding/remuxing of non-MP4 videos (e.g.
+# QuickTime .mov) to MP4 for broad Matrix client compatibility.
+# Requires ffmpeg to be installed on the system.
+video_transcoding: false
+
 # Override the outgoing iMessage identity (what recipients see your messages "from").
 # Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
 # Leave empty to use the handle chosen during login.

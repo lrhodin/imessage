@@ -920,6 +920,8 @@ pub struct WrappedAttachment {
     pub size: u64,
     pub is_inline: bool,
     pub inline_data: Option<Vec<u8>>,
+    /// True for Live Photo attachments (Apple's "iris" flag).
+    pub iris: bool,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -1024,6 +1026,12 @@ pub struct WrappedCloudAttachmentInfo {
     pub file_size: i64,
     /// CloudKit record name in attachmentManateeZone (needed for download)
     pub record_name: String,
+    /// Whether this attachment is hidden (companion transfer, e.g. Live Photo MOV).
+    /// When true, this is the video component of a Live Photo — not shown standalone.
+    pub hide_attachment: bool,
+    /// Whether this attachment record has a Live Photo video in its `avid` asset field.
+    /// When true, use cloud_download_attachment_avid to get the MOV instead of the HEIC.
+    pub has_avid: bool,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -1107,6 +1115,40 @@ fn extract_attachment_guids_from_attributed_body(data: &[u8]) -> Vec<String> {
             }
         } else if let Some(StCollapsedValue::String(s)) = dict.0.get("__kIMFileTransferGUIDAttributeName") {
             guids.push(s.clone());
+        }
+    }
+    guids
+}
+
+/// Extract attachment GUIDs from a CloudKit message's messageSummaryInfo.
+/// messageSummaryInfo is a binary plist containing an "ams" (attachment metadata
+/// summary) array. Each entry is a dict with "g" = GUID. This captures GUIDs
+/// for companion transfers (e.g. Live Photo MOV components) that are NOT
+/// referenced in attributedBody's __kIMFileTransferGUIDAttributeName.
+fn extract_attachment_guids_from_summary_info(data: &[u8]) -> Vec<String> {
+    let value: plist::Value = match plist::from_bytes(data) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("messageSummaryInfo: plist parse failed ({} bytes): {}", data.len(), e);
+            return vec![];
+        }
+    };
+    let dict = match value.as_dictionary() {
+        Some(d) => d,
+        None => return vec![],
+    };
+    let mut guids = Vec::new();
+    // "ams" = attachment metadata summary — array of per-attachment dicts
+    if let Some(plist::Value::Array(ams)) = dict.get("ams") {
+        for entry in ams {
+            if let Some(entry_dict) = entry.as_dictionary() {
+                // "g" = attachment GUID (file transfer GUID)
+                if let Some(plist::Value::String(guid)) = entry_dict.get("g") {
+                    if !guid.is_empty() {
+                        guids.push(guid.clone());
+                    }
+                }
+            }
         }
     }
     guids
@@ -1251,6 +1293,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                         size,
                         is_inline,
                         inline_data,
+                        iris: att.iris,
                     });
                 }
             }
@@ -1284,6 +1327,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                     size: 0,
                     is_inline: true,
                     inline_data: Some(meta.into_bytes()),
+                    iris: false,
                 });
 
                 // Image data (from image or icon)
@@ -1305,6 +1349,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                         size: img_data.len() as u64,
                         is_inline: true,
                         inline_data: Some(img_data),
+                        iris: false,
                     });
                 }
             }
@@ -3105,13 +3150,25 @@ impl Client {
                         .and_then(|p4| p4.associated_message_emoji.clone());
 
                     // Extract attachment GUIDs from attributedBody
-                    let attachment_guids: Vec<String> = msg.msg_proto.attributed_body
+                    let mut attachment_guids: Vec<String> = msg.msg_proto.attributed_body
                         .as_ref()
                         .map(|body| extract_attachment_guids_from_attributed_body(body))
                         .unwrap_or_default()
                         .into_iter()
                         .filter(|g| !g.is_empty() && g.len() <= 256 && g.is_ascii())
                         .collect();
+
+                    // Also extract from messageSummaryInfo to capture companion
+                    // transfers (e.g. Live Photo MOV) not in attributedBody.
+                    if let Some(ref summary) = msg.msg_proto.message_summary_info {
+                        for sg in extract_attachment_guids_from_summary_info(summary) {
+                            if !sg.is_empty() && sg.len() <= 256 && sg.is_ascii()
+                                && !attachment_guids.contains(&sg)
+                            {
+                                attachment_guids.push(sg);
+                            }
+                        }
+                    }
 
                     let date_read_ms = msg.msg_proto.date_read
                         .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
@@ -3220,6 +3277,7 @@ impl Client {
         let mut normalized = Vec::with_capacity(attachments.len());
         for (record_name, att_opt) in attachments {
             if let Some(att) = att_opt {
+                let has_avid = att.avid.size.unwrap_or(0) > 0;
                 normalized.push(WrappedCloudAttachmentInfo {
                     guid: att.cm.guid.clone(),
                     mime_type: att.cm.mime_type.clone(),
@@ -3227,6 +3285,8 @@ impl Client {
                     filename: att.cm.transfer_name.clone().or_else(|| att.cm.filename.clone()),
                     file_size: att.cm.total_bytes,
                     record_name,
+                    hide_attachment: att.cm.hide_attachment,
+                    has_avid,
                 });
             }
             // Deleted attachments are simply not included
@@ -3256,6 +3316,24 @@ impl Client {
         cloud_messages.download_attachment(files).await
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("Failed to download CloudKit attachment {}: {}", record_name, e),
+            })?;
+        Ok(shared.into_bytes())
+    }
+
+    /// Download the Live Photo video (avid asset) from a CloudKit attachment record.
+    /// Returns the raw MOV file bytes. Use this when has_avid is true.
+    pub async fn cloud_download_attachment_avid(
+        &self,
+        record_name: String,
+    ) -> Result<Vec<u8>, WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+        let shared = SharedWriter::new();
+        let mut files = HashMap::new();
+        files.insert(record_name.clone(), shared.clone());
+        cloud_messages.download_attachment_avid(files).await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to download CloudKit attachment avid {}: {}", record_name, e),
             })?;
         Ok(shared.into_bytes())
     }
@@ -3437,6 +3515,24 @@ impl Client {
                     .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
                     .unwrap_or(0);
 
+                // Extract attachment GUIDs from attributedBody + messageSummaryInfo
+                let mut attachment_guids: Vec<String> = msg.msg_proto.attributed_body
+                    .as_ref()
+                    .map(|body| extract_attachment_guids_from_attributed_body(body))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|g| !g.is_empty() && g.len() <= 256 && g.is_ascii())
+                    .collect();
+                if let Some(ref summary) = msg.msg_proto.message_summary_info {
+                    for sg in extract_attachment_guids_from_summary_info(summary) {
+                        if !sg.is_empty() && sg.len() <= 256 && sg.is_ascii()
+                            && !attachment_guids.contains(&sg)
+                        {
+                            attachment_guids.push(sg);
+                        }
+                    }
+                }
+
                 deduped.insert(
                     guid.clone(),
                     WrappedCloudSyncMessage {
@@ -3455,7 +3551,7 @@ impl Client {
                         tapback_type,
                         tapback_target_guid,
                         tapback_emoji,
-                        attachment_guids: vec![],
+                        attachment_guids,
                         date_read_ms,
                         msg_type: msg.r#type,
                         has_body: msg.msg_proto.attributed_body.is_some(),

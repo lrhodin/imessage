@@ -1203,6 +1203,31 @@ func (_self *Client) CloudDownloadAttachment(recordName string) ([]byte, error) 
 		})
 }
 
+func (_self *Client) CloudDownloadAttachmentAvid(recordName string) ([]byte, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_download_attachment_avid(
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(recordName)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterBytesINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *Client) CloudDownloadGroupPhoto(recordName string) ([]byte, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
@@ -2717,6 +2742,7 @@ type WrappedAttachment struct {
 	Size       uint64
 	IsInline   bool
 	InlineData *[]byte
+	Iris       bool
 }
 
 func (r *WrappedAttachment) Destroy() {
@@ -2726,6 +2752,7 @@ func (r *WrappedAttachment) Destroy() {
 	FfiDestroyerUint64{}.Destroy(r.Size)
 	FfiDestroyerBool{}.Destroy(r.IsInline)
 	FfiDestroyerOptionalBytes{}.Destroy(r.InlineData)
+	FfiDestroyerBool{}.Destroy(r.Iris)
 }
 
 type FfiConverterTypeWrappedAttachment struct{}
@@ -2744,6 +2771,7 @@ func (c FfiConverterTypeWrappedAttachment) Read(reader io.Reader) WrappedAttachm
 		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterOptionalBytesINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
 	}
 }
 
@@ -2758,6 +2786,7 @@ func (c FfiConverterTypeWrappedAttachment) Write(writer io.Writer, value Wrapped
 	FfiConverterUint64INSTANCE.Write(writer, value.Size)
 	FfiConverterBoolINSTANCE.Write(writer, value.IsInline)
 	FfiConverterOptionalBytesINSTANCE.Write(writer, value.InlineData)
+	FfiConverterBoolINSTANCE.Write(writer, value.Iris)
 }
 
 type FfiDestroyerTypeWrappedAttachment struct{}
@@ -2767,12 +2796,14 @@ func (_ FfiDestroyerTypeWrappedAttachment) Destroy(value WrappedAttachment) {
 }
 
 type WrappedCloudAttachmentInfo struct {
-	Guid       string
-	MimeType   *string
-	UtiType    *string
-	Filename   *string
-	FileSize   int64
-	RecordName string
+	Guid            string
+	MimeType        *string
+	UtiType         *string
+	Filename        *string
+	FileSize        int64
+	RecordName      string
+	HideAttachment  bool
+	HasAvid         bool
 }
 
 func (r *WrappedCloudAttachmentInfo) Destroy() {
@@ -2782,6 +2813,8 @@ func (r *WrappedCloudAttachmentInfo) Destroy() {
 	FfiDestroyerOptionalString{}.Destroy(r.Filename)
 	FfiDestroyerInt64{}.Destroy(r.FileSize)
 	FfiDestroyerString{}.Destroy(r.RecordName)
+	FfiDestroyerBool{}.Destroy(r.HideAttachment)
+	FfiDestroyerBool{}.Destroy(r.HasAvid)
 }
 
 type FfiConverterTypeWrappedCloudAttachmentInfo struct{}
@@ -2800,6 +2833,8 @@ func (c FfiConverterTypeWrappedCloudAttachmentInfo) Read(reader io.Reader) Wrapp
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterInt64INSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
 	}
 }
 
@@ -2814,6 +2849,8 @@ func (c FfiConverterTypeWrappedCloudAttachmentInfo) Write(writer io.Writer, valu
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.Filename)
 	FfiConverterInt64INSTANCE.Write(writer, value.FileSize)
 	FfiConverterStringINSTANCE.Write(writer, value.RecordName)
+	FfiConverterBoolINSTANCE.Write(writer, value.HideAttachment)
+	FfiConverterBoolINSTANCE.Write(writer, value.HasAvid)
 }
 
 type FfiDestroyerTypeWrappedCloudAttachmentInfo struct{}

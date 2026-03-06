@@ -860,6 +860,32 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         Ok(())
     }
 
+    /// Download the Live Photo video (avid asset) from a CloudKit attachment record.
+    /// This is the MOV companion stored alongside the HEIC still in the same record.
+    pub async fn download_attachment_avid<T: Write + Send + Sync>(&self, files: HashMap<String, T>) -> Result<(), PushError> {
+        let container = self.get_container().await?;
+        let zone = container.private_zone("attachmentManateeZone".to_string());
+        let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
+
+        let invoke = container.perform_operations(&CloudKitSession::new(),
+            &FetchRecordOperation::many(&ALL_ASSETS, &zone, &files.keys().cloned().collect::<Vec<_>>()), IsolationLevel::Operation).await?;
+        let records = FetchedRecords::new(&invoke);
+
+        let record: Vec<CloudAttachment> = files.keys().map(|f| records.get_record(f, Some(&key))).collect::<Vec<_>>();
+
+        for r in &record {
+            if let Some(pi) = r.lqa.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
+                crate::icloud::mmcs::register_ford_key(pi);
+            }
+            if let Some(pi) = r.avid.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
+                crate::icloud::mmcs::register_ford_key(pi);
+            }
+        }
+
+        container.get_assets(&records.assets, record.iter().map(|i| &i.avid).zip(files.into_values()).collect::<Vec<_>>()).await?;
+        Ok(())
+    }
+
     pub async fn download_group_photo<T: Write + Send + Sync>(&self, files: HashMap<String, T>) -> Result<(), PushError> {
         let container = self.get_container().await?;
         let zone = container.private_zone("chatManateeZone".to_string());

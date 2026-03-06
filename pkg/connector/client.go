@@ -643,6 +643,14 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	log.Info().Str("selected_handle", c.handle).Strs("handles", handles).Msg("Connected to iMessage")
 
+	if c.Main.Config.VideoTranscoding {
+		if ffmpeg.Supported() {
+			log.Info().Msg("Video transcoding enabled (ffmpeg found)")
+		} else {
+			log.Warn().Msg("Video transcoding enabled in config but ffmpeg not found — install ffmpeg to enable video conversion")
+		}
+	}
+
 	// Persist state after connect (APS tokens, IDS keys, device ID)
 	c.persistState(log)
 
@@ -1095,10 +1103,24 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		})
 	}
 
+	// Live Photo handling: when a message has both an iris (Live Photo) video
+	// and a still image, skip the still so only the motion video is bridged.
+	hasIrisVideo := false
+	for _, att := range msg.Attachments {
+		if att.Iris && strings.HasPrefix(att.MimeType, "video/") {
+			hasIrisVideo = true
+			break
+		}
+	}
+
 	attIndex := 0
 	for _, att := range msg.Attachments {
 		// Skip rich link sideband attachments (handled in convertMessage)
 		if att.MimeType == "x-richlink/meta" || att.MimeType == "x-richlink/image" {
+			continue
+		}
+		// Skip the HEIC still when we have the Live Photo video
+		if hasIrisVideo && !att.Iris && strings.HasPrefix(att.MimeType, "image/") {
 			continue
 		}
 		attID := msg.Uuid
@@ -1124,7 +1146,9 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			},
 			Data:               attMsg,
 			ID:                 makeMessageID(attID),
-			ConvertMessageFunc: convertAttachment,
+			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
+				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding)
+			},
 		})
 	}
 }
@@ -3206,6 +3230,37 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 			downloadable = append(downloadable, indexedAtt{index: i, att: att})
 		}
 	}
+
+	// Live Photo handling: when a message has a companion MOV (HideAttachment
+	// from filename matching) or an avid-backed HEIC (HasAvid), filter out
+	// redundant stills/companions so only one video per Live Photo is bridged.
+	hasHiddenVideo := false
+	hasAvid := false
+	for _, da := range downloadable {
+		if da.att.HideAttachment && strings.HasPrefix(da.att.MimeType, "video/") {
+			hasHiddenVideo = true
+		}
+		if da.att.HasAvid {
+			hasAvid = true
+		}
+	}
+	if hasHiddenVideo || hasAvid {
+		var filtered []indexedAtt
+		for _, da := range downloadable {
+			// When we have avid, drop filename-matched companion MOVs
+			// (they're redundant — avid on the HEIC record IS the video).
+			if hasAvid && da.att.HideAttachment {
+				continue
+			}
+			// When we have a hidden MOV companion (but no avid), drop
+			// the HEIC still so only the MOV is bridged.
+			if hasHiddenVideo && !hasAvid && !da.att.HideAttachment && strings.HasPrefix(da.att.MimeType, "image/") {
+				continue
+			}
+			filtered = append(filtered, da)
+		}
+		downloadable = filtered
+	}
 	if len(downloadable) == 0 {
 		return nil
 	}
@@ -3298,6 +3353,41 @@ func safeCloudDownloadAttachment(client *rustpushgo.Client, recordName string) (
 	}
 }
 
+// safeCloudDownloadAttachmentAvid wraps the avid FFI call with the same
+// panic recovery and timeout as safeCloudDownloadAttachment.
+func safeCloudDownloadAttachmentAvid(client *rustpushgo.Client, recordName string) ([]byte, error) {
+	type dlResult struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan dlResult, 1)
+	go func() {
+		var res dlResult
+		defer func() {
+			if r := recover(); r != nil {
+				stack := string(debug.Stack())
+				log.Error().Str("ffi_method", "CloudDownloadAttachmentAvid").
+					Str("record_name", recordName).
+					Str("stack", stack).
+					Msgf("FFI panic recovered: %v", r)
+				res = dlResult{err: fmt.Errorf("FFI panic in CloudDownloadAttachmentAvid: %v", r)}
+			}
+			ch <- res
+		}()
+		d, e := client.CloudDownloadAttachmentAvid(recordName)
+		res = dlResult{data: d, err: e}
+	}()
+	select {
+	case res := <-ch:
+		return res.data, res.err
+	case <-time.After(90 * time.Second):
+		log.Error().Str("ffi_method", "CloudDownloadAttachmentAvid").
+			Str("record_name", recordName).
+			Msg("CloudDownloadAttachmentAvid timed out after 90s")
+		return nil, fmt.Errorf("CloudDownloadAttachmentAvid timed out after 90s")
+	}
+}
+
 // downloadAndUploadAttachment handles a single attachment: download from CloudKit,
 // upload to Matrix, return as a backfill message.
 func (c *IMClient) downloadAndUploadAttachment(
@@ -3342,7 +3432,24 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
-	data, err := safeCloudDownloadAttachment(c.client, att.RecordName)
+	// Live Photo: if the attachment has an avid (video) asset, download that
+	// instead of the lqa (HEIC still). This gives recipients the motion video
+	// as intended on iOS. Falls back to lqa if avid download fails.
+	var data []byte
+	var err error
+	usedAvid := false
+	if att.HasAvid {
+		data, err = safeCloudDownloadAttachmentAvid(c.client, att.RecordName)
+		if err != nil || len(data) == 0 {
+			log.Warn().Err(err).Str("guid", row.GUID).Str("record_name", att.RecordName).
+				Msg("Live Photo avid download failed, falling back to lqa")
+			data, err = safeCloudDownloadAttachment(c.client, att.RecordName)
+		} else {
+			usedAvid = true
+		}
+	} else {
+		data, err = safeCloudDownloadAttachment(c.client, att.RecordName)
+	}
 	if err != nil {
 		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
 		log.Warn().Err(err).
@@ -3362,13 +3469,30 @@ func (c *IMClient) downloadAndUploadAttachment(
 	}
 
 	mimeType := att.MimeType
+	fileName := att.Filename
+	if usedAvid {
+		// Downloaded the Live Photo video — override metadata from the HEIC still.
+		mimeType = "video/quicktime"
+		if fileName != "" {
+			base := filenameBase(fileName)
+			if base != "" {
+				fileName = base + ".MOV"
+			} else {
+				fileName = "livephoto.MOV"
+			}
+		} else {
+			fileName = "livephoto.MOV"
+		}
+		log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
+			Int("bytes", len(data)).
+			Msg("Live Photo: downloaded avid video instead of HEIC still")
+	}
 	if mimeType == "" {
 		mimeType = utiToMIME(att.UTIType)
 	}
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
-	fileName := att.Filename
 	if fileName == "" {
 		fileName = "attachment"
 	}
@@ -3380,7 +3504,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 	}
 
 	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
-	if ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+	if c.Main.Config.VideoTranscoding && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		origMime := mimeType
 		origSize := len(data)
 		method := "remux"
@@ -5107,7 +5231,7 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 	return cm, nil
 }
 
-func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
+func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding bool) (*bridgev2.ConvertedMessage, error) {
 	att := attMsg.Attachment
 	mimeType := att.MimeType
 	fileName := att.Filename
@@ -5124,7 +5248,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 	}
 
 	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
-	if inlineData != nil && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+	if inlineData != nil && videoTranscoding && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		log := zerolog.Ctx(ctx)
 		origMime := mimeType
 		origSize := len(inlineData)
@@ -5848,10 +5972,29 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 			MemberMap:   memberMap,
 		}
 
-		// For self-chats, set an explicit name so the room isn't blank.
+		// For self-chats, set an explicit name and avatar from contacts since
+		// the framework can't derive them from the ghost when the "other user"
+		// is the logged-in user. Setting Name causes NameIsCustom=true in the
+		// framework, which blocks UpdateInfoFromGhost (it returns early when
+		// NameIsCustom is set), so we must also set the avatar explicitly here.
 		if isSelfChat {
 			selfName := c.resolveContactDisplayname(portalID)
 			chatInfo.Name = &selfName
+
+			// Pull contact photo for self-chat room avatar.
+			localID := stripIdentifierPrefix(portalID)
+			if c.contacts != nil {
+				if contact, _ := c.contacts.GetContactInfo(localID); contact != nil && len(contact.Avatar) > 0 {
+					avatarHash := sha256.Sum256(contact.Avatar)
+					avatarData := contact.Avatar
+					chatInfo.Avatar = &bridgev2.Avatar{
+						ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", portalID, hex.EncodeToString(avatarHash[:8]))),
+						Get: func(ctx context.Context) ([]byte, error) {
+							return avatarData, nil
+						},
+					}
+				}
+			}
 		}
 
 		chatInfo.Members = members

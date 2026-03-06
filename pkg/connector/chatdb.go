@@ -11,6 +11,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -205,11 +206,16 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			}
 		}
 
+		// Live Photo handling: macOS stores the MOV companion as a sibling
+		// file next to the HEIC on disk, but does NOT list it in the
+		// attachment table. For each HEIC, check if a .MOV exists in the
+		// same directory. If so, bridge the MOV instead of the HEIC.
 		for i, att := range msg.Attachments {
 			if att == nil {
 				continue
 			}
-			attCm, err := convertChatDBAttachment(ctx, params.Portal, intent, msg, att)
+			att = chatDBResolveLivePhoto(att, log)
+			attCm, err := convertChatDBAttachment(ctx, params.Portal, intent, msg, att, c.Main.Config.VideoTranscoding)
 			if err != nil {
 				log.Warn().Err(err).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert attachment, skipping")
 				continue
@@ -326,7 +332,7 @@ func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent b
 	}, nil
 }
 
-func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, att *imessage.Attachment) (*bridgev2.ConvertedMessage, error) {
+func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, att *imessage.Attachment, videoTranscoding bool) (*bridgev2.ConvertedMessage, error) {
 	mimeType := att.GetMimeType()
 	fileName := att.GetFileName()
 
@@ -343,7 +349,7 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 
 	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
 	log := zerolog.Ctx(ctx)
-	if ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+	if videoTranscoding && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		origMime := mimeType
 		origSize := len(data)
 		method := "remux"
@@ -406,4 +412,47 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 			Content: content,
 		}},
 	}, nil
+}
+
+// chatDBResolveLivePhoto checks if a HEIC/JPG attachment has a companion .MOV
+// file on disk (Apple stores Live Photo videos as sibling files but doesn't
+// list them in the attachment table). If found, returns a new Attachment
+// pointing to the MOV instead.
+func chatDBResolveLivePhoto(att *imessage.Attachment, log *zerolog.Logger) *imessage.Attachment {
+	path := att.PathOnDisk
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return att
+		}
+		path = filepath.Join(home, path[2:])
+	}
+
+	lower := strings.ToLower(filepath.Base(path))
+	if !strings.HasSuffix(lower, ".heic") && !strings.HasSuffix(lower, ".jpg") && !strings.HasSuffix(lower, ".jpeg") {
+		return att
+	}
+
+	// Check for sibling .MOV in the same directory
+	dir := filepath.Dir(path)
+	base := filenameBase(filepath.Base(path))
+	movPath := filepath.Join(dir, base+".MOV")
+
+	if _, err := os.Stat(movPath); err != nil {
+		// Try lowercase extension
+		movPath = filepath.Join(dir, base+".mov")
+		if _, err := os.Stat(movPath); err != nil {
+			return att // No companion MOV found — keep the HEIC
+		}
+	}
+
+	log.Info().Str("heic", filepath.Base(path)).Str("mov", filepath.Base(movPath)).
+		Msg("Live Photo: swapping HEIC for MOV companion")
+
+	return &imessage.Attachment{
+		GUID:       att.GUID,
+		PathOnDisk: movPath,
+		FileName:   base + ".MOV",
+		MimeType:   "video/quicktime",
+	}
 }
