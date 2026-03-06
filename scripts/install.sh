@@ -129,7 +129,7 @@ if [ -t 0 ]; then
         echo ""
         echo "Message History Backfill:"
         echo "  1) iCloud (CloudKit) — sync from iCloud, requires device PIN"
-        echo "  2) Local chat.db — read macOS Messages database, requires Full Disk Access"
+        echo "  2) Local chat.db — for legacy systems, read macOS Messages database, requires Full Disk Access"
         echo "  3) Disabled — real-time messages only"
         echo ""
         read -p "Choose [1/2/3]: " BACKFILL_CHOICE
@@ -492,7 +492,12 @@ fi
 SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
 TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
-if [ "$NEEDS_LOGIN" = "false" ]; then
+# Trust-circle only applies to CloudKit backfill — chatdb never creates
+# trustedpeers.plist.  Match Go's UseCloudKitBackfill(): cloudkit_backfill
+# must be true AND backfill_source must not be "chatdb".
+CK_ENABLED=$(awk '/cloudkit_backfill:/{print $2; exit}' "$CONFIG" 2>/dev/null)
+BF_SOURCE=$(awk '/backfill_source:/{print $2; exit}' "$CONFIG" 2>/dev/null)
+if [ "$NEEDS_LOGIN" = "false" ] && [ "$CK_ENABLED" = "true" ] && [ "$BF_SOURCE" != "chatdb" ]; then
     HAS_CLIQUE=false
     if [ -f "$TRUSTEDPEERS_FILE" ]; then
         if grep -q "<key>userIdentity</key>\|<key>user_identity</key>" "$TRUSTEDPEERS_FILE" 2>/dev/null; then
@@ -597,6 +602,54 @@ if [ -n "${CURRENT_HANDLE:-}" ]; then
     fi
     echo "✓ Preferred handle: $CURRENT_HANDLE"
     echo "$CURRENT_HANDLE" > "$HANDLE_BACKUP"
+fi
+
+# ── Ensure video_transcoding key exists in config ──────────────
+if ! grep -q 'video_transcoding:' "$CONFIG" 2>/dev/null; then
+    sed -i '' '/cloudkit_backfill:/i\
+\    video_transcoding: false' "$CONFIG"
+fi
+
+# ── Video transcoding (ffmpeg) ─────────────────────────────────
+CURRENT_VIDEO_TRANSCODING=$(grep 'video_transcoding:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*video_transcoding: *//' || true)
+if [ -t 0 ]; then
+    echo ""
+    echo "Video Transcoding:"
+    echo "  When enabled, non-MP4 videos (e.g. QuickTime .mov) are automatically"
+    echo "  converted to MP4 for broad Matrix client compatibility."
+    echo "  Requires ffmpeg."
+    echo ""
+    if [ "$CURRENT_VIDEO_TRANSCODING" = "true" ]; then
+        read -p "Enable video transcoding/remuxing? [Y/n]: " ENABLE_VT
+        case "$ENABLE_VT" in
+            [nN]*)
+                sed -i '' "s/video_transcoding: .*/video_transcoding: false/" "$CONFIG"
+                echo "✓ Video transcoding disabled"
+                ;;
+            *)
+                if ! command -v ffmpeg >/dev/null 2>&1; then
+                    echo "  ffmpeg not found — installing via Homebrew..."
+                    brew install ffmpeg
+                fi
+                echo "✓ Video transcoding enabled"
+                ;;
+        esac
+    else
+        read -p "Enable video transcoding/remuxing? [y/N]: " ENABLE_VT
+        case "$ENABLE_VT" in
+            [yY]*)
+                sed -i '' "s/video_transcoding: .*/video_transcoding: true/" "$CONFIG"
+                if ! command -v ffmpeg >/dev/null 2>&1; then
+                    echo "  ffmpeg not found — installing via Homebrew..."
+                    brew install ffmpeg
+                fi
+                echo "✓ Video transcoding enabled"
+                ;;
+            *)
+                echo "✓ Video transcoding disabled"
+                ;;
+        esac
+    fi
 fi
 
 # ── Install LaunchAgent ───────────────────────────────────────

@@ -35,6 +35,11 @@ type IMConfig struct {
 	// chat.db (requires Full Disk Access).
 	BackfillSource string `yaml:"backfill_source"`
 
+	// VideoTranscoding enables automatic remuxing/transcoding of non-MP4
+	// videos (e.g. QuickTime .mov) to MP4 for broad Matrix client
+	// compatibility.  Requires ffmpeg to be installed.  Default is false.
+	VideoTranscoding bool `yaml:"video_transcoding"`
+
 	// PreferredHandle overrides the outgoing iMessage identity.
 	// Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
 	// If empty, the handle chosen during login is used.
@@ -129,6 +134,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "displayname_template")
 	helper.Copy(up.Bool, "cloudkit_backfill")
 	helper.Copy(up.Str, "backfill_source")
+	helper.Copy(up.Bool, "video_transcoding")
 	helper.Copy(up.Str, "preferred_handle")
 	helper.Copy(up.Str, "carddav", "email")
 	helper.Copy(up.Str, "carddav", "url")
