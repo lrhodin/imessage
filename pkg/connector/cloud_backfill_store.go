@@ -1761,17 +1761,16 @@ func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid 
 //
 // Must be called BEFORE markForwardBackfillDone (inserts synthetic rows).
 func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portalID string) (bool, error) {
-	var total, filtered int
+	var count int
 	err := s.db.QueryRow(ctx, `
-		SELECT COUNT(*),
-		       SUM(CASE WHEN COALESCE(is_filtered, 0) != 0 THEN 1 ELSE 0 END)
-		FROM cloud_chat
+		SELECT COUNT(*) FROM cloud_chat
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
-	`, s.loginID, portalID).Scan(&total, &filtered)
+		  AND COALESCE(is_filtered, 0) = 0
+	`, s.loginID, portalID).Scan(&count)
 	if err != nil {
 		return false, err
 	}
-	return total > 0 && filtered == 0, nil
+	return count > 0, nil
 }
 
 // pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose
