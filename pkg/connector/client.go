@@ -2865,6 +2865,11 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			// Beeper clients display as "Read at [now]". Instead, rely on
 			// the synthetic receipts below for correct timestamps.
 			CompleteCallback: func() {
+				// Compute read state BEFORE markForwardBackfillDone, which may
+				// insert a synthetic cloud_chat row with is_filtered=0 default
+				// that would defeat the "no chat row → unread" safeguard.
+				readByMe, readErr := cloudStoreDone.getConversationReadByMe(context.Background(), portalID)
+
 				cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
 
 				// NOTE: Receipt 1 (ghost "they read my message") is intentionally
@@ -2874,14 +2879,14 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				// Real-time read receipts via APNs still work after backfill.
 
 				// --- Receipt 2: Double puppet receipt ("I read their message") ---
-				// Works for both DMs and group chats. Marks all non-filtered
-				// (non-junk/spam) CloudKit conversations as read, since they
-				// exist on the user's Apple devices and the user receives push
-				// notifications for them. Filtered chats are left unread.
+				// Marks all non-filtered CloudKit conversations as read, since
+				// they exist on the user's Apple devices and the user receives
+				// push notifications for them. Filtered chats and portals
+				// without cloud_chat metadata are left unread.
 				// Targets the latest backfilled message to mark the entire
 				// conversation as read, overwriting forceMarkRead's server-time
 				// receipt via SetBeeperInboxState with correct BeeperReadExtra["ts"].
-				if readByMe, err := cloudStoreDone.getConversationReadByMe(context.Background(), portalID); err == nil && readByMe {
+				if readErr == nil && readByMe {
 					c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
 						EventMeta: simplevent.EventMeta{
 							Type:      bridgev2.RemoteEventReadReceipt,
@@ -2901,8 +2906,8 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						Str("last_msg_id", string(lastMsgID)).
 						Str("last_msg_ts", lastMsgTS.UTC().Format(time.RFC3339)).
 						Msg("Queued double puppet read receipt (I read their message)")
-				} else if err != nil {
-					log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to check if conversation is read by me")
+				} else if readErr != nil {
+					log.Warn().Err(readErr).Str("portal_id", portalID).Msg("Failed to check if conversation is read by me")
 				}
 
 				c.onForwardBackfillDone()

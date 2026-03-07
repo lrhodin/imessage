@@ -1761,22 +1761,40 @@ func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid 
 // left unread, as those are spam the user likely hasn't seen.
 // Returns false when no cloud_chat row exists for the portal (DM portals can
 // legitimately have messages without a cloud_chat row).
+//
+// Must be called BEFORE markForwardBackfillDone, which may insert a synthetic
+// cloud_chat row with is_filtered=0 default that would defeat this check.
 func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portalID string) (bool, error) {
-	var isFiltered int
+	// Require at least one non-deleted cloud_chat row for this portal.
+	// DM portals can legitimately have messages without cloud_chat rows;
+	// those should not be marked as read.
+	var hasChat bool
 	err := s.db.QueryRow(ctx, `
-		SELECT is_filtered
-		FROM cloud_chat
-		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
-		ORDER BY is_filtered ASC
-		LIMIT 1
-	`, s.loginID, portalID).Scan(&isFiltered)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
+		SELECT EXISTS(
+			SELECT 1 FROM cloud_chat
+			WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
+		)
+	`, s.loginID, portalID).Scan(&hasChat)
 	if err != nil {
 		return false, err
 	}
-	return isFiltered == 0, nil
+	if !hasChat {
+		return false, nil
+	}
+	// Treat as unread if ANY cloud_chat row for this portal is filtered,
+	// matching the semantics in listPortalIDsWithNewestTimestamp.
+	var hasFiltered bool
+	err = s.db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM cloud_chat
+			WHERE login_id=$1 AND portal_id=$2
+			  AND COALESCE(is_filtered, 0) != 0
+		)
+	`, s.loginID, portalID).Scan(&hasFiltered)
+	if err != nil {
+		return false, err
+	}
+	return !hasFiltered, nil
 }
 
 // pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose
