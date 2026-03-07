@@ -865,10 +865,10 @@ if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ "$_ck_source
     echo "┌─────────────────────────────────────────────────────────────┐"
     echo "│  Last step: sync iCloud Messages before starting            │"
     echo "│                                                             │"
-    echo "│  On your iPhone or iPad:                                    │"
-    echo "│    Settings → [Your Name] → iCloud → Messages → Sync Now   │"
+    echo "│  On your iPhone, iPad, Mac, or OpenBubbles:                 │"
+    echo "│    Settings → [Your Name] → iCloud → Messages → Sync Now    │"
     echo "│                                                             │"
-    echo "│  Wait for sync to complete, then press Y to start.         │"
+    echo "│  Wait for sync to complete, then press Y to start.          │"
     echo "└─────────────────────────────────────────────────────────────┘"
     echo ""
     read -p "Have you synced iCloud Messages and are ready to start? [y/N]: " _sync_ready
