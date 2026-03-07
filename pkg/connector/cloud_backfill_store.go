@@ -1754,30 +1754,25 @@ func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid 
 	return exists, nil
 }
 
-// getConversationReadByMe returns true if the portal has no unread incoming
-// messages — i.e., the user has read the entire conversation on the iMessage
-// side. This is approximated by checking if any incoming messages exist that
-// are newer than the latest outgoing message (if we sent a reply, we must have
-// read everything before it). Returns false if there are no incoming messages.
+// getConversationReadByMe returns true if the conversation should be marked
+// as read during backfill. All non-filtered CloudKit conversations are treated
+// as read because they exist on the user's Apple devices and the user receives
+// push notifications for them. Only filtered (junk/unknown sender) chats are
+// left unread, as those are spam the user likely hasn't seen.
 func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portalID string) (bool, error) {
-	// Strategy: if the newest message in the portal is from_me, the user has
-	// seen the conversation. If the newest is NOT from_me, they might not have.
-	// This is a heuristic — CloudKit doesn't store "I read their message".
-	var isFromMe bool
+	var isFiltered int
 	err := s.db.QueryRow(ctx, `
-		SELECT is_from_me
-		FROM cloud_message
+		SELECT COALESCE(MAX(is_filtered), 0)
+		FROM cloud_chat
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
-		ORDER BY timestamp_ms DESC, guid DESC
-		LIMIT 1
-	`, s.loginID, portalID).Scan(&isFromMe)
+	`, s.loginID, portalID).Scan(&isFiltered)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	return isFromMe, nil
+	return isFiltered == 0, nil
 }
 
 // pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose

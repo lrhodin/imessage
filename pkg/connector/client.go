@@ -2874,10 +2874,10 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				// Real-time read receipts via APNs still work after backfill.
 
 				// --- Receipt 2: Double puppet receipt ("I read their message") ---
-				// Works for both DMs and group chats. Uses getConversationReadByMe
-				// heuristic (last message is from_me → user has read everything).
-				// Independent of date_read_ms — covers conversations where the
-				// recipient hasn't sent read receipts (SMS, disabled receipts, etc.).
+				// Works for both DMs and group chats. Marks all non-filtered
+				// (non-junk/spam) CloudKit conversations as read, since they
+				// exist on the user's Apple devices and the user receives push
+				// notifications for them. Filtered chats are left unread.
 				// Targets the latest backfilled message to mark the entire
 				// conversation as read, overwriting forceMarkRead's server-time
 				// receipt via SetBeeperInboxState with correct BeeperReadExtra["ts"].
