@@ -21,16 +21,16 @@ echo "  iMessage Bridge Setup (Beeper · Linux)"
 echo "═══════════════════════════════════════════════"
 echo ""
 
-# ── Mask and stop bridge for the duration of setup ───────────
-# Mask FIRST to prevent Restart=always from restarting the service between
-# stop and mask. Masking doesn't kill a running service — it just makes the
-# unit unstartable. Then stop kills the process and it cannot restart.
-# We unmask right before the final start at the end of this script.
-systemctl --user mask mautrix-imessage 2>/dev/null || sudo systemctl mask mautrix-imessage 2>/dev/null || true
+# ── Stop bridge for the duration of setup ─────────────────────
+# systemctl stop prevents Restart=always from kicking in (systemd only
+# auto-restarts after process exits, not after admin stop). No need to
+# mask — masking fails when the unit file already exists on disk.
 if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
     systemctl --user stop mautrix-imessage
+    echo "✓ Stopped running bridge"
 elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
     sudo systemctl stop mautrix-imessage
+    echo "✓ Stopped running bridge"
 fi
 
 # ── Permission repair helper ──────────────────────────────────
@@ -203,11 +203,8 @@ else
     echo "✓ Config saved to $CONFIG"
 fi
 
-# ── Tell Beeper the bridge is stopped during setup ────────────
-# bbctl config posts StateStarting, which makes Beeper show the bridge as
-# "Running" even though no binary is connected. Post StateBridgeUnreachable
-# so it shows as stopped while we ask setup questions and run login.
-"$BBCTL" stop "$BRIDGE_NAME" "$CONFIG" || echo "⚠  Failed to mark bridge as stopped (non-fatal)"
+# No bridge-state override needed here — the bridge will post its own
+# state when it actually starts at the end of setup.
 
 # ── Belt-and-suspenders: fix broken permissions ───────────────
 if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
@@ -566,6 +563,16 @@ if [ "$IS_FRESH_DB" = "true" ]; then
     echo "Initializing bridge database..."
     (cd "$DATA_DIR" && "$BINARY" init-db -c "$CONFIG" >/dev/null 2>&1) || true
     echo "✓ Bridge database initialized — answering setup questions"
+fi
+
+# ── Ensure bridge is stopped during setup ─────────────────────
+# bbctl config posts StateStarting which makes Beeper show "Running".
+# Stopping the systemd service disconnects the websocket, which makes
+# Beeper detect it as unreachable and overrides the stale state.
+if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
+    systemctl --user stop mautrix-imessage
+elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
+    sudo systemctl stop mautrix-imessage
 fi
 
 # ── Check for existing login / prompt if needed ──────────────
@@ -1082,12 +1089,6 @@ EOF
     systemctl daemon-reload
     systemctl enable mautrix-imessage
 }
-
-# ── Unmask bridge before starting ────────────────────────────
-# We masked it at the top of this script to prevent Restart=always from
-# firing during setup. Now that setup is complete, unmask so the service
-# can be started (and will auto-restart normally on future crashes).
-systemctl --user unmask mautrix-imessage 2>/dev/null || sudo systemctl unmask mautrix-imessage 2>/dev/null || true
 
 if [ "$SYSTEMD_MODE" = "user" ]; then
     if [ -f "$USER_SERVICE_FILE" ]; then

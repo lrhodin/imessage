@@ -212,11 +212,8 @@ else
     echo "✓ Config saved to $CONFIG"
 fi
 
-# ── Tell Beeper the bridge is stopped during setup ────────────
-# bbctl config posts StateStarting, which makes Beeper show the bridge as
-# "Running" even though no binary is connected. Post StateBridgeUnreachable
-# so it shows as stopped while we ask setup questions and run login.
-"$BBCTL" stop "$BRIDGE_NAME" "$CONFIG" || echo "⚠  Failed to mark bridge as stopped (non-fatal)"
+# No bridge-state override needed here — the bridge will post its own
+# state when it actually starts at the end of setup.
 
 # ── Belt-and-suspenders: fix broken permissions ───────────────
 if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
@@ -629,6 +626,13 @@ if [ "$IS_FRESH_DB" = "true" ]; then
     (cd "$DATA_DIR" && "$BINARY" init-db -c "$CONFIG" >/dev/null 2>&1) || true
     echo "✓ Bridge database initialized — answering setup questions"
 fi
+
+# ── Ensure bridge is stopped during setup ─────────────────────
+# bbctl config posts StateStarting which makes Beeper show "Running".
+# Stopping the LaunchAgent disconnects the websocket, which makes
+# Beeper detect it as unreachable and overrides the stale state.
+launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
+
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
     # DB missing — check if session.json can auto-restore (has hardware_key for Linux, or macOS)
     if [ -f "$SESSION_FILE" ] && { grep -q '"hardware_key"' "$SESSION_FILE" 2>/dev/null || [ "$(uname -s)" = "Darwin" ]; }; then
