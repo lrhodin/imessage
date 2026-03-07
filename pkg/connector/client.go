@@ -3404,8 +3404,11 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// attachment in the cloud sync goroutine. Return immediately without touching
 	// CloudKit, keeping the portal event loop unblocked.
 	// NOTE: Skip cache for non-MP4 videos that need transcoding, and for
-	// HasAvid records (old cache entries only have one part, not both still+video).
-	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok && !att.HasAvid {
+	// Live Photo HasAvid records (old cache entries only have one part, not
+	// both still+video). Regular videos with HasAvid use the cache normally
+	// since we only bridge the lqa (the video itself), not the avid duplicate.
+	isLivePhoto := att.HasAvid && !strings.HasPrefix(att.MimeType, "video/")
+	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok && !isLivePhoto {
 		cachedContent := cached.(*event.MessageEventContent)
 		if cachedContent.Info != nil && cachedContent.Info.MimeType == "video/quicktime" {
 			// Stale cache entry — video needs transcoding. Fall through to re-download.
@@ -3610,7 +3613,10 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	// Live Photo: if this attachment has an avid (video) asset, also download
 	// and bridge the video so recipients see both the still and the motion.
-	if att.HasAvid {
+	// Skip when the lqa itself is already a video — that means this is a regular
+	// video attachment (not a Live Photo), and CloudKit stores the same video in
+	// both lqa and avid fields. Bridging both would produce duplicates.
+	if att.HasAvid && !strings.HasPrefix(mimeType, "video/") {
 		avidData, avidErr := safeCloudDownloadAttachmentAvid(c.client, att.RecordName)
 		if avidErr != nil || len(avidData) == 0 {
 			log.Warn().Err(avidErr).Str("guid", row.GUID).Str("record_name", att.RecordName).
