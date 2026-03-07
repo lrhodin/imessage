@@ -614,15 +614,8 @@ SESSION_FILE="$SESSION_DIR/session.json"
 if [ "$IS_FRESH_DB" = "true" ] && [ ! -f "$SESSION_FILE" ]; then
     echo ""
     echo "Initializing bridge database..."
-    launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
-    (cd "$DATA_DIR" && exec "$BINARY" -n -c "$CONFIG" >/dev/null 2>&1) &
-    _BRIDGE_INIT_PID=$!
-    sleep 5
-    kill "$_BRIDGE_INIT_PID" 2>/dev/null || true
-    wait "$_BRIDGE_INIT_PID" 2>/dev/null || true
-    # Belt-and-suspenders: ensure no stray bridge process remains
-    pkill -f "$(basename "$BINARY")" 2>/dev/null || true
-    echo "✓ Bridge initialized (stopped) — answering setup questions"
+    (cd "$DATA_DIR" && "$BINARY" init-db -c "$CONFIG" >/dev/null 2>&1) || true
+    echo "✓ Bridge database initialized — answering setup questions"
 fi
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
     # DB missing — check if session.json can auto-restore (has hardware_key for Linux, or macOS)
