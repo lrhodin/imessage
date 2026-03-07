@@ -79,6 +79,9 @@ func cmdStop(ctx *cli.Context) error {
 	}
 
 	envCfg := getEnvConfig(ctx)
+	fmt.Fprintf(os.Stderr, "[stop] bridge=%s user=%s config=%s token=%s...\n",
+		bridge, envCfg.Username, configPath, asToken[:min(10, len(asToken))])
+
 	err = beeperapi.PostBridgeState(baseDomain, envCfg.Username, bridge, asToken, beeperapi.ReqPostBridgeState{
 		StateEvent:   status.StateBridgeUnreachable,
 		Reason:       "SELF_HOST_STOPPED",
@@ -90,4 +93,11 @@ func cmdStop(ctx *cli.Context) error {
 	}
 	fmt.Printf("Bridge '%s' stopped\n", bridge)
 	return nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
