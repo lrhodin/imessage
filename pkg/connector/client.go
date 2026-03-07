@@ -953,6 +953,35 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			log.Debug().Str("uuid", msg.Uuid).Bool("is_stored", msg.IsStoredMessage).Msg("Skipping message already in bridge DB")
 			return
 		}
+		// Also check for UUID_* suffix variants (e.g. UUID_att0, UUID_att1, UUID_avid).
+		// Two past regressions left image messages in the bridge DB with suffixed
+		// IDs instead of the base UUID:
+		//
+		//   1. Pre-0755816: the attachment-index condition used the raw msg.Text
+		//      value (non-empty for "\ufffc" placeholder) instead of the stripped
+		//      form, so ALL image-only APNs messages were stored as UUID_att0.
+		//
+		//   2. baf5354 era: injectLivePhotoCompanion appended the MOV companion
+		//      at original index 1 and the HEIC-drop filter kept it there, so
+		//      Live Photo companions were stored as UUID_att1.
+		//
+		// An exact-match lookup on UUID misses both. A LIKE prefix query catches
+		// all suffix forms with a single round-trip.
+		rows, likeErr := c.Main.Bridge.DB.Database.Query(
+			context.Background(),
+			`SELECT 1 FROM message
+			 WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='') AND id LIKE $3
+			 LIMIT 1`,
+			c.Main.Bridge.ID, c.UserLogin.ID, string(makeMessageID(msg.Uuid))+"_%",
+		)
+		if likeErr == nil {
+			found := rows.Next()
+			_ = rows.Close()
+			if found {
+				log.Debug().Str("uuid", msg.Uuid).Bool("is_stored", msg.IsStoredMessage).Msg("Skipping message: UUID suffix variant found in bridge DB")
+				return
+			}
+		}
 	}
 
 	sender := c.makeEventSender(msg.Sender)
