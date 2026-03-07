@@ -216,7 +216,7 @@ fi
 # bbctl config posts StateStarting, which makes Beeper show the bridge as
 # "Running" even though no binary is connected. Post StateBridgeUnreachable
 # so it shows as stopped while we ask setup questions and run login.
-"$BBCTL" stop "$BRIDGE_NAME" || echo "⚠  Failed to mark bridge as stopped (non-fatal)"
+"$BBCTL" stop "$BRIDGE_NAME" "$CONFIG" || echo "⚠  Failed to mark bridge as stopped (non-fatal)"
 
 # ── Belt-and-suspenders: fix broken permissions ───────────────
 if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
@@ -833,7 +833,9 @@ if [ "$NEEDS_LOGIN" = "true" ] && [ "${FORCE_CLEAR_STATE:-false}" != "true" ] &&
     NEEDS_LOGIN=false
 fi
 
+LOGIN_RAN=false
 if [ "$NEEDS_LOGIN" = "true" ]; then
+    LOGIN_RAN=true
     echo ""
     echo "┌─────────────────────────────────────────────────┐"
     echo "│  No valid iMessage login found — starting login │"
@@ -884,7 +886,11 @@ if [ -z "$CURRENT_HANDLE" ]; then
     fi
 fi
 
-if [ -t 0 ]; then
+# Skip handle prompt if login just ran and already set a handle (the login
+# flow on macOS asks for handle during Apple ID auth — no need to ask twice).
+# On Linux (external-key flow), login doesn't ask, so CURRENT_HANDLE is empty
+# and the prompt still shows.
+if [ -t 0 ] && { [ "$LOGIN_RAN" != "true" ] || [ -z "$CURRENT_HANDLE" ]; }; then
     # Get available handles from session state (available after login)
     AVAILABLE_HANDLES=$("$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
     if [ -n "$AVAILABLE_HANDLES" ]; then

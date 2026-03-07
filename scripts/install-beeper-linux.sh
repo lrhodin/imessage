@@ -207,7 +207,7 @@ fi
 # bbctl config posts StateStarting, which makes Beeper show the bridge as
 # "Running" even though no binary is connected. Post StateBridgeUnreachable
 # so it shows as stopped while we ask setup questions and run login.
-"$BBCTL" stop "$BRIDGE_NAME" || echo "⚠  Failed to mark bridge as stopped (non-fatal)"
+"$BBCTL" stop "$BRIDGE_NAME" "$CONFIG" || echo "⚠  Failed to mark bridge as stopped (non-fatal)"
 
 # ── Belt-and-suspenders: fix broken permissions ───────────────
 if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then

@@ -17,7 +17,7 @@ import (
 var stopCommand = &cli.Command{
 	Name:      "stop",
 	Usage:     "Tell Beeper that the bridge is stopped (not running)",
-	ArgsUsage: "BRIDGE",
+	ArgsUsage: "BRIDGE [CONFIG_PATH]",
 	Before:    requiresAuth,
 	Action:    cmdStop,
 }
@@ -57,14 +57,22 @@ func readASToken(configPath string) (string, error) {
 
 func cmdStop(ctx *cli.Context) error {
 	if ctx.NArg() == 0 {
-		return fmt.Errorf("you must specify a bridge name")
+		return fmt.Errorf("usage: bbctl stop BRIDGE [CONFIG_PATH]")
 	}
 	bridge := ctx.Args().Get(0)
 
-	configPath, err := findBridgeConfig()
-	if err != nil {
-		return err
+	// Config path: second arg, or auto-discover from XDG
+	var configPath string
+	if ctx.NArg() >= 2 {
+		configPath = ctx.Args().Get(1)
+	} else {
+		var err error
+		configPath, err = findBridgeConfig()
+		if err != nil {
+			return err
+		}
 	}
+
 	asToken, err := readASToken(configPath)
 	if err != nil {
 		return fmt.Errorf("failed to read AS token from %s: %w", configPath, err)
