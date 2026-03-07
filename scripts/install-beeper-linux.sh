@@ -21,17 +21,17 @@ echo "  iMessage Bridge Setup (Beeper · Linux)"
 echo "═══════════════════════════════════════════════"
 echo ""
 
-# ── Stop and mask bridge for the duration of setup ───────────
-# Stop first, then mask so Restart=always cannot restart it while we ask
-# questions, run login, or select a handle. Without masking, systemd will
-# restart the bridge after RestartSec (5s) even after an explicit stop.
+# ── Mask and stop bridge for the duration of setup ───────────
+# Mask FIRST to prevent Restart=always from restarting the service between
+# stop and mask. Masking doesn't kill a running service — it just makes the
+# unit unstartable. Then stop kills the process and it cannot restart.
 # We unmask right before the final start at the end of this script.
+systemctl --user mask mautrix-imessage 2>/dev/null || sudo systemctl mask mautrix-imessage 2>/dev/null || true
 if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
     systemctl --user stop mautrix-imessage
 elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
     sudo systemctl stop mautrix-imessage
 fi
-systemctl --user mask mautrix-imessage 2>/dev/null || sudo systemctl mask mautrix-imessage 2>/dev/null || true
 
 # ── Permission repair helper ──────────────────────────────────
 # Detects and fixes broken permissions in config.yaml. Matches the same
