@@ -37,6 +37,7 @@ var caps = &event.RoomFeatures{
 				"image/png":  event.CapLevelFullySupported,
 				"image/gif":  event.CapLevelFullySupported,
 				"image/heic": event.CapLevelFullySupported,
+				"image/heif": event.CapLevelFullySupported,
 				"image/webp": event.CapLevelFullySupported,
 			},
 			Caption: event.CapLevelFullySupported,

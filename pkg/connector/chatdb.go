@@ -11,6 +11,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"image"
 	"os"
 	"path/filepath"
 	"sort"
@@ -214,7 +215,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			if att == nil {
 				continue
 			}
-			attCm, err := convertChatDBAttachment(ctx, params.Portal, intent, msg, att, c.Main.Config.VideoTranscoding)
+			attCm, err := convertChatDBAttachment(ctx, params.Portal, intent, msg, att, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
 			if err != nil {
 				log.Warn().Err(err).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert attachment, skipping")
 				continue
@@ -232,7 +233,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			// If there's a Live Photo MOV companion on disk, bridge it too.
 			movAtt := chatDBResolveLivePhoto(att, log)
 			if movAtt.PathOnDisk != att.PathOnDisk {
-				movCm, movErr := convertChatDBAttachment(ctx, params.Portal, intent, msg, movAtt, c.Main.Config.VideoTranscoding)
+				movCm, movErr := convertChatDBAttachment(ctx, params.Portal, intent, msg, movAtt, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
 				if movErr != nil {
 					log.Warn().Err(movErr).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert Live Photo MOV companion, skipping")
 				} else {
@@ -350,7 +351,7 @@ func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent b
 	}, nil
 }
 
-func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, att *imessage.Attachment, videoTranscoding bool) (*bridgev2.ConvertedMessage, error) {
+func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, att *imessage.Attachment, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {
 	mimeType := att.GetMimeType()
 	fileName := att.GetFileName()
 
@@ -395,12 +396,30 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 		}
 	}
 
+	// Convert HEIC/HEIF images to JPEG since most Matrix clients can't display HEIC.
+	var heicImg image.Image
+	data, mimeType, fileName, heicImg = maybeConvertHEIC(log, data, mimeType, fileName, heicQuality, heicConversion)
+
+	// Extract image dimensions and generate thumbnail
+	var imgWidth, imgHeight int
+	var thumbData []byte
+	var thumbW, thumbH int
+	if heicImg != nil {
+		b := heicImg.Bounds()
+		imgWidth, imgHeight = b.Dx(), b.Dy()
+		if imgWidth > 800 || imgHeight > 800 {
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+		}
+	}
+
 	content := &event.MessageEventContent{
 		MsgType: mimeToMsgType(mimeType),
 		Body:    fileName,
 		Info: &event.FileInfo{
 			MimeType: mimeType,
 			Size:     len(data),
+			Width:    imgWidth,
+			Height:   imgHeight,
 		},
 	}
 
@@ -421,6 +440,24 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 			content.File = encFile
 		} else {
 			content.URL = url
+		}
+
+		// Upload image thumbnail
+		if thumbData != nil {
+			thumbURL, thumbEnc, thumbErr := intent.UploadMedia(ctx, "", thumbData, "thumbnail.jpg", "image/jpeg")
+			if thumbErr == nil {
+				if thumbEnc != nil {
+					content.Info.ThumbnailFile = thumbEnc
+				} else {
+					content.Info.ThumbnailURL = thumbURL
+				}
+				content.Info.ThumbnailInfo = &event.FileInfo{
+					MimeType: "image/jpeg",
+					Size:     len(thumbData),
+					Width:    thumbW,
+					Height:   thumbH,
+				}
+			}
 		}
 	}
 

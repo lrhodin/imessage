@@ -821,6 +821,79 @@ if [ -t 0 ]; then
     fi
 fi
 
+# ── Ensure heic_conversion key exists in config ──────────────
+if ! grep -q 'heic_conversion:' "$CONFIG" 2>/dev/null; then
+    sed -i '' '/video_transcoding:/a\
+    heic_conversion: false' "$CONFIG"
+fi
+
+# ── HEIC conversion (libheif) ─────────────────────────────────
+CURRENT_HEIC_CONVERSION=$(grep 'heic_conversion:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_conversion: *//' || true)
+if [ -t 0 ]; then
+    echo ""
+    echo "HEIC Conversion:"
+    echo "  When enabled, HEIC/HEIF images are automatically converted to JPEG"
+    echo "  for broad Matrix client compatibility."
+    echo "  Requires libheif."
+    echo ""
+    if [ "$CURRENT_HEIC_CONVERSION" = "true" ]; then
+        read -p "Enable HEIC to JPEG conversion? [Y/n]: " ENABLE_HC
+        case "$ENABLE_HC" in
+            [nN]*)
+                sed -i '' "s/heic_conversion: .*/heic_conversion: false/" "$CONFIG"
+                echo "✓ HEIC conversion disabled"
+                ;;
+            *)
+                if command -v brew >/dev/null 2>&1; then
+                    brew list libheif >/dev/null 2>&1 || brew install libheif
+                fi
+                echo "✓ HEIC conversion enabled"
+                ;;
+        esac
+    else
+        read -p "Enable HEIC to JPEG conversion? [y/N]: " ENABLE_HC
+        case "$ENABLE_HC" in
+            [yY]*)
+                sed -i '' "s/heic_conversion: .*/heic_conversion: true/" "$CONFIG"
+                if command -v brew >/dev/null 2>&1; then
+                    brew list libheif >/dev/null 2>&1 || brew install libheif
+                fi
+                echo "✓ HEIC conversion enabled"
+                ;;
+            *)
+                echo "✓ HEIC conversion disabled"
+                ;;
+        esac
+    fi
+fi
+
+# ── HEIC JPEG quality (only if HEIC conversion is enabled) ───
+HEIC_ENABLED=$(grep 'heic_conversion:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_conversion: *//' || true)
+if [ "$HEIC_ENABLED" = "true" ]; then
+    if ! grep -q 'heic_jpeg_quality:' "$CONFIG" 2>/dev/null; then
+        sed -i '' '/heic_conversion:/a\
+    heic_jpeg_quality: 95' "$CONFIG"
+    fi
+else
+    sed -i '' '/heic_jpeg_quality:/d' "$CONFIG"
+fi
+if [ "$HEIC_ENABLED" = "true" ] && [ -t 0 ]; then
+    CURRENT_QUALITY=$(grep 'heic_jpeg_quality:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_jpeg_quality: *//' || echo "95")
+    [ -z "$CURRENT_QUALITY" ] && CURRENT_QUALITY=95
+    echo ""
+    read -p "JPEG quality for HEIC conversion (1–100) [$CURRENT_QUALITY]: " NEW_QUALITY
+    if [ -n "$NEW_QUALITY" ]; then
+        if [ "$NEW_QUALITY" -ge 1 ] 2>/dev/null && [ "$NEW_QUALITY" -le 100 ] 2>/dev/null; then
+            sed -i '' "s/heic_jpeg_quality: .*/heic_jpeg_quality: $NEW_QUALITY/" "$CONFIG"
+            echo "✓ JPEG quality set to $NEW_QUALITY"
+        else
+            echo "  ⚠ Invalid quality '$NEW_QUALITY' — keeping $CURRENT_QUALITY"
+        fi
+    else
+        echo "✓ JPEG quality: $CURRENT_QUALITY"
+    fi
+fi
+
 # ── Install LaunchAgent ───────────────────────────────────────
 CONFIG_ABS="$(cd "$DATA_DIR" && pwd)/config.yaml"
 DATA_ABS="$(cd "$DATA_DIR" && pwd)"

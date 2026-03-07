@@ -651,6 +651,10 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 	}
 
+	if c.Main.Config.HEICConversion {
+		log.Info().Msg("HEIC conversion enabled (libheif)")
+	}
+
 	// Persist state after connect (APS tokens, IDS keys, device ID)
 	c.persistState(log)
 
@@ -1134,7 +1138,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Data:               attMsg,
 			ID:                 makeMessageID(attID),
 			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
-				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding)
+				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
 			},
 		})
 	}
@@ -3459,11 +3463,22 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
+	// Convert HEIC/HEIF images to JPEG since most Matrix clients can't display HEIC.
+	var heicImg image.Image
+	data, mimeType, fileName, heicImg = maybeConvertHEIC(&log, data, mimeType, fileName, c.Main.Config.HEICJPEGQuality, c.Main.Config.HEICConversion)
+
 	// Convert non-JPEG images to JPEG and extract dimensions/thumbnail
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
-	if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
+	if heicImg != nil {
+		// Use the already-decoded image from HEIC conversion
+		b := heicImg.Bounds()
+		imgWidth, imgHeight = b.Dx(), b.Dy()
+		if imgWidth > 800 || imgHeight > 800 {
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+		}
+	} else if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
 		if mimeType == "image/gif" {
 			if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 				imgWidth, imgHeight = cfg.Width, cfg.Height
@@ -5243,7 +5258,7 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 	return cm, nil
 }
 
-func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding bool) (*bridgev2.ConvertedMessage, error) {
+func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {
 	att := attMsg.Attachment
 	mimeType := att.MimeType
 	fileName := att.Filename
@@ -5289,11 +5304,25 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		}
 	}
 
+	// Convert HEIC/HEIF images to JPEG since most Matrix clients can't display HEIC.
+	var heicImg image.Image
+	if inlineData != nil {
+		log := zerolog.Ctx(ctx)
+		inlineData, mimeType, fileName, heicImg = maybeConvertHEIC(log, inlineData, mimeType, fileName, heicQuality, heicConversion)
+	}
+
 	// Process images: extract dimensions, convert non-JPEG to JPEG, generate thumbnail
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
-	if inlineData != nil && (strings.HasPrefix(mimeType, "image/") || looksLikeImage(inlineData)) {
+	if heicImg != nil {
+		// Use the already-decoded image from HEIC conversion
+		b := heicImg.Bounds()
+		imgWidth, imgHeight = b.Dx(), b.Dy()
+		if imgWidth > 800 || imgHeight > 800 {
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+		}
+	} else if inlineData != nil && (strings.HasPrefix(mimeType, "image/") || looksLikeImage(inlineData)) {
 		log := zerolog.Ctx(ctx)
 		log.Debug().Str("mime_type", mimeType).Str("file_name", fileName).Int("data_len", len(inlineData)).Msg("Processing image attachment")
 		if mimeType == "image/gif" {

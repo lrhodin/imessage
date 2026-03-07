@@ -40,6 +40,15 @@ type IMConfig struct {
 	// compatibility.  Requires ffmpeg to be installed.  Default is false.
 	VideoTranscoding bool `yaml:"video_transcoding"`
 
+	// HEICConversion enables automatic conversion of HEIC/HEIF images
+	// to JPEG for broad Matrix client compatibility.
+	// Requires libheif to be installed.  Default is false.
+	HEICConversion bool `yaml:"heic_conversion"`
+
+	// HEICJPEGQuality sets the JPEG output quality (1–100) used when
+	// converting HEIC/HEIF images. Default is 95.
+	HEICJPEGQuality int `yaml:"heic_jpeg_quality"`
+
 	// PreferredHandle overrides the outgoing iMessage identity.
 	// Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
 	// If empty, the handle chosen during login is used.
@@ -135,6 +144,8 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "cloudkit_backfill")
 	helper.Copy(up.Str, "backfill_source")
 	helper.Copy(up.Bool, "video_transcoding")
+	helper.Copy(up.Bool, "heic_conversion")
+	helper.Copy(up.Int, "heic_jpeg_quality")
 	helper.Copy(up.Str, "preferred_handle")
 	helper.Copy(up.Str, "carddav", "email")
 	helper.Copy(up.Str, "carddav", "url")
