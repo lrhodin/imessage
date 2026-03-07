@@ -1781,13 +1781,15 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 	if !hasChat {
 		return false, nil
 	}
-	// Treat as unread if ANY cloud_chat row for this portal is filtered,
-	// matching the semantics in listPortalIDsWithNewestTimestamp.
+	// Treat as unread if ANY non-deleted cloud_chat row for this portal is
+	// filtered. Both queries filter on deleted=FALSE so stale soft-deleted
+	// rows (e.g., a previously-filtered chat that was re-created as
+	// unfiltered) don't poison the result.
 	var hasFiltered bool
 	err = s.db.QueryRow(ctx, `
 		SELECT EXISTS(
 			SELECT 1 FROM cloud_chat
-			WHERE login_id=$1 AND portal_id=$2
+			WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
 			  AND COALESCE(is_filtered, 0) != 0
 		)
 	`, s.loginID, portalID).Scan(&hasFiltered)
