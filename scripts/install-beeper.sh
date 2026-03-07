@@ -916,6 +916,12 @@ if [ -t 0 ]; then
         if [ -n "$NEW_HANDLE" ]; then
             CURRENT_HANDLE="$NEW_HANDLE"
         fi
+    else
+        # list-handles returned empty (e.g. session not yet populated).
+        # Fall back to manual entry so the bridge doesn't start without a handle.
+        echo ""
+        echo "Could not detect handles automatically."
+        read -p "Enter your iMessage handle (e.g. tel:+12345678900 or mailto:you@icloud.com): " CURRENT_HANDLE
     fi
 fi
 

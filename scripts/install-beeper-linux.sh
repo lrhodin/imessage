@@ -21,15 +21,17 @@ echo "  iMessage Bridge Setup (Beeper · Linux)"
 echo "═══════════════════════════════════════════════"
 echo ""
 
-# ── Stop any running bridge instance immediately ──────────────
-# Do this before any setup work so the bridge isn't running while we ask
-# questions, patch config, or run init-db. On re-setup scenarios (bbctl delete),
-# systemd may have restarted the bridge — stop it now.
+# ── Stop and mask bridge for the duration of setup ───────────
+# Stop first, then mask so Restart=always cannot restart it while we ask
+# questions, run login, or select a handle. Without masking, systemd will
+# restart the bridge after RestartSec (5s) even after an explicit stop.
+# We unmask right before the final start at the end of this script.
 if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
     systemctl --user stop mautrix-imessage
 elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
     sudo systemctl stop mautrix-imessage
 fi
+systemctl --user mask mautrix-imessage 2>/dev/null || sudo systemctl mask mautrix-imessage 2>/dev/null || true
 
 # ── Permission repair helper ──────────────────────────────────
 # Detects and fixes broken permissions in config.yaml. Matches the same
@@ -989,6 +991,12 @@ if [ -t 0 ]; then
         if [ -n "$NEW_HANDLE" ]; then
             CURRENT_HANDLE="$NEW_HANDLE"
         fi
+    else
+        # list-handles returned empty (e.g. session not yet populated).
+        # Fall back to manual entry so the bridge doesn't start without a handle.
+        echo ""
+        echo "Could not detect handles automatically."
+        read -p "Enter your iMessage handle (e.g. tel:+12345678900 or mailto:you@icloud.com): " CURRENT_HANDLE
     fi
 fi
 
@@ -1068,6 +1076,12 @@ EOF
     systemctl daemon-reload
     systemctl enable mautrix-imessage
 }
+
+# ── Unmask bridge before starting ────────────────────────────
+# We masked it at the top of this script to prevent Restart=always from
+# firing during setup. Now that setup is complete, unmask so the service
+# can be started (and will auto-restart normally on future crashes).
+systemctl --user unmask mautrix-imessage 2>/dev/null || sudo systemctl unmask mautrix-imessage 2>/dev/null || true
 
 if [ "$SYSTEMD_MODE" = "user" ]; then
     if [ -f "$USER_SERVICE_FILE" ]; then
