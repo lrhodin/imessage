@@ -1089,7 +1089,8 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Msg("Portal creation decision for message")
 	}
 
-	if msg.Text != nil && *msg.Text != "" && strings.TrimRight(*msg.Text, "\ufffc \n") != "" {
+	hasText := msg.Text != nil && *msg.Text != "" && strings.TrimRight(*msg.Text, "\ufffc \n") != ""
+	if hasText {
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*rustpushgo.WrappedMessage]{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventMessage,
@@ -1115,7 +1116,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			continue
 		}
 		attID := msg.Uuid
-		if attIndex > 0 || (msg.Text != nil && *msg.Text != "") {
+		if attIndex > 0 || hasText {
 			attID = fmt.Sprintf("%s_att%d", msg.Uuid, attIndex)
 		}
 		attMsg := &attachmentMessage{

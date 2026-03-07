@@ -604,6 +604,11 @@ if [ -n "${CURRENT_HANDLE:-}" ]; then
     echo "$CURRENT_HANDLE" > "$HANDLE_BACKUP"
 fi
 
+# ── Stop the bridge before config prompts ─────────────────────
+# If the bridge is already running (re-install), stop it now so APNs
+# messages don't flow while the user answers config questions.
+launchctl unload "$PLIST" 2>/dev/null || true
+
 # ── Ensure video_transcoding key exists in config ──────────────
 if ! grep -q 'video_transcoding:' "$CONFIG" 2>/dev/null; then
     sed -i '' '/cloudkit_backfill:/i\
