@@ -308,16 +308,6 @@ if [ -t 0 ]; then
                 sed -i '' "s/cloudkit_backfill: .*/cloudkit_backfill: true/" "$CONFIG"
                 sed -i '' "s/backfill_source: .*/backfill_source: cloudkit/" "$CONFIG"
                 echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
-                echo ""
-                echo "IMPORTANT: Before starting the bridge, sync your latest messages to iCloud"
-                echo "from an Apple device (iPhone, iPad, or Mac) to ensure all recent messages"
-                echo "are available for backfill."
-                echo ""
-                read -p "Have you synced your Apple device to iCloud? [y/N]: " ICLOUD_SYNCED
-                case "$ICLOUD_SYNCED" in
-                    [yY]*) echo "✓ Great — backfill will include your latest messages" ;;
-                    *)     echo "⚠ Please sync your Apple device to iCloud before starting the bridge" ;;
-                esac
                 ;;
         esac
     else
@@ -871,8 +861,7 @@ fi
 HEIC_ENABLED=$(grep 'heic_conversion:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_conversion: *//' || true)
 if [ "$HEIC_ENABLED" = "true" ]; then
     if ! grep -q 'heic_jpeg_quality:' "$CONFIG" 2>/dev/null; then
-        sed -i '' '/heic_conversion:/a\
-    heic_jpeg_quality: 95' "$CONFIG"
+        sed -i '' "$(printf '/heic_conversion:/a\\\n    heic_jpeg_quality: 95')" "$CONFIG"
     fi
 else
     sed -i '' '/heic_jpeg_quality:/d' "$CONFIG"
@@ -892,6 +881,34 @@ if [ "$HEIC_ENABLED" = "true" ] && [ -t 0 ]; then
     else
         echo "✓ JPEG quality: $CURRENT_QUALITY"
     fi
+fi
+
+# ── iCloud sync gate (CloudKit + fresh DB) ───────────────────
+# Last step before the bridge starts — this is when APNs first connects.
+# Requiring sync confirmation here ensures CloudKit backfill can deduplicate
+# any buffered APNs messages that arrive immediately on first connection.
+_ck_backfill=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
+_ck_source=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*backfill_source: *//' || true)
+if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ "$_ck_source" != "chatdb" ] && [ -t 0 ]; then
+    echo ""
+    echo "┌─────────────────────────────────────────────────────────────┐"
+    echo "│  Last step: sync iCloud Messages before starting            │"
+    echo "│                                                             │"
+    echo "│  On your iPhone or iPad:                                    │"
+    echo "│    Settings → [Your Name] → iCloud → Messages → Sync Now   │"
+    echo "│                                                             │"
+    echo "│  Wait for sync to complete, then press Y to start.         │"
+    echo "└─────────────────────────────────────────────────────────────┘"
+    echo ""
+    read -p "Have you synced iCloud Messages and are ready to start? [y/N]: " _sync_ready
+    case "$_sync_ready" in
+        [yY]*) echo "✓ Starting bridge" ;;
+        *)
+            echo ""
+            echo "Re-run 'make install-beeper' after syncing iCloud Messages."
+            exit 0
+            ;;
+    esac
 fi
 
 # ── Install LaunchAgent ───────────────────────────────────────

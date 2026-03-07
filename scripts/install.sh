@@ -702,8 +702,7 @@ fi
 HEIC_ENABLED=$(grep 'heic_conversion:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_conversion: *//' || true)
 if [ "$HEIC_ENABLED" = "true" ]; then
     if ! grep -q 'heic_jpeg_quality:' "$CONFIG" 2>/dev/null; then
-        sed -i '' '/heic_conversion:/a\
-    heic_jpeg_quality: 95' "$CONFIG"
+        sed -i '' "$(printf '/heic_conversion:/a\\\n    heic_jpeg_quality: 95')" "$CONFIG"
     fi
 else
     sed -i '' '/heic_jpeg_quality:/d' "$CONFIG"
