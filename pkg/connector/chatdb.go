@@ -9,9 +9,11 @@
 package connector
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"sort"
@@ -409,6 +411,27 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 		imgWidth, imgHeight = b.Dx(), b.Dy()
 		if imgWidth > 800 || imgHeight > 800 {
 			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+		}
+	} else if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
+		if mimeType == "image/gif" {
+			if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+				imgWidth, imgHeight = cfg.Width, cfg.Height
+			}
+		} else if img, fmtName, _ := decodeImageData(data); img != nil {
+			b := img.Bounds()
+			imgWidth, imgHeight = b.Dx(), b.Dy()
+			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
+			if fmtName == "tiff" {
+				var buf bytes.Buffer
+				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
+					data = buf.Bytes()
+					mimeType = "image/jpeg"
+					fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
+				}
+			}
+			if imgWidth > 800 || imgHeight > 800 {
+				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, imgWidth, imgHeight)
+			}
 		}
 	}
 

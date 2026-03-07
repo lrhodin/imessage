@@ -3483,10 +3483,11 @@ func (c *IMClient) downloadAndUploadAttachment(
 			if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 				imgWidth, imgHeight = cfg.Width, cfg.Height
 			}
-		} else if img, _, isJPEG := decodeImageData(data); img != nil {
+		} else if img, fmtName, _ := decodeImageData(data); img != nil {
 			b := img.Bounds()
 			imgWidth, imgHeight = b.Dx(), b.Dy()
-			if !isJPEG {
+			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
+			if fmtName == "tiff" {
 				var buf bytes.Buffer
 				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
 					data = buf.Bytes()
@@ -5330,20 +5331,20 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 			if err == nil {
 				imgWidth, imgHeight = cfg.Width, cfg.Height
 			}
-		} else if img, fmtName, isJPEG := decodeImageData(inlineData); img != nil {
+		} else if img, fmtName, _ := decodeImageData(inlineData); img != nil {
 			b := img.Bounds()
 			imgWidth, imgHeight = b.Dx(), b.Dy()
-			log.Debug().Str("decoded_format", fmtName).Int("width", imgWidth).Int("height", imgHeight).Bool("is_jpeg", isJPEG).Msg("Image decoded successfully")
-			// Re-encode non-JPEG images (PNG, TIFF, etc.) as JPEG for compatibility
-			if !isJPEG {
+			log.Debug().Str("decoded_format", fmtName).Int("width", imgWidth).Int("height", imgHeight).Msg("Image decoded successfully")
+			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
+			if fmtName == "tiff" {
 				var buf bytes.Buffer
 				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
 					inlineData = buf.Bytes()
 					mimeType = "image/jpeg"
 					fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
-					log.Debug().Int("jpeg_size", len(inlineData)).Msg("Re-encoded image as JPEG")
+					log.Debug().Int("jpeg_size", len(inlineData)).Msg("Re-encoded TIFF as JPEG")
 				} else {
-					log.Warn().Err(err).Msg("Failed to re-encode image as JPEG")
+					log.Warn().Err(err).Msg("Failed to re-encode TIFF as JPEG")
 				}
 			}
 			if imgWidth > 800 || imgHeight > 800 {
