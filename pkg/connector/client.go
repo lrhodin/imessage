@@ -2150,6 +2150,10 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 		if err != nil {
 			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
 		}
+		// Return nil: SMS reactions are sent as plain text, not as structured
+		// tapbacks, so there is no database.Reaction to store. The remove path
+		// (HandleMatrixReactionRemove) reads the target from the Matrix event
+		// directly and does not need a stored Reaction record.
 		return nil, nil
 	}
 
