@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"html"
 	"image"
-	"math"
 	"image/jpeg"
+	"math"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -77,7 +77,6 @@ type failedAttachmentEntry struct {
 
 const maxAttachmentRetries = 3
 
-
 // recordAttachmentFailure increments the retry count for a failed attachment.
 // Returns the updated entry so callers can log the retry count.
 func (c *IMClient) recordAttachmentFailure(recordName, errMsg string) *failedAttachmentEntry {
@@ -133,6 +132,12 @@ type IMClient struct {
 	// Unsend re-delivery suppression
 	recentUnsends     map[string]time.Time
 	recentUnsendsLock sync.Mutex
+
+	// SMS reaction echo suppression: tracks UUIDs of SMS reaction messages sent
+	// from Matrix so the outgoing echo from the iPhone relay is not processed as
+	// a duplicate plain-text message in the Matrix room.
+	recentSmsReactionEchoes     map[string]time.Time
+	recentSmsReactionEchoesLock sync.Mutex
 
 	// Outbound unsend echo suppression: tracks target UUIDs of unsends
 	// initiated from Matrix so the APNs echo doesn't get double-processed.
@@ -433,9 +438,9 @@ func (c *IMClient) sendGhostReadReceipt(
 		"ts": readTime.UnixMilli(),
 	}
 	req := &mautrix.ReqSetReadMarkers{
-		Read:            msg.MXID,
-		FullyRead:       msg.MXID,
-		BeeperReadExtra: extraData,
+		Read:                 msg.MXID,
+		FullyRead:            msg.MXID,
+		BeeperReadExtra:      extraData,
 		BeeperFullyReadExtra: extraData,
 	}
 	err = asIntent.Matrix.SetBeeperInboxState(ctx, portal.MXID, &mautrix.ReqSetBeeperInboxState{
@@ -940,6 +945,10 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		log.Debug().Str("uuid", msg.Uuid).Msg("Suppressing re-delivery of unsent message")
 		return
 	}
+	if c.wasSmsReactionEcho(msg.Uuid) {
+		log.Debug().Str("uuid", msg.Uuid).Msg("Suppressing SMS reaction echo")
+		return
+	}
 
 	// Skip APNs messages that were already bridged (e.g. via CloudKit backfill
 	// or a previous session). After the initial backfill completes and the APNs
@@ -997,6 +1006,30 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Strs("participants", msg.Participants).
 			Msg("Dropping message: could not resolve portal key (no participants/sender)")
 		return
+	}
+
+	// SMS/RCS group reactions and other messages sometimes arrive from the
+	// iPhone relay with an empty participant list. makePortalKey() then falls
+	// back to [sender, our_number] and computes a DM portal key, which can split
+	// one group chat into spurious DM portals.
+	//
+	// Only redirect DM->group when there is unambiguous evidence that this
+	// payload belongs to a known group. If evidence is ambiguous, keep the DM
+	// portal to avoid misrouting legitimate 1:1 SMS traffic.
+	if msg.IsSms {
+		isComputedDM := !strings.HasPrefix(string(portalKey.ID), "gid:") &&
+			!strings.Contains(string(portalKey.ID), ",")
+		if isComputedDM {
+			if groupKey, ok := c.resolveSMSGroupRedirectPortal(msg); ok {
+				log.Debug().
+					Str("sender", ptr.Val(msg.Sender)).
+					Str("sender_guid", ptr.Val(msg.SenderGuid)).
+					Str("dm_portal", string(portalKey.ID)).
+					Str("group_portal", string(groupKey.ID)).
+					Msg("Redirecting SMS message from DM portal to known group portal")
+				portalKey = groupKey
+			}
+		}
 	}
 
 	// Track SMS portals so outbound replies use the correct service type
@@ -1164,8 +1197,8 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 					return lc.Str("msg_uuid", attID)
 				},
 			},
-			Data:               attMsg,
-			ID:                 makeMessageID(attID),
+			Data: attMsg,
+			ID:   makeMessageID(attID),
 			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
 				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
 			},
@@ -2126,6 +2159,38 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.Content.RelatesTo.Key)
 
+	if conv.IsSms {
+		// For SMS/RCS portals, send the tapback as an SMS text message via the
+		// iPhone relay format instead of as an iMessage tapback (Message::React).
+		//
+		// SendTapback() generates Message::React, which causes prepare_send() in
+		// Rust to assign a new random sender_guid when the conversation has none
+		// (as SMS/RCS groups always do). The iPhone relay treats any unrecognised
+		// sender_guid as a new iMessage group conversation rather than routing the
+		// tapback to the existing SMS/RCS thread — producing a phantom new thread.
+		//
+		// Sending via SendMessage() with the reaction text uses RawSmsOutgoingMessage
+		// format, which the iPhone routes by participants without needing a stable
+		// sender_guid, correctly delivering to the existing SMS/RCS thread.
+		targetGUID := string(msg.TargetMessage.ID)
+		reactionText := formatSMSReactionText(reaction, emoji, false)
+		if c.cloudStore != nil {
+			if origText, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && origText != "" {
+				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, false)
+			}
+		}
+		uuid, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
+		}
+		c.trackSmsReactionEcho(uuid)
+		// Return nil: SMS reactions are sent as plain text, not as structured
+		// tapbacks, so there is no database.Reaction to store. The remove path
+		// (HandleMatrixReactionRemove) reads the target from the Matrix event
+		// directly and does not need a stored Reaction record.
+		return nil, nil
+	}
+
 	_, err := c.client.SendTapback(conv, string(msg.TargetMessage.ID), 0, reaction, emoji, false, c.handle)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send tapback: %w", err)
@@ -2147,6 +2212,25 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.TargetReaction.Emoji)
+
+	if conv.IsSms {
+		// Same SMS routing fix as HandleMatrixReaction: use SendMessage instead
+		// of SendTapback to avoid the phantom new-thread creation.
+		targetGUID := string(msg.TargetReaction.MessageID)
+		reactionText := formatSMSReactionText(reaction, emoji, true)
+		if c.cloudStore != nil {
+			if origText, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && origText != "" {
+				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, true)
+			}
+		}
+		uuid, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
+		if err != nil {
+			return err
+		}
+		c.trackSmsReactionEcho(uuid)
+		return nil
+	}
+
 	_, err := c.client.SendTapback(conv, string(msg.TargetReaction.MessageID), 0, reaction, emoji, true, c.handle)
 	return err
 }
@@ -3621,6 +3705,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 		},
 	}}
 
+<<<<<<< HEAD
 	// Live Photo: if this attachment has an avid (video) asset, also download
 	// and bridge the video so recipients see both the still and the motion.
 	// Skip when the lqa itself is already a video — that means this is a regular
@@ -3707,6 +3792,8 @@ func (c *IMClient) downloadAndUploadAttachment(
 		})
 	}
 
+=======
+>>>>>>> e3ab934 (connector: avoid ambiguous SMS DM-to-group redirect)
 	return messages
 }
 
@@ -4525,6 +4612,57 @@ func (c *IMClient) resolveExistingGroupPortalID(computedID string, senderGuid *s
 // Prefers the group where the member last sent a message; falls back to the
 // sole group containing them. Used when typing/read receipts lack full
 // participant lists.
+func (c *IMClient) resolveSMSGroupRedirectPortal(msg rustpushgo.WrappedMessage) (networkid.PortalKey, bool) {
+	if len(msg.Participants) != 0 || msg.Sender == nil || *msg.Sender == "" {
+		return networkid.PortalKey{}, false
+	}
+
+	ctx := context.Background()
+
+	// Strongest signal: sender_guid explicitly maps to an existing group portal.
+	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
+		gidKey := networkid.PortalKey{ID: networkid.PortalID("gid:" + strings.ToLower(*msg.SenderGuid)), Receiver: c.UserLogin.ID}
+		if existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, gidKey); existing != nil && existing.MXID != "" {
+			return gidKey, true
+		}
+
+		c.imGroupGuidsMu.RLock()
+		matches := make([]string, 0, 1)
+		for portalID, guid := range c.imGroupGuids {
+			if strings.EqualFold(guid, *msg.SenderGuid) {
+				matches = append(matches, portalID)
+			}
+		}
+		c.imGroupGuidsMu.RUnlock()
+		if len(matches) == 1 {
+			groupKey := networkid.PortalKey{ID: networkid.PortalID(matches[0]), Receiver: c.UserLogin.ID}
+			if existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, groupKey); existing != nil && existing.MXID != "" {
+				return groupKey, true
+			}
+		}
+	}
+
+	// Fallback: unique group membership match only (no "last active" heuristic).
+	normalized := normalizeIdentifierForPortalID(*msg.Sender)
+	if normalized == "" {
+		return networkid.PortalKey{}, false
+	}
+	c.ensureGroupPortalIndex()
+	c.groupPortalMu.RLock()
+	portals := c.groupPortalIndex[normalized]
+	c.groupPortalMu.RUnlock()
+	if len(portals) != 1 {
+		return networkid.PortalKey{}, false
+	}
+	for portalID := range portals {
+		groupKey := networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
+		if existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, groupKey); existing != nil && existing.MXID != "" {
+			return groupKey, true
+		}
+	}
+	return networkid.PortalKey{}, false
+}
+
 func (c *IMClient) findGroupPortalForMember(member string) (networkid.PortalKey, bool) {
 	normalized := normalizeIdentifierForPortalID(member)
 	if normalized == "" {
@@ -5100,10 +5238,11 @@ func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []s
 
 // resolveGroupName determines the best display name for a group portal.
 // Priority: 1) in-memory cache (user-set iMessage group name from real-time
-//              protocol cv_name, e.g. when someone explicitly renames a group)
-//           2) CloudKit display_name (user-set group name persisted to iCloud,
-//              the "name" field on CKChatRecord = cv_name from chat.db)
-//           3) contact-resolved member names via buildGroupName
+//
+//	   protocol cv_name, e.g. when someone explicitly renames a group)
+//	2) CloudKit display_name (user-set group name persisted to iCloud,
+//	   the "name" field on CKChatRecord = cv_name from chat.db)
+//	3) contact-resolved member names via buildGroupName
 func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) string {
 	// 1) In-memory cache (populated from real-time iMessage rename messages)
 	c.imGroupNamesMu.RLock()
@@ -5743,6 +5882,34 @@ func (c *IMClient) wasUnsent(uuid string) bool {
 	defer c.recentUnsendsLock.Unlock()
 	if t, ok := c.recentUnsends[uuid]; ok {
 		return time.Since(t) < 5*time.Minute
+	}
+	return false
+}
+
+func (c *IMClient) trackSmsReactionEcho(uuid string) {
+	if uuid == "" {
+		return
+	}
+	c.recentSmsReactionEchoesLock.Lock()
+	defer c.recentSmsReactionEchoesLock.Unlock()
+	c.recentSmsReactionEchoes[strings.ToUpper(uuid)] = time.Now()
+	for k, t := range c.recentSmsReactionEchoes {
+		if time.Since(t) > 5*time.Minute {
+			delete(c.recentSmsReactionEchoes, k)
+		}
+	}
+}
+
+func (c *IMClient) wasSmsReactionEcho(uuid string) bool {
+	if uuid == "" {
+		return false
+	}
+	c.recentSmsReactionEchoesLock.Lock()
+	defer c.recentSmsReactionEchoesLock.Unlock()
+	key := strings.ToUpper(uuid)
+	if _, ok := c.recentSmsReactionEchoes[key]; ok {
+		delete(c.recentSmsReactionEchoes, key)
+		return true
 	}
 	return false
 }
