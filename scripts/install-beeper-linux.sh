@@ -561,7 +561,10 @@ _SESSION_FILE_CHECK="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage/sessi
 if [ "$IS_FRESH_DB" = "true" ]; then
     echo ""
     echo "Initializing bridge database..."
-    (cd "$DATA_DIR" && "$BINARY" init-db -c "$CONFIG" >/dev/null 2>&1) || true
+    if ! (cd "$DATA_DIR" && "$BINARY" init-db -c "$CONFIG"); then
+        echo "✗ Bridge database initialization failed — check the output above for details"
+        exit 1
+    fi
     echo "✓ Bridge database initialized — answering setup questions"
 fi
 

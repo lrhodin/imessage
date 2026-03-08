@@ -1754,15 +1754,36 @@ func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid 
 	return exists, nil
 }
 
-// getConversationReadByMe returns true if the portal has at least one active
-// non-filtered cloud_chat row. All non-filtered CloudKit conversations are
-// marked as read during backfill; filtered (junk) chats and portals without
-// chat metadata are left unread.
+// getConversationReadByMe returns true when the most recent non-tapback message
+// in the conversation was sent by the user (is_from_me=true), meaning the user
+// has read everything in the thread. If there are no messages in the local
+// store, falls back to checking for a non-filtered cloud_chat row (portals with
+// chat metadata but no stored messages are treated as read).
+// Filtered (junk) chats and portals with no cloud_chat metadata are left unread.
 //
 // Must be called BEFORE markForwardBackfillDone (inserts synthetic rows).
 func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portalID string) (bool, error) {
-	var count int
+	// Primary check: direction of the most recent non-tapback message.
+	var isFromMe bool
 	err := s.db.QueryRow(ctx, `
+		SELECT is_from_me FROM cloud_message
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
+		  AND tapback_type IS NULL
+		ORDER BY timestamp_ms DESC
+		LIMIT 1
+	`, s.loginID, portalID).Scan(&isFromMe)
+	if err == nil {
+		// Latest message direction determines read state:
+		// outgoing → user has read the conversation; incoming → leave unread.
+		return isFromMe, nil
+	} else if err != sql.ErrNoRows {
+		return false, err
+	}
+	// No messages in the local store — fall back to checking for a
+	// non-filtered cloud_chat row. Portals with chat metadata but no
+	// stored messages are treated as read.
+	var count int
+	err = s.db.QueryRow(ctx, `
 		SELECT COUNT(*) FROM cloud_chat
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
 		  AND COALESCE(is_filtered, 0) = 0
