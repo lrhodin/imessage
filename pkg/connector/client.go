@@ -2040,6 +2040,16 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		_ = c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true)
 	}
 
+	// Send caption as a follow-up text message if present.
+	// When FileName is set, Body contains the caption text rather than the filename.
+	if msg.Content.FileName != "" && msg.Content.Body != "" {
+		caption := msg.Content.Body
+		_, captionErr := c.client.SendMessage(conv, caption, c.handle, nil, nil)
+		if captionErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(captionErr).Msg("Failed to send caption for attachment")
+		}
+	}
+
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
 			ID:        makeMessageID(uuid),
