@@ -1764,6 +1764,9 @@ func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid 
 // Must be called BEFORE markForwardBackfillDone (inserts synthetic rows).
 func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portalID string) (bool, error) {
 	// Primary check: direction of the most recent non-tapback message.
+	// Reactions (tapback_type IS NOT NULL) are excluded: an incoming reaction
+	// to something you sent does not create an unread state. The filter finds
+	// the last substantive message and uses its direction as the read signal.
 	var isFromMe bool
 	err := s.db.QueryRow(ctx, `
 		SELECT is_from_me FROM cloud_message
