@@ -1965,7 +1965,10 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		return nil, fmt.Errorf("failed to download media: %w", err)
 	}
 
-	fileName := msg.Content.Body
+	fileName := msg.Content.FileName
+	if fileName == "" {
+		fileName = msg.Content.Body
+	}
 	if fileName == "" {
 		fileName = "file"
 	}
