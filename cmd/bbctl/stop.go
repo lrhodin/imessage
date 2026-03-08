@@ -47,6 +47,8 @@ func readASToken(configPath string) (string, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return "", fmt.Errorf("failed to parse config: %w", err)
 	}
+	// bridgev2 configs nest the token under appservice; fall back to
+	// legacy top-level as_token for older config shapes.
 	token := cfg.Appservice.ASToken
 	if token == "" {
 		token = cfg.ASToken

@@ -841,6 +841,7 @@ func completeLoginWithMeta(
 		imGroupParticipants:     make(map[string][]string),
 		gidAliases:              make(map[string]string),
 		lastGroupForMember:      make(map[string]networkid.PortalKey),
+		forwardBackfillSem:      make(chan struct{}, 3),
 	}
 
 	ul, err := user.NewLogin(ctx, &database.UserLogin{
