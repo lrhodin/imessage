@@ -511,7 +511,8 @@ func (c *IMClient) onForwardBackfillDone() {
 		contactsReady := c.contactsReady
 		c.contactsReadyLock.RUnlock()
 		if contactsReady {
-			go c.refreshGhostNamesFromContacts(log.Logger)
+			l := c.UserLogin.Log.With().Str("component", "post_backfill_ghost_refresh").Logger()
+			go c.refreshGhostNamesFromContacts(l)
 		}
 	}
 }

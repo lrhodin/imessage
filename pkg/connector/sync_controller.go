@@ -198,8 +198,6 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		log.Err(err).Msg("Failed to query ghosts for contact name refresh")
 		return
 	}
-	defer rows.Close()
-
 	type ghostEntry struct {
 		id   networkid.UserID
 		name string
