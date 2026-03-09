@@ -37,15 +37,15 @@ const (
 // AppleIDLogin implements the multi-step login flow:
 // Apple ID + password → 2FA code → IDS registration → device selection → passcode → handle selection → connected.
 type AppleIDLogin struct {
-	User          *bridgev2.User
-	Main          *IMConnector
-	username      string
-	cfg           *rustpushgo.WrappedOsConfig
-	conn          *rustpushgo.WrappedApsConnection
-	session       *rustpushgo.LoginSession
-	result        *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
-	handle        string                                  // chosen handle
-	devices       []rustpushgo.EscrowDeviceInfo           // escrow devices (fetched after IDS registration)
+	User           *bridgev2.User
+	Main           *IMConnector
+	username       string
+	cfg            *rustpushgo.WrappedOsConfig
+	conn           *rustpushgo.WrappedApsConnection
+	session        *rustpushgo.LoginSession
+	result         *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
+	handle         string                                 // chosen handle
+	devices        []rustpushgo.EscrowDeviceInfo          // escrow devices (fetched after IDS registration)
 	selectedDevice int                                    // index into devices (-1 = not yet selected)
 }
 
@@ -266,9 +266,9 @@ type ExternalKeyLogin struct {
 	conn           *rustpushgo.WrappedApsConnection
 	session        *rustpushgo.LoginSession
 	result         *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
-	handle         string                                  // chosen handle
-	devices        []rustpushgo.EscrowDeviceInfo           // escrow devices (fetched after IDS registration)
-	selectedDevice int                                     // index into devices (-1 = not yet selected)
+	handle         string                                 // chosen handle
+	devices        []rustpushgo.EscrowDeviceInfo          // escrow devices (fetched after IDS registration)
+	selectedDevice int                                    // index into devices (-1 = not yet selected)
 }
 
 var _ bridgev2.LoginProcessUserInput = (*ExternalKeyLogin)(nil)
@@ -823,23 +823,25 @@ func completeLoginWithMeta(
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))
 
 	client := &IMClient{
-		Main:               main,
-		config:             cfg,
-		users:              result.Users,
-		identity:           result.Identity,
-		connection:         conn,
-		tokenProvider:      result.TokenProvider,
-		contactsReady:      false,
-		contactsReadyCh:    make(chan struct{}),
-		cloudStore:         newCloudBackfillStore(main.Bridge.DB.Database, loginID),
-		recentUnsends:         make(map[string]time.Time),
-		recentOutboundUnsends: make(map[string]time.Time),
-		smsPortals:            make(map[string]bool),
-		imGroupNames:        make(map[string]string),
-		imGroupGuids:        make(map[string]string),
-		imGroupParticipants: make(map[string][]string),
-		gidAliases:          make(map[string]string),
-		lastGroupForMember:  make(map[string]networkid.PortalKey),
+		Main:                    main,
+		config:                  cfg,
+		users:                   result.Users,
+		identity:                result.Identity,
+		connection:              conn,
+		tokenProvider:           result.TokenProvider,
+		contactsReady:           false,
+		contactsReadyCh:         make(chan struct{}),
+		cloudStore:              newCloudBackfillStore(main.Bridge.DB.Database, loginID),
+		recentUnsends:           make(map[string]time.Time),
+		recentOutboundUnsends:   make(map[string]time.Time),
+		recentSmsReactionEchoes: make(map[string]time.Time),
+		smsPortals:              make(map[string]bool),
+		imGroupNames:            make(map[string]string),
+		imGroupGuids:            make(map[string]string),
+		imGroupParticipants:     make(map[string][]string),
+		gidAliases:              make(map[string]string),
+		lastGroupForMember:      make(map[string]networkid.PortalKey),
+		forwardBackfillSem:      make(chan struct{}, 3),
 	}
 
 	ul, err := user.NewLogin(ctx, &database.UserLogin{

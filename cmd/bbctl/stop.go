@@ -39,15 +39,24 @@ func readASToken(configPath string) (string, error) {
 		return "", err
 	}
 	var cfg struct {
-		AsToken string `yaml:"as_token"`
+		ASToken    string `yaml:"as_token"`
+		Appservice struct {
+			ASToken string `yaml:"as_token"`
+		} `yaml:"appservice"`
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return "", fmt.Errorf("failed to parse config: %w", err)
 	}
-	if cfg.AsToken == "" {
+	// bridgev2 configs nest the token under appservice; fall back to
+	// legacy top-level as_token for older config shapes.
+	token := cfg.Appservice.ASToken
+	if token == "" {
+		token = cfg.ASToken
+	}
+	if token == "" {
 		return "", fmt.Errorf("as_token not found in config")
 	}
-	return cfg.AsToken, nil
+	return token, nil
 }
 
 func cmdStop(ctx *cli.Context) error {
