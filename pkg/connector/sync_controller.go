@@ -1040,10 +1040,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 
 	// Collect portal IDs for chats that have a group photo GUID so we can
 	// warm the photo cache after upserting the batch.
-	type photoRef struct {
-		portalID string
-	}
-	var photoRefs []photoRef
+	var photoPortalIDs []string
 
 	// Build batch of rows.
 	batch := make([]cloudChatUpsertRow, 0, len(chats))
@@ -1071,7 +1068,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 				Str("record_name", chat.RecordName).
 				Str("group_photo_guid", *chat.GroupPhotoGuid).
 				Msg("CloudKit chat sync: group photo GUID found")
-			photoRefs = append(photoRefs, photoRef{portalID: portalID})
+			photoPortalIDs = append(photoPortalIDs, portalID)
 		}
 
 		batch = append(batch, cloudChatUpsertRow{
@@ -1112,7 +1109,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 	// Runs in a background goroutine so it doesn't block the sync sweep.
 	// Each download attempt is best-effort: failures are logged at debug level
 	// since the CloudKit "gp" asset field is often unpopulated by Apple clients.
-	if len(photoRefs) > 0 {
+	if len(photoPortalIDs) > 0 {
 		bgCtx, cancelBg := context.WithCancel(context.Background())
 		// Wire bgCtx to the client lifecycle: cancel it when the client
 		// disconnects. The warmup goroutine also cancels on exit via defer,
@@ -1124,18 +1121,18 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			case <-bgCtx.Done():
 			}
 		}()
-		refs := photoRefs
+		portalIDs := photoPortalIDs
 		go func() {
 			defer cancelBg()
 			photoLog := log.With().Str("component", "cloud_photo_warmup").Logger()
-			for _, ref := range refs {
-				_, existing, cacheErr := c.cloudStore.getGroupPhoto(bgCtx, ref.portalID)
+			for _, portalID := range portalIDs {
+				_, existing, cacheErr := c.cloudStore.getGroupPhoto(bgCtx, portalID)
 				if cacheErr == nil && len(existing) > 0 {
 					continue // already cached
 				}
 				c.fetchAndCacheGroupPhoto(bgCtx,
-					photoLog.With().Str("portal_id", ref.portalID).Logger(),
-					ref.portalID)
+					photoLog.With().Str("portal_id", portalID).Logger(),
+					portalID)
 			}
 		}()
 	}
