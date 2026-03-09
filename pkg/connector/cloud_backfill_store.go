@@ -1105,6 +1105,20 @@ func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, porta
 	return err
 }
 
+// persistTapbackUUID inserts a minimal cloud_message record for a realtime APNs
+// tapback so its UUID survives restarts. Unlike persistMessageUUID it sets
+// tapback_type, ensuring getConversationReadByMe (which filters tapback_type IS
+// NULL) does not treat the synthetic row as a substantive message and does not
+// spuriously flip conversation read state for incoming reactions.
+func (s *cloudBackfillStore) persistTapbackUUID(ctx context.Context, uuid, portalID string, timestampMS int64, isFromMe bool, tapbackType uint32) error {
+	nowMS := time.Now().UnixMilli()
+	_, err := s.db.Exec(ctx, `
+		INSERT OR IGNORE INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, tapback_type, created_ts, updated_ts)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, s.loginID, uuid, portalID, timestampMS, isFromMe, tapbackType, nowMS, nowMS)
+	return err
+}
+
 // hasMessageUUID checks if a message UUID exists in cloud_message for this login.
 // Used for echo detection: if the UUID is known, the message is an echo of a
 // previously-seen message and should not create a new portal.
