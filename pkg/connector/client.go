@@ -2255,6 +2255,37 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.Content.RelatesTo.Key)
 
+	if conv.IsSms {
+		// For SMS/RCS portals, send the tapback as an SMS text message via the
+		// iPhone relay format instead of as an iMessage tapback (Message::React).
+		//
+		// SendTapback() generates Message::React, which causes prepare_send() in
+		// Rust to assign a new random sender_guid when the conversation has none
+		// (as SMS/RCS groups always do). The iPhone relay treats any unrecognised
+		// sender_guid as a new iMessage group conversation rather than routing the
+		// tapback to the existing SMS/RCS thread — producing a phantom new thread.
+		//
+		// Sending via SendMessage() with the reaction text uses RawSmsOutgoingMessage
+		// format, which the iPhone routes by participants without needing a stable
+		// sender_guid, correctly delivering to the existing SMS/RCS thread.
+		targetGUID := string(msg.TargetMessage.ID)
+		reactionText := formatSMSReactionText(reaction, emoji, false)
+		if c.cloudStore != nil {
+			if origText, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && origText != "" {
+				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, false)
+			}
+		}
+		_, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
+		}
+		// Return nil: SMS reactions are sent as plain text, not as structured
+		// tapbacks, so there is no database.Reaction to store. The remove path
+		// (HandleMatrixReactionRemove) reads the target from the Matrix event
+		// directly and does not need a stored Reaction record.
+		return nil, nil
+	}
+
 	_, err := c.client.SendTapback(conv, string(msg.TargetMessage.ID), 0, reaction, emoji, false, c.handle)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send tapback: %w", err)
@@ -2276,6 +2307,21 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.TargetReaction.Emoji)
+
+	if conv.IsSms {
+		// Same SMS routing fix as HandleMatrixReaction: use SendMessage instead
+		// of SendTapback to avoid the phantom new-thread creation.
+		targetGUID := string(msg.TargetReaction.MessageID)
+		reactionText := formatSMSReactionText(reaction, emoji, true)
+		if c.cloudStore != nil {
+			if origText, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && origText != "" {
+				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, true)
+			}
+		}
+		_, err := c.client.SendMessage(conv, reactionText, c.handle, &targetGUID, nil)
+		return err
+	}
+
 	_, err := c.client.SendTapback(conv, string(msg.TargetReaction.MessageID), 0, reaction, emoji, true, c.handle)
 	return err
 }
@@ -5802,6 +5848,68 @@ func emojiToTapbackType(emoji string) (uint32, *string) {
 	default:
 		return 6, &emoji
 	}
+}
+
+// formatSMSReactionText returns the SMS/RCS reaction text for a tapback with an
+// empty quoted body (when the original message text is not available). The result
+// matches Apple's SMS relay format exactly so the iPhone can thread it correctly.
+func formatSMSReactionText(tapbackType uint32, customEmoji *string, isRemove bool) string {
+	return formatSMSReactionTextWithBody(tapbackType, customEmoji, "", isRemove)
+}
+
+// formatSMSReactionTextWithBody returns the SMS/RCS reaction text with the
+// original message body quoted inside the curly-quote delimiters.
+// Mirrors the Rust ReactMessageType::get_text() output so SMS contacts see the
+// same reaction text they would receive from a native iMessage client.
+func formatSMSReactionTextWithBody(tapbackType uint32, customEmoji *string, body string, isRemove bool) string {
+	var word string
+	if isRemove {
+		switch tapbackType {
+		case 0:
+			word = "Removed a heart from"
+		case 1:
+			word = "Removed a like from"
+		case 2:
+			word = "Removed a dislike from"
+		case 3:
+			word = "Removed a laugh from"
+		case 4:
+			word = "Removed an exclamation from"
+		case 5:
+			word = "Removed a question mark from"
+		case 6:
+			if customEmoji != nil {
+				word = "Removed a " + *customEmoji + " from"
+			} else {
+				word = "Removed a like from"
+			}
+		default:
+			word = "Removed a heart from"
+		}
+		return word + " \u201c" + body + "\u201d"
+	}
+	switch tapbackType {
+	case 0:
+		word = "Loved"
+	case 1:
+		word = "Liked"
+	case 2:
+		word = "Disliked"
+	case 3:
+		word = "Laughed at"
+	case 4:
+		word = "Emphasized"
+	case 5:
+		word = "Questioned"
+	case 6:
+		if customEmoji != nil {
+			return "Reacted " + *customEmoji + " to \u201c" + body + "\u201d"
+		}
+		word = "Liked"
+	default:
+		word = "Loved"
+	}
+	return word + " \u201c" + body + "\u201d"
 }
 
 func mimeToUTI(mime string) string {

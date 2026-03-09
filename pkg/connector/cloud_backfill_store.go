@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -1124,8 +1125,13 @@ func (s *cloudBackfillStore) persistTapbackUUID(ctx context.Context, uuid, porta
 // previously-seen message and should not create a new portal.
 func (s *cloudBackfillStore) hasMessageUUID(ctx context.Context, uuid string) (bool, error) {
 	var count int
+	// UPPER() on both sides: CloudKit GUIDs are lowercase, APNs UUIDs are
+	// uppercase, and incoming SMS constant_uuid values may vary in case.
+	// A case-sensitive match would miss cross-path duplicates (e.g. a message
+	// CloudKit-backfilled as lowercase then re-delivered by APNs as uppercase).
+	// Mirrors the pattern used in getMessageTimestampByGUID.
 	err := s.db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM cloud_message WHERE login_id=$1 AND guid=$2 LIMIT 1`,
+		`SELECT COUNT(*) FROM cloud_message WHERE login_id=$1 AND UPPER(guid)=UPPER($2) LIMIT 1`,
 		s.loginID, uuid,
 	).Scan(&count)
 	return count > 0, err
@@ -1135,6 +1141,25 @@ func (s *cloudBackfillStore) hasMessageUUID(ctx context.Context, uuid string) (b
 // message UUID, and whether the row was found. Used to enforce the pre-startup
 // receipt filter when the message is still being backfilled into the Matrix DB
 // (so the Matrix DB lookup returns nothing but CloudKit already has the record).
+// getMessageTextByGUID returns the text body of a message by UUID.
+// Used when sending SMS/RCS reactions to include the original message text in the
+// reaction string (e.g. "Loved "original message""). Returns "" if not found.
+// Case-insensitive UUID comparison mirrors getMessageTimestampByGUID.
+func (s *cloudBackfillStore) getMessageTextByGUID(ctx context.Context, uuid string) (string, error) {
+	var text sql.NullString
+	err := s.db.QueryRow(ctx,
+		`SELECT text FROM cloud_message WHERE login_id=$1 AND UPPER(guid)=UPPER($2) AND tapback_type IS NULL LIMIT 1`,
+		s.loginID, uuid,
+	).Scan(&text)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return text.String, nil
+}
+
 func (s *cloudBackfillStore) getMessageTimestampByGUID(ctx context.Context, uuid string) (int64, bool, error) {
 	var ts int64
 	// UPPER() on both sides: APNs delivers UUIDs as uppercase while CloudKit
