@@ -1455,6 +1455,85 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 	})
 }
 
+// safeCloudDownloadGroupPhoto wraps the FFI call with panic recovery and a
+// 90-second timeout, matching the pattern used by safeCloudDownloadAttachment.
+func safeCloudDownloadGroupPhoto(ctx context.Context, client *rustpushgo.Client, recordName string) ([]byte, error) {
+	type dlResult struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan dlResult, 1)
+	go func() {
+		var res dlResult
+		defer func() {
+			if r := recover(); r != nil {
+				stack := string(debug.Stack())
+				log.Error().Str("ffi_method", "CloudDownloadGroupPhoto").
+					Str("record_name", recordName).
+					Str("stack", stack).
+					Msgf("FFI panic recovered: %v", r)
+				res = dlResult{err: fmt.Errorf("FFI panic in CloudDownloadGroupPhoto: %v", r)}
+			}
+			ch <- res
+		}()
+		d, e := client.CloudDownloadGroupPhoto(recordName)
+		res = dlResult{data: d, err: e}
+	}()
+	select {
+	case res := <-ch:
+		return res.data, res.err
+	case <-time.After(90 * time.Second):
+		log.Error().Str("ffi_method", "CloudDownloadGroupPhoto").
+			Str("record_name", recordName).
+			Msg("CloudDownloadGroupPhoto timed out after 90s — inner goroutine leaked until FFI unblocks")
+		return nil, fmt.Errorf("CloudDownloadGroupPhoto timed out after 90s")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// fetchAndCacheGroupPhoto attempts to download the group photo from CloudKit
+// using the record_name stored during chat sync. It tries the CloudKit "gp"
+// (group photo) asset field on the chat record. Apple's iMessage clients may
+// not always write to this field (preferring MMCS delivery via APNs IconChange
+// messages), so failures are expected and logged at debug level rather than
+// warning. On success, the bytes are persisted to group_photo_cache so
+// subsequent GetChatInfo calls can serve the photo without a network round-trip.
+// Returns (photoData, timestampMs); both are zero on any failure.
+func (c *IMClient) fetchAndCacheGroupPhoto(ctx context.Context, log zerolog.Logger, portalID string) ([]byte, int64) {
+	if c.cloudStore == nil {
+		return nil, 0
+	}
+	_, recordName, err := c.cloudStore.getGroupPhotoByPortalID(ctx, portalID)
+	if err != nil {
+		log.Debug().Err(err).Msg("group_photo: failed to look up record_name for CloudKit download")
+		return nil, 0
+	}
+	if recordName == "" {
+		log.Debug().Msg("group_photo: no group_photo_guid in cloud_chat, skipping CloudKit download")
+		return nil, 0
+	}
+	log.Debug().Str("record_name", recordName).Msg("group_photo: attempting CloudKit download")
+	data, dlErr := safeCloudDownloadGroupPhoto(ctx, c.client, recordName)
+	if dlErr != nil {
+		log.Debug().Err(dlErr).Str("record_name", recordName).
+			Msg("group_photo: CloudKit download failed (expected if Apple did not write gp asset)")
+		return nil, 0
+	}
+	if len(data) == 0 {
+		log.Debug().Str("record_name", recordName).Msg("group_photo: CloudKit download returned empty data")
+		return nil, 0
+	}
+	ts := time.Now().UnixMilli()
+	if saveErr := c.cloudStore.saveGroupPhoto(ctx, portalID, ts, data); saveErr != nil {
+		log.Warn().Err(saveErr).Msg("group_photo: failed to cache downloaded photo")
+	} else {
+		log.Info().Str("record_name", recordName).Int("bytes", len(data)).
+			Msg("group_photo: downloaded and cached from CloudKit")
+	}
+	return data, ts
+}
+
 // handleIconChange processes a group photo (icon) change from APNs.
 // When a participant changes or clears the group photo from their iMessage
 // client, Apple delivers an IconChange message with MMCS transfer data.
@@ -2374,22 +2453,30 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			chatInfo.Name = &groupName
 		}
 
-		// Set group photo from locally cached MMCS bytes.
-		// Apple's native iMessage clients deliver group photos via MMCS inside
-		// APNs IconChange messages — they never write to the CloudKit gp asset
-		// field, so a CloudKit round-trip would always fail with MissingGroupPhoto.
-		// handleIconChange persists the MMCS bytes to the DB, so we can apply
-		// the correct avatar here on portal creation or resync after a restart.
+		// Set group photo from cache or CloudKit.
+		//
+		// Primary path: MMCS bytes previously downloaded via an APNs IconChange
+		// message and persisted to group_photo_cache by handleIconChange.
+		//
+		// Fallback path: when the cache is empty (e.g. fresh bridge, or first
+		// sync before any IconChange has arrived), attempt a CloudKit download
+		// using the record_name stored during chat sync. Apple's iMessage
+		// clients may not write the CloudKit "gp" asset field (preferring MMCS
+		// delivery), so this fallback often returns MissingGroupPhoto — logged
+		// at debug level and silently ignored. When it does succeed the bytes
+		// are cached for future calls.
 		if c.cloudStore != nil {
 			photoLog := c.Main.Bridge.Log.With().Str("portal_id", portalID).Logger()
 			photoTS, photoData, gpErr := c.cloudStore.getGroupPhoto(ctx, portalID)
 			if gpErr != nil {
 				photoLog.Warn().Err(gpErr).Msg("group_photo: DB lookup error")
 			} else if len(photoData) == 0 {
-				photoLog.Debug().Msg("group_photo: no cached photo in DB")
-			} else {
+				photoLog.Debug().Msg("group_photo: no cached photo in DB, trying CloudKit")
+				photoData, photoTS = c.fetchAndCacheGroupPhoto(ctx, photoLog, portalID)
+			}
+			if len(photoData) > 0 {
 				avatarID := networkid.AvatarID(fmt.Sprintf("icon-change:%d", photoTS))
-				photoLog.Info().Int64("ts", photoTS).Int("bytes", len(photoData)).Msg("group_photo: setting avatar from local cache")
+				photoLog.Info().Int64("ts", photoTS).Int("bytes", len(photoData)).Msg("group_photo: setting avatar from cache")
 				cachedData := photoData
 				chatInfo.Avatar = &bridgev2.Avatar{
 					ID:  avatarID,

@@ -1038,6 +1038,13 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 	// the real chat identifier). We must look up by record_name.
 	var deletedRecordNames []string
 
+	// Collect portal IDs for chats that have a group photo GUID so we can
+	// warm the photo cache after upserting the batch.
+	type photoRef struct {
+		portalID string
+	}
+	var photoRefs []photoRef
+
 	// Build batch of rows.
 	batch := make([]cloudChatUpsertRow, 0, len(chats))
 	for _, chat := range chats {
@@ -1064,6 +1071,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 				Str("record_name", chat.RecordName).
 				Str("group_photo_guid", *chat.GroupPhotoGuid).
 				Msg("CloudKit chat sync: group photo GUID found")
+			photoRefs = append(photoRefs, photoRef{portalID: portalID})
 		}
 
 		batch = append(batch, cloudChatUpsertRow{
@@ -1096,6 +1104,40 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 	// Batch insert all non-deleted chats.
 	if err := c.cloudStore.upsertChatBatch(ctx, batch); err != nil {
 		return counts, err
+	}
+
+	// Proactively warm the group_photo_cache for chats that have a photo GUID
+	// but no cached bytes yet. This ensures GetChatInfo can serve the avatar
+	// immediately on first portal open without waiting for an APNs IconChange.
+	// Runs in a background goroutine so it doesn't block the sync sweep.
+	// Each download attempt is best-effort: failures are logged at debug level
+	// since the CloudKit "gp" asset field is often unpopulated by Apple clients.
+	if len(photoRefs) > 0 {
+		bgCtx, cancelBg := context.WithCancel(context.Background())
+		// Wire bgCtx to the client lifecycle: cancel it when the client
+		// disconnects. The warmup goroutine also cancels on exit via defer,
+		// so this watcher exits promptly in either case.
+		go func() {
+			select {
+			case <-c.stopChan:
+				cancelBg()
+			case <-bgCtx.Done():
+			}
+		}()
+		refs := photoRefs
+		go func() {
+			defer cancelBg()
+			photoLog := log.With().Str("component", "cloud_photo_warmup").Logger()
+			for _, ref := range refs {
+				_, existing, cacheErr := c.cloudStore.getGroupPhoto(bgCtx, ref.portalID)
+				if cacheErr == nil && len(existing) > 0 {
+					continue // already cached
+				}
+				c.fetchAndCacheGroupPhoto(bgCtx,
+					photoLog.With().Str("portal_id", ref.portalID).Logger(),
+					ref.portalID)
+			}
+		}()
 	}
 
 	// Handle tombstoned (deleted) chats. Tombstones only carry the
