@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
 
 // ogMetaRegex matches <meta property="og:..." content="..."> in either attribute order,
@@ -27,8 +28,9 @@ var ogMetaRegex = regexp.MustCompile(
 // fetchURLPreview builds a BeeperLinkPreview by fetching the target URL's Open Graph
 // metadata. It tries the homeserver's /preview_url first, then falls back to fetching
 // the HTML and parsing og: meta tags directly. If an og:image is found, it is downloaded
-// and uploaded via the provided intent.
-func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridgev2.MatrixAPI, targetURL string) *event.BeeperLinkPreview {
+// and uploaded via the provided intent. The roomID is required so that UploadMedia
+// encrypts the image in E2EE rooms (matching mautrix-whatsapp behavior).
+func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridgev2.MatrixAPI, roomID id.RoomID, targetURL string) *event.BeeperLinkPreview {
 	log := zerolog.Ctx(ctx)
 
 	fetchURL := normalizeURL(targetURL)
@@ -43,7 +45,11 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 
 	// Try homeserver preview first
 	if mc, ok := bridge.Matrix.(bridgev2.MatrixConnectorWithURLPreviews); ok {
-		if lp, err := mc.GetURLPreview(ctx, fetchURL); err == nil && lp != nil {
+		lp, err := mc.GetURLPreview(ctx, fetchURL)
+		if err != nil {
+			log.Debug().Err(err).Str("url", fetchURL).Msg("Homeserver URL preview failed, falling back to og: scraping")
+		}
+		if err == nil && lp != nil {
 			preview.LinkPreview = *lp
 			if preview.CanonicalURL == "" {
 				preview.CanonicalURL = targetURL
@@ -51,9 +57,31 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 			if preview.Title == "" {
 				preview.Title = targetURL
 			}
-			// If homeserver already returned an image, we're done
-			if preview.ImageURL != "" {
-				return preview
+			// If homeserver returned an image, re-upload it through the intent
+			// so it gets encrypted for E2EE rooms (the homeserver's mxc:// URL
+			// is a plain upload that won't work in encrypted rooms).
+			if preview.ImageURL != "" && intent != nil {
+				data, err := bridge.Bot.DownloadMedia(ctx, preview.ImageURL, nil)
+				if err == nil && len(data) > 0 {
+					mime := preview.ImageType
+					if mime == "" {
+						mime = "image/jpeg"
+					}
+					mxcURL, encFile, err := intent.UploadMedia(ctx, roomID, data, "preview", mime)
+					if err == nil {
+						if encFile != nil {
+							preview.ImageEncryption = encFile
+							preview.ImageURL = encFile.URL
+						} else {
+							preview.ImageURL = mxcURL
+						}
+						return preview
+					}
+					log.Debug().Err(err).Msg("Failed to re-upload homeserver preview image")
+				} else if err != nil {
+					log.Debug().Err(err).Msg("Failed to download homeserver preview image for re-upload")
+				}
+				// Fall through to og: scraping if re-upload failed
 			}
 		}
 	}
@@ -83,7 +111,7 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 		}
 		data, mime, err := downloadURL(ctx, imageURL)
 		if err == nil && len(data) > 0 {
-			mxcURL, encFile, err := intent.UploadMedia(ctx, "", data, "preview", mime)
+			mxcURL, encFile, err := intent.UploadMedia(ctx, roomID, data, "preview", mime)
 			if err == nil {
 				if encFile != nil {
 					preview.ImageEncryption = encFile
@@ -127,8 +155,9 @@ func fetchOGMetadata(ctx context.Context, targetURL string) map[string]string {
 		return result
 	}
 
-	// Read first 50KB — og: meta tags are in <head>
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 50*1024))
+	// Read first 512KB — og: meta tags should be in <head> but some sites
+	// (e.g. CNN) inline hundreds of KB of CSS/JS before their meta tags.
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	if len(data) == 0 {
 		return result
 	}

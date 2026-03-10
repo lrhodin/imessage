@@ -2053,7 +2053,7 @@ func (c *IMClient) addOutboundURLPreview(eventID id.EventID, roomID id.RoomID, b
 		return
 	}
 
-	preview := fetchURLPreview(ctx, c.Main.Bridge, intent, detectedURL)
+	preview := fetchURLPreview(ctx, c.Main.Bridge, intent, roomID, detectedURL)
 
 	editContent := &event.MessageEventContent{
 		MsgType:            msgType,
@@ -3367,7 +3367,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 		}
 		if detectedURL := urlRegex.FindString(row.Text); detectedURL != "" {
 			textContent.BeeperLinkPreviews = []*event.BeeperLinkPreview{
-				fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, detectedURL),
+				fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, "", detectedURL),
 			}
 		}
 		messages = append(messages, &bridgev2.BackfillMessage{
@@ -5573,7 +5573,7 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 				imageMime = "image/jpeg"
 			}
 			log.Debug().Int("image_bytes", len(*rlImage.InlineData)).Str("mime", imageMime).Msg("Uploading rich link preview image")
-			url, encFile, err := intent.UploadMedia(ctx, "", *rlImage.InlineData, "preview", imageMime)
+			url, encFile, err := intent.UploadMedia(ctx, portal.MXID, *rlImage.InlineData, "preview", imageMime)
 			if err == nil {
 				if encFile != nil {
 					preview.ImageEncryption = encFile
@@ -5594,7 +5594,7 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 	// No rich link from iMessage — auto-detect URL and fetch og: metadata + image
 	if detectedURL := urlRegex.FindString(bodyText); detectedURL != "" {
 		log.Debug().Str("detected_url", detectedURL).Msg("No iMessage rich link, fetching URL preview")
-		return []*event.BeeperLinkPreview{fetchURLPreview(ctx, portal.Bridge, intent, detectedURL)}
+		return []*event.BeeperLinkPreview{fetchURLPreview(ctx, portal.Bridge, intent, portal.MXID, detectedURL)}
 	}
 
 	return nil
