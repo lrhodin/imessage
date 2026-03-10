@@ -1948,12 +1948,10 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	log := zerolog.Ctx(ctx)
 	body := content.Body
 
-	// Explicit empty previews means the client disabled URL previews.
-	// Mirrors mautrix-whatsapp and telegramgo behavior.
-	if content.BeeperLinkPreviews != nil && len(content.BeeperLinkPreviews) == 0 {
-		log.Debug().Msg("Client explicitly disabled link previews, sending plain text")
-		return body
-	}
+	// Note: we intentionally do NOT treat empty BeeperLinkPreviews ([]) as
+	// "explicitly disabled." Beeper sends [] when it can't generate a preview
+	// itself (e.g. bare domains like "x.com"), but our bridge has its own
+	// og: scraper that can often succeed. So we fall through to auto-detection.
 
 	// Priority 1: Explicit BeeperLinkPreviews from Matrix
 	if len(content.BeeperLinkPreviews) > 0 {
@@ -2027,11 +2025,12 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 		}
 	}
 
-	// If the outbound message has a URL and the client didn't explicitly manage
-	// preview state, add com.beeper.linkpreviews so Beeper renders it.
-	// nil means the client didn't set previews at all; empty slice means
-	// explicitly disabled (mirrors mautrix-whatsapp / telegramgo semantics).
-	if msg.Content.BeeperLinkPreviews == nil {
+	// If the outbound message has a URL and the client didn't provide previews,
+	// add com.beeper.linkpreviews so Beeper renders it. Fire the double puppet
+	// edit for both nil (field omitted) and empty slice (client couldn't preview)
+	// since the bridge has its own og: scraper that can often succeed where
+	// the client couldn't.
+	if len(msg.Content.BeeperLinkPreviews) == 0 {
 		if detectedURL := urlRegex.FindString(msg.Content.Body); detectedURL != "" && isLikelyURL(detectedURL) {
 			go c.addOutboundURLPreview(msg.Event.ID, msg.Portal.MXID, msg.Content.Body, msg.Content.MsgType, detectedURL)
 		}
