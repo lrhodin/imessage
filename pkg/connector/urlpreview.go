@@ -111,8 +111,34 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 	return preview
 }
 
+// userAgents lists User-Agent strings to try when fetching og: metadata.
+// Some sites (e.g. x.com) only serve og: tags to known crawlers, while
+// others (e.g. Reddit) block bot UAs. We try a browser UA first (works
+// for most sites), then fall back to a bot UA for JS-heavy SPAs.
+var userAgents = []string{
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+	"Googlebot/2.1 (+http://www.google.com/bot.html)",
+}
+
 // fetchOGMetadata fetches a URL and extracts Open Graph meta tags from the HTML.
+// It tries multiple User-Agent strings to handle sites that only serve og: tags
+// to recognized crawlers.
 func fetchOGMetadata(ctx context.Context, targetURL string) map[string]string {
+	log := zerolog.Ctx(ctx)
+
+	for _, ua := range userAgents {
+		result := fetchOGMetadataWithUA(ctx, targetURL, ua)
+		if result["image"] != "" || result["title"] != "" {
+			return result
+		}
+		log.Debug().Str("ua", ua).Str("url", targetURL).Msg("No og: metadata found with this UA, trying next")
+	}
+
+	return make(map[string]string)
+}
+
+// fetchOGMetadataWithUA fetches a URL with a specific User-Agent and extracts og: tags.
+func fetchOGMetadataWithUA(ctx context.Context, targetURL string, ua string) map[string]string {
 	result := make(map[string]string)
 
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -120,7 +146,7 @@ func fetchOGMetadata(ctx context.Context, targetURL string) map[string]string {
 	if err != nil {
 		return result
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	resp, err := client.Do(req)
