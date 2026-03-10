@@ -119,12 +119,16 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 
 // userAgents lists User-Agent strings to try when fetching og: metadata.
 // Some sites (e.g. x.com) only serve og: tags to known crawlers, while
-// others (e.g. Reddit) block bot UAs. We try a browser UA first (works
-// for most sites), then fall back to a bot UA for JS-heavy SPAs.
+// others (e.g. Reddit) block bot UAs. iPhone UA first (best compatibility
+// with bot detection), then Googlebot for JS-heavy SPAs like x.com.
 var userAgents = []string{
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
 	"Googlebot/2.1 (+http://www.google.com/bot.html)",
 }
+
+// titleRegex extracts the <title> tag content as a last-resort fallback
+// when no og: tags are present (e.g. JS-rendered pages like Reddit).
+var titleRegex = regexp.MustCompile(`(?i)<title[^>]*>([^<]+)</title>`)
 
 // fetchOGMetadata fetches a URL and extracts Open Graph meta tags from the HTML.
 // It tries multiple User-Agent strings to handle sites that only serve og: tags
@@ -209,6 +213,16 @@ func fetchOGMetadataWithUA(ctx context.Context, targetURL string, ua string) map
 		prop = strings.ToLower(prop)
 		if _, exists := result[prop]; !exists {
 			result[prop] = html.UnescapeString(content)
+		}
+	}
+
+	// Fall back to <title> tag if no og:title was found
+	if result["title"] == "" {
+		if m := titleRegex.FindStringSubmatch(htmlStr); m != nil {
+			title := strings.TrimSpace(html.UnescapeString(m[1]))
+			if title != "" {
+				result["title"] = title
+			}
 		}
 	}
 
