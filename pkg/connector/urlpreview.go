@@ -1,7 +1,9 @@
 package connector
 
 import (
+	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"html"
 	"io"
@@ -141,19 +143,32 @@ func fetchOGMetadata(ctx context.Context, targetURL string) map[string]string {
 	return make(map[string]string)
 }
 
+// ogHTTPClient uses TLS 1.3 to avoid bot detection via TLS fingerprinting.
+// Sites like Reddit reject Go's default TLS 1.2 handshake with HTTP 403.
+var ogHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS13,
+			MaxVersion: tls.VersionTLS13,
+		},
+	},
+}
+
 // fetchOGMetadataWithUA fetches a URL with a specific User-Agent and extracts og: tags.
 func fetchOGMetadataWithUA(ctx context.Context, targetURL string, ua string) map[string]string {
 	result := make(map[string]string)
 
-	client := &http.Client{Timeout: 5 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return result
 	}
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	resp, err := client.Do(req)
+	resp, err := ogHTTPClient.Do(req)
 	if err != nil {
 		return result
 	}
@@ -163,9 +178,20 @@ func fetchOGMetadataWithUA(ctx context.Context, targetURL string, ua string) map
 		return result
 	}
 
+	// Handle gzip-compressed responses
+	var reader io.Reader = resp.Body
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		gr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return result
+		}
+		defer gr.Close()
+		reader = gr
+	}
+
 	// Read first 512KB — og: meta tags should be in <head> but some sites
 	// (e.g. CNN) inline hundreds of KB of CSS/JS before their meta tags.
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	data, _ := io.ReadAll(io.LimitReader(reader, 512*1024))
 	if len(data) == 0 {
 		return result
 	}
@@ -190,15 +216,15 @@ func fetchOGMetadataWithUA(ctx context.Context, targetURL string, ua string) map
 }
 
 // downloadURL fetches a URL and returns the body bytes and content type.
+// Uses the shared TLS 1.3 client to avoid bot detection.
 func downloadURL(ctx context.Context, targetURL string) ([]byte, string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return nil, "", err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
-	resp, err := client.Do(req)
+	resp, err := ogHTTPClient.Do(req)
 	if err != nil {
 		return nil, "", err
 	}
