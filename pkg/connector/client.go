@@ -1970,11 +1970,12 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 		return "\x00RL\x01" + lp.MatchedURL + "\x01" + canonical + "\x01" + lp.Title + "\x01" + lp.Description + "\x00" + body
 	}
 
-	// Priority 2: Auto-detect URL and fetch preview from homeserver
+	// Priority 2: Auto-detect URL and fetch preview via homeserver or og: scraping
 	if detectedURL := urlRegex.FindString(body); detectedURL != "" && isLikelyURL(detectedURL) {
 		fetchURL := normalizeURL(detectedURL)
 		log.Debug().Str("detected_url", detectedURL).Msg("Auto-detected URL in outbound message, fetching preview")
 		title, desc := "", ""
+		// Try homeserver preview first
 		if mc, ok := c.Main.Bridge.Matrix.(bridgev2.MatrixConnectorWithURLPreviews); ok {
 			if lp, err := mc.GetURLPreview(ctx, fetchURL); err == nil && lp != nil {
 				title = lp.Title
@@ -1982,6 +1983,15 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from homeserver for outbound")
 			} else if err != nil {
 				log.Debug().Err(err).Msg("Failed to fetch URL preview from homeserver for outbound")
+			}
+		}
+		// Fall back to our own og: scraping if homeserver didn't provide metadata
+		if title == "" && desc == "" {
+			ogData := fetchOGMetadata(ctx, fetchURL)
+			title = ogData["title"]
+			desc = ogData["description"]
+			if title != "" || desc != "" {
+				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from og: scraping for outbound")
 			}
 		}
 		return "\x00RL\x01" + detectedURL + "\x01" + fetchURL + "\x01" + title + "\x01" + desc + "\x00" + body
