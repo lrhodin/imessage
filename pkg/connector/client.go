@@ -1985,7 +1985,7 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 		}
 		// Fall back to our own og: scraping if homeserver didn't provide metadata
 		if title == "" && desc == "" {
-			ogData := fetchOGMetadata(ctx, fetchURL)
+			ogData := fetchPageMetadata(ctx, fetchURL)
 			title = ogData["title"]
 			desc = ogData["description"]
 			if title != "" || desc != "" {
