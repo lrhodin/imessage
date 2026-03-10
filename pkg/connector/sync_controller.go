@@ -1279,11 +1279,26 @@ func (c *IMClient) resolveConversationID(ctx context.Context, msg rustpushgo.Wra
 		parts := strings.Split(msg.CloudChatId, ";")
 		if len(parts) == 3 {
 			normalized := normalizeIdentifierForPortalID(parts[2])
-			if normalized != "" {
+			// Only use parts[2] as recipient if it's a real phone/email.
+			// CloudKit uses "chat<numeric>" identifiers for self-chat, which
+			// normalizeIdentifierForPortalID returns unchanged (no tel:/mailto:
+			// prefix). Using those raw creates junk portals.
+			if normalized != "" && (strings.HasPrefix(normalized, "tel:") || strings.HasPrefix(normalized, "mailto:")) {
 				resolved := c.resolveContactPortalID(normalized)
 				resolved = c.resolveExistingDMPortalID(string(resolved))
 				return string(resolved)
 			}
+		}
+	}
+
+	// Self-chat fallback: is_from_me messages where the recipient couldn't be
+	// determined. CloudKit uses unique "chat<numeric>" identifiers for self-chat
+	// instead of the user's phone number, so the handler above can't extract a
+	// valid recipient. Route to the user's own handle (Notes to Self portal).
+	if msg.IsFromMe {
+		normalized := normalizeIdentifierForPortalID(c.handle)
+		if normalized != "" {
+			return normalized
 		}
 	}
 
