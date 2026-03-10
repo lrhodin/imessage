@@ -119,10 +119,14 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 
 // userAgents lists User-Agent strings to try when fetching og: metadata.
 // Some sites (e.g. x.com) only serve og: tags to known crawlers, while
-// others (e.g. Reddit) block bot UAs. iPhone UA first (best compatibility
-// with bot detection), then Googlebot for JS-heavy SPAs like x.com.
+// others (e.g. Reddit) block bot UAs. We try multiple UA families to
+// maximize compatibility:
+//   1. iPhone Safari — best for bot detection, most sites accept mobile
+//   2. Firefox/Gecko — covers sites that block WebKit specifically
+//   3. Googlebot — for JS-heavy SPAs like x.com that gate og: behind crawlers
 var userAgents = []string{
 	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+	"Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0",
 	"Googlebot/2.1 (+http://www.google.com/bot.html)",
 }
 
