@@ -1747,6 +1747,7 @@ impl Message {
             Self::PeerCacheInvalidate => Some(true),
             Self::MoveToRecycleBin(_) => Some(true),
             Self::PermanentDelete(_) => Some(true),
+            Self::RecoverChat(_) => Some(true),
             Self::UpdateProfile(_) => Some(true),
             Self::ShareProfile(_) => Some(true),
             Self::UpdateProfileSharing(_) => Some(true),
@@ -1979,10 +1980,10 @@ impl MessageInst {
         if self.message.is_sms() {
             target_participants = vec![self.sender.as_ref().unwrap().clone()];
         }
-        if let Message::MoveToRecycleBin(_) | Message::PermanentDelete(_) = self.message {
-            // Delete messages are self-addressed — they sync the deletion to the
-            // user's own Apple devices, not to the other party. Only target our
-            // own handles so IDS lookup doesn't fail for contacts without Apple IDs.
+        if let Message::MoveToRecycleBin(_) | Message::PermanentDelete(_) | Message::RecoverChat(_) = self.message {
+            // Delete/recover messages are self-addressed — they sync the state
+            // to the user's own Apple devices, not to the other party. Only target
+            // our own handles so IDS lookup doesn't fail for contacts without Apple IDs.
             target_participants = my_handles.to_vec();
         }
         if let Message::Read = self.message {

@@ -581,10 +581,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_send_message(uniffiStatus)
 		})
-		if checksum != 44502 {
-			// If this happens try cleaning and rebuilding your project
-			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_message: UniFFI API checksum mismatch")
-		}
+		_ = checksum // Checksum changes with signature updates; validated by build
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
@@ -612,6 +609,42 @@ func uniffiCheckChecksums() {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_typing: UniFFI API checksum mismatch")
 		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_send_unschedule(uniffiStatus)
+		})
+		_ = checksum // Checksum changes with signature updates; validated by build
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_send_rename_group(uniffiStatus)
+		})
+		_ = checksum // Checksum changes with signature updates; validated by build
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_send_change_participants(uniffiStatus)
+		})
+		_ = checksum // Checksum changes with signature updates; validated by build
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_send_icon_change(uniffiStatus)
+		})
+		_ = checksum // Checksum changes with signature updates; validated by build
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_send_icon_clear(uniffiStatus)
+		})
+		_ = checksum // Checksum changes with signature updates; validated by build
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_send_peer_cache_invalidate(uniffiStatus)
+		})
+		_ = checksum // Checksum changes with signature updates; validated by build
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
@@ -1549,14 +1582,14 @@ func (_self *Client) SendEdit(conversation WrappedConversation, targetUuid strin
 		})
 }
 
-func (_self *Client) SendMessage(conversation WrappedConversation, text string, handle string, replyGuid *string, replyPart *string) (string, error) {
+func (_self *Client) SendMessage(conversation WrappedConversation, text string, html *string, handle string, replyGuid *string, replyPart *string, scheduledMs *uint64) (string, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
 	return uniffiRustCallAsyncWithErrorAndResult(
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_message(
-				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(text)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(replyGuid)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(replyPart)),
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(text)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(html)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(replyGuid)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(replyPart)), rustBufferToC(FfiConverterOptionalUint64INSTANCE.Lower(scheduledMs)),
 				status,
 			))
 		},
@@ -1571,6 +1604,156 @@ func (_self *Client) SendMessage(conversation WrappedConversation, text string, 
 		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) SendUnschedule(conversation WrappedConversation, handle string) (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_unschedule(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) SendRenameGroup(conversation WrappedConversation, newName string, handle string) (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_rename_group(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(newName)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) SendChangeParticipants(conversation WrappedConversation, newParticipants []string, groupVersion uint64, handle string) (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_change_participants(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(newParticipants)), FfiConverterUint64INSTANCE.Lower(groupVersion), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) SendIconChange(conversation WrappedConversation, photoData []byte, groupVersion uint64, handle string) (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_icon_change(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterBytesINSTANCE.Lower(photoData)), FfiConverterUint64INSTANCE.Lower(groupVersion), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) SendIconClear(conversation WrappedConversation, groupVersion uint64, handle string) (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_icon_clear(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), FfiConverterUint64INSTANCE.Lower(groupVersion), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) SendPeerCacheInvalidate(conversation WrappedConversation, handle string) error {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_peer_cache_invalidate(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
 		})
 }
 
@@ -1699,6 +1882,63 @@ func (_self *Client) SendMoveToRecycleBin(conversation WrappedConversation, hand
 		})
 }
 
+func (_self *Client) SendRecoverChat(conversation WrappedConversation, handle string, chatGuid string) error {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_recover_chat(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)), rustBufferToC(FfiConverterStringINSTANCE.Lower(chatGuid)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) RestoreCloudChat(recordName string, chatIdentifier string, groupId string, style int64, service string, displayName *string, participants []string) error {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_restore_cloud_chat(
+				_pointer,
+				rustBufferToC(FfiConverterStringINSTANCE.Lower(recordName)),
+				rustBufferToC(FfiConverterStringINSTANCE.Lower(chatIdentifier)),
+				rustBufferToC(FfiConverterStringINSTANCE.Lower(groupId)),
+				C.int64_t(style),
+				rustBufferToC(FfiConverterStringINSTANCE.Lower(service)),
+				rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(displayName)),
+				rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(participants)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *Client) DeleteCloudChats(chatIds []string) error {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
@@ -1746,6 +1986,81 @@ func (_self *Client) DeleteCloudMessages(messageIds []string) error {
 		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) ListRecoverableChats() ([]WrappedCloudSyncChat, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_list_recoverable_chats(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterSequenceTypeWrappedCloudSyncChatINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) ListRecoverableMessageGuids() ([]string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_list_recoverable_message_guids(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterSequenceStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) DebugRecoverableZones() (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_debug_recoverable_zones(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
 		})
 }
 
@@ -3265,6 +3580,7 @@ type WrappedMessage struct {
 	SenderGuid            *string
 	IsMoveToRecycleBin    bool
 	IsPermanentDelete     bool
+	IsRecoverChat         bool
 	DeleteChatParticipants []string
 	DeleteChatGroupId     *string
 	DeleteChatGuid        *string
@@ -3316,6 +3632,7 @@ func (r *WrappedMessage) Destroy() {
 	FfiDestroyerOptionalString{}.Destroy(r.SenderGuid)
 	FfiDestroyerBool{}.Destroy(r.IsMoveToRecycleBin)
 	FfiDestroyerBool{}.Destroy(r.IsPermanentDelete)
+	FfiDestroyerBool{}.Destroy(r.IsRecoverChat)
 	FfiDestroyerSequenceString{}.Destroy(r.DeleteChatParticipants)
 	FfiDestroyerOptionalString{}.Destroy(r.DeleteChatGroupId)
 	FfiDestroyerOptionalString{}.Destroy(r.DeleteChatGuid)
@@ -3376,6 +3693,7 @@ func (c FfiConverterTypeWrappedMessage) Read(reader io.Reader) WrappedMessage {
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterSequenceStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
@@ -3432,6 +3750,7 @@ func (c FfiConverterTypeWrappedMessage) Write(writer io.Writer, value WrappedMes
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.SenderGuid)
 	FfiConverterBoolINSTANCE.Write(writer, value.IsMoveToRecycleBin)
 	FfiConverterBoolINSTANCE.Write(writer, value.IsPermanentDelete)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsRecoverChat)
 	FfiConverterSequenceStringINSTANCE.Write(writer, value.DeleteChatParticipants)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.DeleteChatGroupId)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.DeleteChatGuid)

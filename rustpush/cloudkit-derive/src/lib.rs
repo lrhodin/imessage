@@ -139,7 +139,7 @@ pub fn cloudkitrecord_derive(input: TokenStream) -> TokenStream {
                 for data in value {
                     match data.identifier.as_ref().unwrap().name.as_ref().unwrap().as_str() {
                         #(#read_fields)*
-                        _unk => info!("Unknown field {}", _unk),
+                        _unk => log::debug!("Unknown field {}", _unk),
                     }
                 }
 

@@ -183,9 +183,59 @@ void* uniffi_rustpushgo_fn_method_client_send_message(
 	void* ptr,
 	RustBuffer conversation,
 	RustBuffer text,
+	RustBuffer html,
 	RustBuffer handle,
 	RustBuffer reply_guid,
 	RustBuffer reply_part,
+	RustBuffer scheduled_ms,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_unschedule(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_rename_group(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer new_name,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_change_participants(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer new_participants,
+	uint64_t group_version,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_icon_change(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer photo_data,
+	uint64_t group_version,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_icon_clear(
+	void* ptr,
+	RustBuffer conversation,
+	uint64_t group_version,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_peer_cache_invalidate(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer handle,
 	RustCallStatus* out_status
 );
 
@@ -234,6 +284,26 @@ void* uniffi_rustpushgo_fn_method_client_send_move_to_recycle_bin(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_recover_chat(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer handle,
+	RustBuffer chat_guid,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_restore_cloud_chat(
+	void* ptr,
+	RustBuffer record_name,
+	RustBuffer chat_identifier,
+	RustBuffer group_id,
+	int64_t style,
+	RustBuffer service,
+	RustBuffer display_name,
+	RustBuffer participants,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_delete_cloud_chats(
 	void* ptr,
 	RustBuffer chat_ids,
@@ -243,6 +313,21 @@ void* uniffi_rustpushgo_fn_method_client_delete_cloud_chats(
 void* uniffi_rustpushgo_fn_method_client_delete_cloud_messages(
 	void* ptr,
 	RustBuffer message_ids,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_debug_recoverable_zones(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_list_recoverable_message_guids(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_list_recoverable_chats(
+	void* ptr,
 	RustCallStatus* out_status
 );
 
@@ -903,6 +988,30 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_typing(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_send_unschedule(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_rename_group(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_change_participants(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_icon_change(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_icon_clear(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_peer_cache_invalidate(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_send_unsend(
 	RustCallStatus* out_status
 );
@@ -911,11 +1020,23 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_move_to_recycle_bin(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_send_recover_chat(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_restore_cloud_chat(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_delete_cloud_chats(
 	RustCallStatus* out_status
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_delete_cloud_messages(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_list_recoverable_chats(
 	RustCallStatus* out_status
 );
 
