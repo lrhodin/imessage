@@ -1218,6 +1218,20 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 }
 
 func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	// Skip stored (buffered) tapbacks — CloudKit backfill handles those via
+	// BackfillReaction at the correct historical position. Processing them here
+	// as live events gives them current server time, placing them at the end of
+	// the room timeline and making Beeper show a stale reaction as the room
+	// preview instead of the most recent message.
+	// Same pattern as handleRename and handleParticipantChange.
+	// Regression introduced by PR #20 (lwittwer/pr/tapback-edit-dedup, 693d353):
+	// that commit added IsStoredMessage guards to handleEdit but omitted them
+	// for handleTapback, leaving stored tapbacks to fire as live events.
+	if msg.IsStoredMessage {
+		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored tapback")
+		return
+	}
+
 	// Deduplicate: skip tapbacks already processed (e.g. via CloudKit backfill)
 	// to prevent duplicate reactions and notifications from stale APNs re-delivery.
 	// Uses the same cloud_message UUID table as handleMessage (primary key lookup).
