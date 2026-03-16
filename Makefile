@@ -14,11 +14,12 @@ RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' 2>/dev/null)
 #   make RUSTPUSH_DIR=rustpush-master build
 RUSTPUSH_DIR ?= third_party/rustpush-upstream
 # rustpush source strategy:
-#   upstream (default): clone OpenBubbles and apply local compatibility patches
-#   fork: fresh-sync from your fork branch/ref
-RUSTPUSH_SOURCE ?= upstream
+#   fork (default): clone cameronaaron/rustpush which has all bridge-compat
+#                   fixes already applied — no runtime patching needed.
+#   upstream:       clone raw OpenBubbles/rustpush (no patches; for testing only).
+RUSTPUSH_SOURCE ?= fork
 RUSTPUSH_FORK_URL ?= https://github.com/cameronaaron/rustpush.git
-RUSTPUSH_FORK_REF ?= master
+RUSTPUSH_FORK_REF ?= imessage-bridge-compat
 RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(RUSTPUSH_DIR)/apple-private-apis $(RUSTPUSH_DIR)/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(RUSTPUSH_DIR)/open-absinthe/build.rs)
 CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
 GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
@@ -106,8 +107,6 @@ else
 endif
 
 UPSTREAM_REPO := https://github.com/OpenBubbles/rustpush.git
-PATCH_DIR     := patches/rustpush-upstream
-FALLBACK_RUSTPUSH_DIR := rustpush
 FAIRPLAY_CERTS := 4056631661436364584235346952193 \
                   4056631661436364584235346952194 \
                   4056631661436364584235346952195 \
@@ -182,23 +181,6 @@ ensure-rustpush-source:
 				   third_party/rustpush-upstream/certs/fairplay/$$name.crt; \
 				cp third_party/rustpush-upstream/certs/legacy-fairplay/fairplay.pem \
 				   third_party/rustpush-upstream/certs/fairplay/$$name.pem; \
-			done; \
-		fi; \
-		if [ "$(RUSTPUSH_SOURCE)" != "fork" ]; then \
-			echo "Applying upstream compatibility overlays..."; \
-			for patch in rustpush-core.patch icloud-auth.patch; do \
-				case $$patch in \
-					icloud-auth.patch) repo_dir=third_party/rustpush-upstream/apple-private-apis/icloud-auth ;; \
-					*) repo_dir=third_party/rustpush-upstream ;; \
-				esac; \
-				if git -C $$repo_dir apply --check $(CURDIR)/$(PATCH_DIR)/$$patch >/dev/null 2>&1; then \
-					git -C $$repo_dir apply $(CURDIR)/$(PATCH_DIR)/$$patch; \
-					echo "  applied $$patch"; \
-				elif git -C $$repo_dir apply --reverse --check $(CURDIR)/$(PATCH_DIR)/$$patch >/dev/null 2>&1; then \
-					echo "  already applied $$patch"; \
-				else \
-					echo "  skipped $$patch (local upstream checkout has custom edits)"; \
-				fi; \
 			done; \
 		fi; \
 	fi
