@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use plist::{Dictionary, Value};
 use uuid::Uuid;
 
-use rustpush::{activation::ActivationInfo, APSState, DebugMeta, LoginClientInfo, OSConfig, PushError, RegisterMeta};
+use rustpush::{ActivationInfo, APSState, DebugMeta, LoginClientInfo, OSConfig, PushError, RegisterMeta};
 
 // FFI for hardware_info.m
 #[repr(C)]

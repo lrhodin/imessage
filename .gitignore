@@ -20,6 +20,12 @@
 /extract-key-intel
 /start
 /data/
+/bbctl
+
+# Local external worktrees / generated app workspace
+/third_party/rustpush-upstream/
+/openbubbles-app-rustpush/
+/rustpush-master/
 
 # Rust build artifacts
 librustpushgo.a

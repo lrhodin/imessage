@@ -19,8 +19,8 @@ tokio = { version = "1", features = ["full"] }
 uniffi = { version = "0.25.0", features = ["tokio"] }
 pretty_env_logger = "0.5.0"
 log = "0.4.20"
-rustpush = { path = "../../rustpush", default-features = false }
-keystore = { path = "../../rustpush/keystore" }
+rustpush = { path = "../../third_party/rustpush-upstream", default-features = false }
+keystore = { path = "../../third_party/rustpush-upstream/keystore" }
 plist = "1.7.0"
 serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1.4.1", features = ["v4"] }
@@ -32,13 +32,13 @@ serde_json = "1.0"
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-icloud_auth = { path = "../../rustpush/apple-private-apis/icloud-auth", default-features = false }
-omnisette = { path = "../../rustpush/apple-private-apis/omnisette", default-features = false }
+icloud_auth = { path = "../../third_party/rustpush-upstream/apple-private-apis/icloud-auth", default-features = false }
+omnisette = { path = "../../third_party/rustpush-upstream/apple-private-apis/omnisette", default-features = false }
 nac-validation = { path = "../../nac-validation" }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-icloud_auth = { path = "../../rustpush/apple-private-apis/icloud-auth", default-features = false, features = ["remote-anisette-v3"] }
-omnisette = { path = "../../rustpush/apple-private-apis/omnisette", default-features = false, features = ["remote-anisette-v3"] }
+icloud_auth = { path = "../../third_party/rustpush-upstream/apple-private-apis/icloud-auth", default-features = false, features = ["remote-anisette-v3"] }
+omnisette = { path = "../../third_party/rustpush-upstream/apple-private-apis/omnisette", default-features = false, features = ["remote-anisette-v3"] }
 
 [build-dependencies]
 uniffi = { version = "0.25.0", features = ["build"] }

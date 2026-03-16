@@ -7,7 +7,7 @@ mod test_hwinfo;
 use std::{collections::HashMap, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::Duration, sync::atomic::{AtomicU64, Ordering}};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use icloud_auth::{AppleAccount, FetchedToken};
+use icloud_auth::AppleAccount;
 use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
 use log::{debug, error, info, warn};
 use rustpush::{
@@ -16,14 +16,15 @@ use rustpush::{
     IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message,
     MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
     OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
-    ChangeParticipantMessage, IconChangeMessage, UnsendMessage,
+    ChangeParticipantMessage, IconChangeMessage, UnsendMessage, TypingApp,
     IndexedMessagePart, LinkMeta, LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL,
     TextFlags, TextFormat, TextEffect,
-    ShareProfileMessage, SharedPoster,
+    ShareProfileMessage, SharedPoster, PartExtension, UpdateExtensionMessage, UpdateProfileMessage,
+    UpdateProfileSharingMessage, SetTranscriptBackgroundMessage,
     TokenProvider, MobileMeDelegateResponse,
     ScheduleMode,
     cloudkit::{ZoneDeleteOperation, CloudKitSession},
-    util::{base64_decode, encode_hex, ResourceState},
+    base64_decode, encode_hex, ResourceState,
 };
 use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
 use omnisette::default_provider;
@@ -61,11 +62,11 @@ pub struct WrappedAPSConnection {
     pub inner: rustpush::APSConnection,
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl WrappedAPSConnection {
-    pub fn state(&self) -> Arc<WrappedAPSState> {
+    pub async fn state(&self) -> Arc<WrappedAPSState> {
         Arc::new(WrappedAPSState {
-            inner: Some(self.inner.state.blocking_read().clone()),
+            inner: Some(self.inner.state.read().await.clone()),
         })
     }
 }
@@ -449,7 +450,7 @@ async fn create_keychain_clients(
     let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
         .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
     let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
-        state: tokio::sync::RwLock::new(cloudkit_state),
+            state: rustpush::DebugRwLock::new(cloudkit_state),
         anisette: anisette.clone(),
         config: os_config.clone(),
         token_provider: token_provider.clone(),
@@ -479,7 +480,7 @@ async fn create_keychain_clients(
     let keychain = Arc::new(rustpush::keychain::KeychainClient {
         anisette: anisette.clone(),
         token_provider: token_provider.clone(),
-        state: tokio::sync::RwLock::new(keychain_state.expect("keychain state missing")),
+            state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
         config: os_config.clone(),
         update_state: Box::new(move |state| {
             if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
@@ -788,7 +789,7 @@ pub async fn restore_token_provider(
     account.username = Some(username);
 
     // Restore hashed password
-    let hashed_password = rustpush::util::decode_hex(&hashed_password_hex)
+    let hashed_password = rustpush::decode_hex(&hashed_password_hex)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hashed_password hex: {}", e) })?;
     account.hashed_password = Some(hashed_password);
 
@@ -802,12 +803,12 @@ pub async fn restore_token_provider(
     // This forces get_token() to call login_email_pass() on first use,
     // which will obtain a fresh PET via SRP (no 2FA needed if the machine
     // is trusted via consistent anisette state).
-    account.tokens.insert("com.apple.gs.idms.pet".to_string(), icloud_auth::FetchedToken {
-        token: pet,
-        expiration: std::time::UNIX_EPOCH, // expired — forces auto-refresh on first use
-    });
+    account.tokens.insert(
+        "com.apple.gs.idms.pet".to_string(),
+        icloud_auth::FetchedToken::new(pet, std::time::UNIX_EPOCH), // expired — forces auto-refresh on first use
+    );
 
-    let account = Arc::new(tokio::sync::Mutex::new(account));
+    let account = Arc::new(rustpush::DebugMutex::new(account));
     let token_provider = TokenProvider::new(account, os_config);
 
     info!("Restored TokenProvider from persisted credentials");
@@ -866,6 +867,8 @@ pub struct WrappedMessage {
 
     // Typing
     pub is_typing: bool,
+    pub typing_app_bundle_id: Option<String>,
+    pub typing_app_icon: Option<Vec<u8>>,
 
     // Read receipt
     pub is_read_receipt: bool,
@@ -950,12 +953,24 @@ pub struct WrappedMessage {
 
     // Profile sharing state sync update.
     pub is_update_profile_sharing: bool,
+    pub update_profile_sharing_dismissed: Vec<String>,
+    pub update_profile_sharing_all: Vec<String>,
+    pub update_profile_sharing_version: Option<u64>,
+
+    // Profile update (share profile card and/or sharing preference).
+    pub is_update_profile: bool,
+    pub update_profile_share_contacts: Option<bool>,
 
     // "Notify anyway" control message.
     pub is_notify_anyways: bool,
 
     // Transcript background (conversation wallpaper) update.
     pub is_set_transcript_background: bool,
+    pub transcript_background_remove: Option<bool>,
+    pub transcript_background_chat_id: Option<String>,
+    pub transcript_background_object_id: Option<String>,
+    pub transcript_background_url: Option<String>,
+    pub transcript_background_file_size: Option<u64>,
 
     // Sticker data for sticker tapback reactions (tapback_type=7).
     pub sticker_data: Option<Vec<u8>>,
@@ -978,6 +993,66 @@ pub struct WrappedAttachment {
     pub inline_data: Option<Vec<u8>>,
     /// True for Live Photo attachments (Apple's "iris" flag).
     pub iris: bool,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedStickerExtension {
+    pub msg_width: f64,
+    pub rotation: f64,
+    pub sai: u64,
+    pub scale: f64,
+    pub sli: u64,
+    pub normalized_x: f64,
+    pub normalized_y: f64,
+    pub version: u64,
+    pub hash: String,
+    pub safi: u64,
+    pub effect_type: i64,
+    pub sticker_id: String,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedShareProfileData {
+    pub cloud_kit_record_key: String,
+    pub cloud_kit_decryption_record_key: Vec<u8>,
+    pub low_res_wallpaper_tag: Option<Vec<u8>>,
+    pub wallpaper_tag: Option<Vec<u8>>,
+    pub message_tag: Option<Vec<u8>>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedAPSChannelIdentifier {
+    pub topic: String,
+    pub id: Vec<u8>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedStatusKitInviteHandle {
+    pub handle: String,
+    pub allowed_modes: Vec<String>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedPasswordEntryRef {
+    pub id: String,
+    pub group: Option<String>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedPasswordSiteCounts {
+    pub website_meta_count: u64,
+    pub password_count: u64,
+    pub password_meta_count: u64,
+    pub passkey_count: u64,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedLetMeInRequest {
+    pub delegation_uuid: String,
+    pub pseud: String,
+    pub requestor: String,
+    pub nickname: Option<String>,
+    pub usage: Option<String>,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -1233,7 +1308,7 @@ impl std::io::Write for SharedWriter {
 /// The attributedBody is an NSAttributedString containing ranges with
 /// __kIMFileTransferGUIDAttributeName → attachment GUID.
 fn extract_attachment_guids_from_attributed_body(data: &[u8]) -> Vec<String> {
-    use rustpush::util::{coder_decode_flattened, NSAttributedString, StCollapsedValue};
+    use rustpush::{coder_decode_flattened, NSAttributedString, StCollapsedValue};
 
     let decoded = match std::panic::catch_unwind(|| {
         let flat = coder_decode_flattened(data);
@@ -1550,6 +1625,8 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         reply_guid: None,
         reply_part: None,
         is_typing: false,
+        typing_app_bundle_id: None,
+        typing_app_icon: None,
         is_read_receipt: false,
         is_delivered: false,
         is_error: false,
@@ -1582,8 +1659,18 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         is_update_extension: false,
         update_extension_for_uuid: None,
         is_update_profile_sharing: false,
+        update_profile_sharing_dismissed: vec![],
+        update_profile_sharing_all: vec![],
+        update_profile_sharing_version: None,
+        is_update_profile: false,
+        update_profile_share_contacts: None,
         is_notify_anyways: false,
         is_set_transcript_background: false,
+        transcript_background_remove: None,
+        transcript_background_chat_id: None,
+        transcript_background_object_id: None,
+        transcript_background_url: None,
+        transcript_background_file_size: None,
         sticker_data: None,
         sticker_mime: None,
         is_share_profile: false,
@@ -1620,7 +1707,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
 
             // Encode rich link as special attachments for the Go side
             if let Some(ref lm) = normal.link_meta {
-                let original_url: String = lm.data.original_url.clone().into();
+                let original_url: String = lm.data.original_url.clone().map(|u| u.into()).unwrap_or_default();
                 let url: String = lm.data.url.clone().map(|u| u.into()).unwrap_or_default();
                 let title = lm.data.title.clone().unwrap_or_default();
                 let summary = lm.data.summary.clone().unwrap_or_default();
@@ -1736,8 +1823,12 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.is_participant_change = true;
             w.new_participants = change.new_participants.clone();
         }
-        Message::Typing(typing, _) => {
+        Message::Typing(typing, app) => {
             w.is_typing = *typing;
+            if let Some(app) = app {
+                w.typing_app_bundle_id = Some(app.bundle_id.clone());
+                w.typing_app_icon = Some(app.icon.clone());
+            }
         }
         Message::Read => {
             w.is_read_receipt = true;
@@ -1791,14 +1882,8 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.is_update_extension = true;
             w.update_extension_for_uuid = Some(update.for_uuid.clone());
         }
-        Message::UpdateProfileSharing(_) => {
-            w.is_update_profile_sharing = true;
-        }
         Message::NotifyAnyways => {
             w.is_notify_anyways = true;
-        }
-        Message::SetTranscriptBackground(_) => {
-            w.is_set_transcript_background = true;
         }
         Message::ShareProfile(profile) => {
             w.is_share_profile = true;
@@ -1807,11 +1892,35 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.share_profile_has_poster = profile.poster.is_some();
         }
         Message::UpdateProfile(update) => {
+            w.is_update_profile = true;
+            w.update_profile_share_contacts = Some(update.share_contacts);
             if let Some(profile) = &update.profile {
                 w.is_share_profile = true;
                 w.share_profile_record_key = Some(profile.cloud_kit_record_key.clone());
                 w.share_profile_decryption_key = Some(profile.cloud_kit_decryption_record_key.clone());
                 w.share_profile_has_poster = profile.poster.is_some();
+            }
+        }
+        Message::UpdateProfileSharing(update) => {
+            w.is_update_profile_sharing = true;
+            w.update_profile_sharing_dismissed = update.shared_dismissed.clone();
+            w.update_profile_sharing_all = update.shared_all.clone();
+            w.update_profile_sharing_version = Some(update.version);
+        }
+        Message::SetTranscriptBackground(update) => {
+            w.is_set_transcript_background = true;
+            match update {
+                SetTranscriptBackgroundMessage::Remove { chat_id, remove, .. } => {
+                    w.transcript_background_remove = Some(*remove);
+                    w.transcript_background_chat_id = chat_id.clone();
+                }
+                SetTranscriptBackgroundMessage::Set { chat_id, object_id, url, file_size, .. } => {
+                    w.transcript_background_remove = Some(false);
+                    w.transcript_background_chat_id = chat_id.clone();
+                    w.transcript_background_object_id = Some(object_id.clone());
+                    w.transcript_background_url = Some(url.clone());
+                    w.transcript_background_file_size = Some(*file_size as u64);
+                }
             }
         }
         _ => {}
@@ -1912,6 +2021,41 @@ fn resolve_xdg_data_dir() -> String {
     // Last resort — fall back to old relative path
     warn!("Could not determine HOME or XDG_DATA_HOME, using local state directory");
     "state".to_string()
+}
+
+fn subsystem_state_path(file_name: &str) -> String {
+    let xdg_dir = resolve_xdg_data_dir();
+    let _ = std::fs::create_dir_all(&xdg_dir);
+    format!("{}/{}", xdg_dir, file_name)
+}
+
+fn read_plist_state<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
+    match std::fs::read(path) {
+        Ok(data) => match plist::from_bytes(&data) {
+            Ok(state) => Some(state),
+            Err(err) => {
+                warn!("Failed to parse state at {}: {}", path, err);
+                None
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            warn!("Failed to read state at {}: {}", path, err);
+            None
+        }
+    }
+}
+
+fn persist_plist_state<T: serde::Serialize>(path: &str, state: &T) {
+    if let Err(err) = plist::to_file_xml(path, state) {
+        warn!("Failed to persist state to {}: {}", path, err);
+    }
+}
+
+fn serialize_state_json<T: serde::Serialize>(state: &T) -> Result<String, WrappedError> {
+    serde_json::to_string(state).map_err(|err| WrappedError::GenericError {
+        msg: format!("Failed to serialize state: {}", err),
+    })
 }
 
 /// Create a local macOS config that reads hardware info from IOKit
@@ -2245,7 +2389,7 @@ impl LoginSession {
         let mut spd_bytes = Vec::new();
         plist::to_writer_binary(&mut spd_bytes, spd)
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize SPD: {}", e) })?;
-        let spd_base64 = rustpush::util::base64_encode(&spd_bytes);
+        let spd_base64 = rustpush::base64_encode(&spd_bytes);
 
         let account_persist = AccountPersistData {
             username: self.username.clone(),
@@ -2333,7 +2477,7 @@ impl LoginSession {
         // so the first get_mme_token() doesn't need to re-fetch.
         let owned_account = guard.take()
             .ok_or(WrappedError::GenericError { msg: "Account already consumed".to_string() })?;
-        let account_arc = Arc::new(tokio::sync::Mutex::new(owned_account));
+        let account_arc = Arc::new(rustpush::DebugMutex::new(owned_account));
         let token_provider = TokenProvider::new(account_arc, os_config.clone());
 
         // Seed the MobileMe delegate so get_contacts_url() and get_mme_token()
@@ -2430,13 +2574,519 @@ async fn download_icon_change_photo(
 // ============================================================================
 
 #[derive(uniffi::Object)]
+pub struct WrappedFindMyClient {
+    inner: Arc<rustpush::findmy::FindMyClient<omnisette::DefaultAnisetteProvider>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedFindMyClient {
+    pub async fn export_state_json(&self) -> Result<String, WrappedError> {
+        let state = self.inner.state.state.lock().await;
+        serialize_state_json(&*state)
+    }
+
+    pub async fn export_state_bytes(&self) -> Result<Vec<u8>, WrappedError> {
+        let state = self.inner.state.state.lock().await;
+        Ok(state.encode()?)
+    }
+
+    pub async fn sync_items(&self, fetch_shares: bool) -> Result<(), WrappedError> {
+        self.inner.sync_items(fetch_shares).await?;
+        Ok(())
+    }
+
+    pub async fn sync_item_positions(&self) -> Result<(), WrappedError> {
+        self.inner.sync_item_positions().await?;
+        Ok(())
+    }
+
+    pub async fn accept_item_share(&self, circle_id: String) -> Result<(), WrappedError> {
+        self.inner.accept_item_share(&circle_id).await?;
+        Ok(())
+    }
+
+    pub async fn update_beacon_name(
+        &self,
+        associated_beacon: String,
+        role_id: i64,
+        name: String,
+        emoji: String,
+    ) -> Result<(), WrappedError> {
+        let record = rustpush::findmy::BeaconNamingRecord {
+            associated_beacon,
+            role_id,
+            name,
+            emoji,
+        };
+        self.inner.update_beacon_name(&record).await?;
+        Ok(())
+    }
+
+    pub async fn delete_shared_item(&self, id: String, remove_beacon: bool) -> Result<(), WrappedError> {
+        self.inner.delete_shared_item(&id, remove_beacon).await?;
+        Ok(())
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedFaceTimeClient {
+    inner: Arc<rustpush::facetime::FTClient>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedFaceTimeClient {
+    pub async fn export_state_json(&self) -> Result<String, WrappedError> {
+        let state = self.inner.state.read().await;
+        serialize_state_json(&*state)
+    }
+
+    pub async fn use_link_for(&self, old_usage: String, usage: String) -> Result<(), WrappedError> {
+        self.inner.use_link_for(&old_usage, &usage).await?;
+        Ok(())
+    }
+
+    pub async fn get_link_for_usage(&self, handle: String, usage: String) -> Result<String, WrappedError> {
+        Ok(self.inner.get_link_for_usage(&handle, &usage).await?)
+    }
+
+    pub async fn clear_links(&self) -> Result<(), WrappedError> {
+        self.inner.clear_links().await?;
+        Ok(())
+    }
+
+    pub async fn delete_link(&self, pseud: String) -> Result<(), WrappedError> {
+        self.inner.delete_link(&pseud).await?;
+        Ok(())
+    }
+
+    pub async fn get_session_link(&self, guid: String) -> Result<String, WrappedError> {
+        Ok(self.inner.get_session_link(&guid).await?)
+    }
+
+    pub async fn create_session(&self, group_id: String, handle: String, participants: Vec<String>) -> Result<(), WrappedError> {
+        self.inner.create_session(group_id, handle, &participants).await?;
+        Ok(())
+    }
+
+    pub async fn add_members(
+        &self,
+        session_id: String,
+        handles: Vec<String>,
+        letmein: bool,
+        to_members: Option<Vec<String>>,
+    ) -> Result<(), WrappedError> {
+        let mut session = {
+            let state = self.inner.state.read().await;
+            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
+                msg: format!("FaceTime session not found: {}", session_id),
+            })?
+        };
+
+        let members = handles
+            .into_iter()
+            .map(|handle| rustpush::facetime::FTMember {
+                nickname: None,
+                handle,
+            })
+            .collect::<Vec<_>>();
+
+        self.inner.add_members(&mut session, members, letmein, to_members).await?;
+
+        let mut state = self.inner.state.write().await;
+        state.sessions.insert(session_id, session);
+        Ok(())
+    }
+
+    pub async fn remove_members(&self, session_id: String, handles: Vec<String>) -> Result<(), WrappedError> {
+        let mut session = {
+            let state = self.inner.state.read().await;
+            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
+                msg: format!("FaceTime session not found: {}", session_id),
+            })?
+        };
+
+        let members = handles
+            .into_iter()
+            .map(|handle| rustpush::facetime::FTMember {
+                nickname: None,
+                handle,
+            })
+            .collect::<Vec<_>>();
+
+        self.inner.remove_members(&mut session, members).await?;
+
+        let mut state = self.inner.state.write().await;
+        state.sessions.insert(session_id, session);
+        Ok(())
+    }
+
+    pub async fn ring(&self, session_id: String, targets: Vec<String>, letmein: bool) -> Result<(), WrappedError> {
+        let session = {
+            let state = self.inner.state.read().await;
+            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
+                msg: format!("FaceTime session not found: {}", session_id),
+            })?
+        };
+        self.inner.ring(&session, &targets, letmein).await?;
+        Ok(())
+    }
+
+    pub async fn list_delegated_letmein_requests(&self) -> Vec<WrappedLetMeInRequest> {
+        let delegated = self.inner.delegated_requests.lock().await;
+        delegated
+            .iter()
+            .map(|(uuid, request)| WrappedLetMeInRequest {
+                delegation_uuid: uuid.clone(),
+                pseud: request.pseud.clone(),
+                requestor: request.requestor.clone(),
+                nickname: request.nickname.clone(),
+                usage: request.usage.clone(),
+            })
+            .collect()
+    }
+
+    pub async fn respond_delegated_letmein(
+        &self,
+        delegation_uuid: String,
+        approved_group: Option<String>,
+    ) -> Result<(), WrappedError> {
+        let request = {
+            let delegated = self.inner.delegated_requests.lock().await;
+            delegated.get(&delegation_uuid).cloned().ok_or(WrappedError::GenericError {
+                msg: format!("Delegated LetMeIn request not found: {}", delegation_uuid),
+            })?
+        };
+        self.inner.respond_letmein(request, approved_group.as_deref()).await?;
+        Ok(())
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedPasswordsClient {
+    inner: Arc<rustpush::passwords::PasswordManager<omnisette::DefaultAnisetteProvider>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedPasswordsClient {
+    pub async fn export_state_json(&self) -> Result<String, WrappedError> {
+        let state = self.inner.state.read().await;
+        serialize_state_json(&*state)
+    }
+
+    pub async fn sync_passwords(&self) -> Result<(), WrappedError> {
+        self.inner.sync_passwords(&self.inner.conn).await?;
+        Ok(())
+    }
+
+    pub async fn accept_invite(&self, invite_id: String) -> Result<(), WrappedError> {
+        self.inner.accept_invite(&invite_id).await?;
+        Ok(())
+    }
+
+    pub async fn decline_invite(&self, invite_id: String) -> Result<(), WrappedError> {
+        self.inner.decline_invite(&invite_id).await?;
+        Ok(())
+    }
+
+    pub async fn query_handle(&self, handle: String) -> Result<bool, WrappedError> {
+        Ok(self.inner.query_handle(&handle).await?)
+    }
+
+    pub async fn create_group(&self, name: String) -> Result<String, WrappedError> {
+        Ok(self.inner.create_group(&name).await?)
+    }
+
+    pub async fn rename_group(&self, id: String, new_name: String) -> Result<(), WrappedError> {
+        self.inner.rename_group(&id, &new_name).await?;
+        Ok(())
+    }
+
+    pub async fn remove_group(&self, id: String) -> Result<(), WrappedError> {
+        self.inner.remove_group(&id).await?;
+        Ok(())
+    }
+
+    pub async fn invite_user(&self, group_id: String, handle: String) -> Result<(), WrappedError> {
+        self.inner.invite_user(&group_id, &handle).await?;
+        Ok(())
+    }
+
+    pub async fn remove_user(&self, group_id: String, handle: String) -> Result<(), WrappedError> {
+        self.inner.remove_user(&group_id, &handle).await?;
+        Ok(())
+    }
+
+    pub async fn list_password_raw_entry_refs(&self) -> Vec<WrappedPasswordEntryRef> {
+        self.inner
+            .get_password_entries::<rustpush::passwords::PasswordRawEntry>()
+            .await
+            .into_iter()
+            .map(|(id, (group, _))| WrappedPasswordEntryRef { id, group })
+            .collect()
+    }
+
+    pub async fn get_password_site_counts(&self, site: String) -> WrappedPasswordSiteCounts {
+        let cfg = self.inner.get_password_for_site(site).await;
+        WrappedPasswordSiteCounts {
+            website_meta_count: if cfg.website_meta.is_some() { 1 } else { 0 },
+            password_count: cfg.passwords.len() as u64,
+            password_meta_count: cfg.passwords_meta.len() as u64,
+            passkey_count: cfg.passkeys.len() as u64,
+        }
+    }
+
+    pub async fn upsert_password_raw_entry(
+        &self,
+        id: String,
+        site: String,
+        account: String,
+        secret_data: Vec<u8>,
+        group: Option<String>,
+    ) -> Result<(), WrappedError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let entry = rustpush::passwords::PasswordRawEntry {
+            cdat: now_ms,
+            mdat: now_ms,
+            srvr: site,
+            acct: account,
+            agrp: "com.apple.cfnetwork".to_string(),
+            data: secret_data,
+        };
+        self.inner
+            .insert_password_entry::<rustpush::passwords::PasswordRawEntry>(&id, &entry, group)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_password_raw_entry(&self, id: String, group: Option<String>) -> Result<(), WrappedError> {
+        self.inner
+            .delete_password_entry::<rustpush::passwords::PasswordRawEntry>(&id, group)
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedStatusKitClient {
+    inner: Arc<rustpush::statuskit::StatusKitClient<omnisette::DefaultAnisetteProvider>>,
+    interests: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedStatusKitClient {
+    pub async fn export_state_json(&self) -> Result<String, WrappedError> {
+        let state = self.inner.state.read().await;
+        serialize_state_json(&*state)
+    }
+
+    pub async fn configure_aps(&self) -> Result<(), WrappedError> {
+        self.inner.configure_aps().await?;
+        Ok(())
+    }
+
+    pub async fn ensure_channel(&self) -> Result<(), WrappedError> {
+        self.inner.ensure_channel().await?;
+        Ok(())
+    }
+
+    pub async fn roll_keys(&self) {
+        self.inner.roll_keys().await;
+    }
+
+    pub async fn reset_keys(&self) {
+        self.inner.reset_keys().await;
+    }
+
+    pub async fn share_status(&self, active: bool, mode: Option<String>) -> Result<(), WrappedError> {
+        let status = if active {
+            rustpush::statuskit::StatusKitStatus::new_active()
+        } else {
+            rustpush::statuskit::StatusKitStatus::new_away(mode.ok_or(WrappedError::GenericError {
+                msg: "Mode is required when sharing away status".into(),
+            })?)
+        };
+        self.inner.share_status(&status).await?;
+        Ok(())
+    }
+
+    pub async fn update_channels(&self, channels: Vec<WrappedAPSChannelIdentifier>) -> Result<(), WrappedError> {
+        let mapped: std::collections::HashSet<rustpush::APSChannelIdentifier> = channels
+            .into_iter()
+            .map(|c| rustpush::APSChannelIdentifier { topic: c.topic, id: c.id })
+            .collect();
+        self.inner.update_channels(&mapped).await?;
+        Ok(())
+    }
+
+    pub async fn invite_to_channel(
+        &self,
+        sender_handle: String,
+        handles: Vec<WrappedStatusKitInviteHandle>,
+    ) -> Result<(), WrappedError> {
+        let mapped = handles
+            .into_iter()
+            .map(|h| {
+                (
+                    h.handle,
+                    rustpush::statuskit::StatusKitPersonalConfig {
+                        allowed_modes: h.allowed_modes,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        self.inner.invite_to_channel(&sender_handle, mapped).await?;
+        Ok(())
+    }
+
+    pub async fn request_handles(&self, handles: Vec<String>) {
+        let token = self.inner.request_handles(&handles).await;
+        self.interests.lock().await.push(token);
+    }
+
+    pub async fn request_channels(&self, channels: Vec<WrappedAPSChannelIdentifier>) {
+        let mapped = channels
+            .into_iter()
+            .map(|c| rustpush::APSChannelIdentifier { topic: c.topic, id: c.id })
+            .collect::<Vec<_>>();
+        let token = self.inner.request_channels(mapped).await;
+        self.interests.lock().await.push(token);
+    }
+
+    pub async fn clear_interest_tokens(&self) {
+        self.interests.lock().await.clear();
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedSharedStreamsClient {
+    inner: Arc<rustpush::sharedstreams::SharedStreamClient<omnisette::DefaultAnisetteProvider>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedSharedStreamsClient {
+    pub async fn export_state_json(&self) -> Result<String, WrappedError> {
+        let state = self.inner.state.read().await;
+        serialize_state_json(&*state)
+    }
+
+    pub async fn list_album_ids(&self) -> Vec<String> {
+        let state = self.inner.state.read().await;
+        state.albums.iter().map(|album| album.albumguid.clone()).collect()
+    }
+
+    pub async fn get_changes(&self) -> Result<Vec<String>, WrappedError> {
+        Ok(self.inner.get_changes().await?)
+    }
+
+    pub async fn subscribe(&self, album: String) -> Result<(), WrappedError> {
+        self.inner.subscribe(&album).await?;
+        Ok(())
+    }
+
+    pub async fn unsubscribe(&self, album: String) -> Result<(), WrappedError> {
+        self.inner.unsubscribe(&album).await?;
+        Ok(())
+    }
+
+    pub async fn subscribe_token(&self, token: String) -> Result<(), WrappedError> {
+        self.inner.subscribe_token(&token).await?;
+        Ok(())
+    }
+
+    pub async fn get_album_summary(&self, album: String) -> Result<Vec<String>, WrappedError> {
+        Ok(self.inner.get_album_summary(&album).await?)
+    }
+
+    pub async fn get_assets_json(&self, album: String, assets: Vec<String>) -> Result<String, WrappedError> {
+        let details = self.inner.get_assets(&album, &assets).await?;
+        serde_json::to_string(&details).map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to encode asset details: {}", e),
+        })
+    }
+
+    pub async fn create_asset_from_bytes(
+        &self,
+        album: String,
+        filename: String,
+        data: Vec<u8>,
+        width: u64,
+        height: u64,
+        uti_type: String,
+        video_type: Option<String>,
+    ) -> Result<(), WrappedError> {
+        let file = rustpush::sharedstreams::PreparedFile::new(
+            Cursor::new(data),
+            rustpush::sharedstreams::FileMetadata {
+                width: width as usize,
+                height: height as usize,
+                uti_type,
+                video_type: video_type.clone(),
+                asset_metadata: None,
+            },
+        )
+        .await?;
+
+        let asset = rustpush::sharedstreams::PreparedAsset {
+            files: vec![file],
+            name: filename,
+            date_created: std::time::SystemTime::now(),
+            video_duration: None,
+            guid: uuid::Uuid::new_v4().to_string().to_uppercase(),
+        };
+
+        self.inner
+            .create_asset(&album, vec![asset], |_current, _total| {})
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_assets(&self, album: String, assets: Vec<String>) -> Result<(), WrappedError> {
+        self.inner.delete_asset(&album, assets).await?;
+        Ok(())
+    }
+
+    pub async fn download_file_bytes(
+        &self,
+        checksum_hex: String,
+        token: String,
+        url: String,
+    ) -> Result<Vec<u8>, WrappedError> {
+        let file = rustpush::sharedstreams::AssetFile {
+            size: "0".to_string(),
+            checksum: checksum_hex,
+            width: "0".to_string(),
+            height: "0".to_string(),
+            file_type: "public.data".to_string(),
+            metadata: None,
+            url,
+            token,
+            video_type: None,
+        };
+
+        let writer = SharedWriter::new();
+        let mut files = vec![(&file, writer.clone())];
+        self.inner.get_file(&mut files, |_current, _total| {}).await?;
+        Ok(writer.into_bytes())
+    }
+}
+
+#[derive(uniffi::Object)]
 pub struct Client {
     client: Arc<IMClient>,
     conn: rustpush::APSConnection,
+    os_config: Arc<dyn OSConfig>,
     receive_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     token_provider: Option<Arc<WrappedTokenProvider>>,
     cloud_messages_client: tokio::sync::Mutex<Option<Arc<rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>>>>,
     cloud_keychain_client: tokio::sync::Mutex<Option<Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>>>,
+    findmy_client: tokio::sync::Mutex<Option<Arc<WrappedFindMyClient>>>,
+    facetime_client: tokio::sync::Mutex<Option<Arc<WrappedFaceTimeClient>>>,
+    passwords_client: tokio::sync::Mutex<Option<Arc<WrappedPasswordsClient>>>,
+    statuskit_client: tokio::sync::Mutex<Option<Arc<WrappedStatusKitClient>>>,
+    sharedstreams_client: tokio::sync::Mutex<Option<Arc<WrappedSharedStreamsClient>>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -2463,7 +3113,7 @@ pub async fn new_client(
             identity_clone,
             &[&MADRID_SERVICE],
             "state/id_cache.plist".into(),
-            config_clone,
+            config_clone.clone(),
             Box::new(move |updated_keys| {
                 update_users_callback.update_users(Arc::new(WrappedIDSUsers {
                     inner: updated_keys,
@@ -2677,10 +3327,16 @@ pub async fn new_client(
     Ok(Arc::new(Client {
         client,
         conn: connection.inner.clone(),
+        os_config: config_clone,
         receive_handle: tokio::sync::Mutex::new(Some(receive_handle)),
         token_provider,
         cloud_messages_client: tokio::sync::Mutex::new(None),
         cloud_keychain_client: tokio::sync::Mutex::new(None),
+        findmy_client: tokio::sync::Mutex::new(None),
+        facetime_client: tokio::sync::Mutex::new(None),
+        passwords_client: tokio::sync::Mutex::new(None),
+        statuskit_client: tokio::sync::Mutex::new(None),
+        sharedstreams_client: tokio::sync::Mutex::new(None),
     }))
 }
 
@@ -2708,7 +3364,7 @@ impl Client {
             },
         )?;
         let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
-            state: tokio::sync::RwLock::new(cloudkit_state),
+            state: rustpush::DebugRwLock::new(cloudkit_state),
             anisette: anisette.clone(),
             config: os_config.clone(),
             token_provider: tp.inner.clone(),
@@ -2742,7 +3398,7 @@ impl Client {
         let keychain = Arc::new(rustpush::keychain::KeychainClient {
             anisette,
             token_provider: tp.inner.clone(),
-            state: tokio::sync::RwLock::new(keychain_state.expect("keychain state missing")),
+            state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
             config: os_config,
             update_state: Box::new(move |state| {
                 if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
@@ -2808,6 +3464,181 @@ impl Client {
         refresh_recoverable_tlk_shares(&keychain, context).await?;
         sync_keychain_with_retries(&keychain, 6, context).await
     }
+
+    async fn get_or_init_findmy_client(&self) -> Result<Arc<WrappedFindMyClient>, WrappedError> {
+        let mut locked = self.findmy_client.lock().await;
+        if let Some(client) = &*locked {
+            return Ok(client.clone());
+        }
+
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+        let dsid = tp.inner.get_dsid().await?;
+        let keychain = self.get_or_init_cloud_keychain_client().await?;
+        let cloudkit = keychain.client.clone();
+        let account = tp.inner.get_account();
+        let anisette = account.lock().await.anisette.clone();
+
+        let state_path = subsystem_state_path("findmy.state");
+        let state_bytes = match std::fs::read(&state_path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => rustpush::findmy::FindMyState::new(dsid).encode()?,
+            Err(err) => {
+                return Err(WrappedError::GenericError {
+                    msg: format!("Failed to read Find My state: {}", err),
+                })
+            }
+        };
+        let state_path_for_closure = state_path.clone();
+        let state_manager = rustpush::findmy::FindMyStateManager::new(
+            &state_bytes,
+            Box::new(move |data| {
+                if let Err(err) = std::fs::write(&state_path_for_closure, data) {
+                    warn!("Failed to persist Find My state to {}: {}", state_path_for_closure, err);
+                }
+            }),
+        );
+
+        let wrapped = Arc::new(WrappedFindMyClient {
+            inner: Arc::new(
+                rustpush::findmy::FindMyClient::new(
+                    self.conn.clone(),
+                    cloudkit,
+                    keychain,
+                    self.os_config.clone(),
+                    state_manager,
+                    tp.inner.clone(),
+                    anisette,
+                    self.client.identity.clone(),
+                )
+                .await?,
+            ),
+        });
+        *locked = Some(wrapped.clone());
+        Ok(wrapped)
+    }
+
+    async fn get_or_init_facetime_client(&self) -> Result<Arc<WrappedFaceTimeClient>, WrappedError> {
+        let mut locked = self.facetime_client.lock().await;
+        if let Some(client) = &*locked {
+            return Ok(client.clone());
+        }
+
+        let state_path = subsystem_state_path("facetime-state.plist");
+        let state = read_plist_state::<rustpush::facetime::FTState>(&state_path).unwrap_or_default();
+        let state_path_for_closure = state_path.clone();
+
+        let wrapped = Arc::new(WrappedFaceTimeClient {
+            inner: Arc::new(
+                rustpush::facetime::FTClient::new(
+                    state,
+                    Box::new(move |state| persist_plist_state(&state_path_for_closure, state)),
+                    self.conn.clone(),
+                    self.client.identity.clone(),
+                    self.os_config.clone(),
+                )
+                .await,
+            ),
+        });
+        *locked = Some(wrapped.clone());
+        Ok(wrapped)
+    }
+
+    async fn get_or_init_passwords_client(&self) -> Result<Arc<WrappedPasswordsClient>, WrappedError> {
+        let mut locked = self.passwords_client.lock().await;
+        if let Some(client) = &*locked {
+            return Ok(client.clone());
+        }
+
+        let keychain = self.get_or_init_cloud_keychain_client().await?;
+        let cloudkit = keychain.client.clone();
+        let state_path = subsystem_state_path("passwords-state.plist");
+        let state = read_plist_state::<rustpush::passwords::PasswordState>(&state_path).unwrap_or_default();
+        let state_path_for_closure = state_path.clone();
+
+        let wrapped = Arc::new(WrappedPasswordsClient {
+            inner: rustpush::passwords::PasswordManager::new(
+                keychain,
+                cloudkit,
+                self.client.identity.clone(),
+                self.conn.clone(),
+                state,
+                Box::new(move |state| persist_plist_state(&state_path_for_closure, state)),
+                Box::new(|_, _| {}),
+            )
+            .await,
+        });
+        *locked = Some(wrapped.clone());
+        Ok(wrapped)
+    }
+
+    async fn get_or_init_statuskit_client(&self) -> Result<Arc<WrappedStatusKitClient>, WrappedError> {
+        let mut locked = self.statuskit_client.lock().await;
+        if let Some(client) = &*locked {
+            return Ok(client.clone());
+        }
+
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+        let state_path = subsystem_state_path("statuskit-state.plist");
+        let state = read_plist_state::<rustpush::statuskit::StatusKitState>(&state_path).unwrap_or_default();
+        let state_path_for_closure = state_path.clone();
+
+        let wrapped = Arc::new(WrappedStatusKitClient {
+            inner: rustpush::statuskit::StatusKitClient::new(
+                state,
+                Box::new(move |state| persist_plist_state(&state_path_for_closure, state)),
+                tp.inner.clone(),
+                self.conn.clone(),
+                self.os_config.clone(),
+                self.client.identity.clone(),
+            )
+            .await,
+            interests: tokio::sync::Mutex::new(Vec::new()),
+        });
+        *locked = Some(wrapped.clone());
+        Ok(wrapped)
+    }
+
+    async fn get_or_init_sharedstreams_client(&self) -> Result<Arc<WrappedSharedStreamsClient>, WrappedError> {
+        let mut locked = self.sharedstreams_client.lock().await;
+        if let Some(client) = &*locked {
+            return Ok(client.clone());
+        }
+
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+        let dsid = tp.inner.get_dsid().await?;
+        let mme_delegate = tp.inner.get_mme_delegate().await?;
+        let account = tp.inner.get_account();
+        let anisette = account.lock().await.anisette.clone();
+        let state_path = subsystem_state_path("sharedstreams-state.plist");
+        let state = read_plist_state::<rustpush::sharedstreams::SharedStreamsState>(&state_path)
+            .or_else(|| rustpush::sharedstreams::SharedStreamsState::new(dsid, &mme_delegate))
+            .ok_or(WrappedError::GenericError {
+                msg: "Failed to initialize Shared Streams state".into(),
+            })?;
+        let state_path_for_closure = state_path.clone();
+
+        let wrapped = Arc::new(WrappedSharedStreamsClient {
+            inner: Arc::new(
+                rustpush::sharedstreams::SharedStreamClient::new(
+                    state,
+                    Box::new(move |state| persist_plist_state(&state_path_for_closure, state)),
+                    tp.inner.clone(),
+                    self.conn.clone(),
+                    anisette,
+                    self.os_config.clone(),
+                )
+                .await,
+            ),
+        });
+        *locked = Some(wrapped.clone());
+        Ok(wrapped)
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -2848,6 +3679,106 @@ impl Client {
             Some(tp) => Ok(Some(tp.inner.get_dsid().await?)),
             None => Ok(None),
         }
+    }
+
+    pub async fn get_findmy_client(&self) -> Result<Arc<WrappedFindMyClient>, WrappedError> {
+        self.get_or_init_findmy_client().await
+    }
+
+    pub async fn get_facetime_client(&self) -> Result<Arc<WrappedFaceTimeClient>, WrappedError> {
+        self.get_or_init_facetime_client().await
+    }
+
+    pub async fn get_passwords_client(&self) -> Result<Arc<WrappedPasswordsClient>, WrappedError> {
+        self.get_or_init_passwords_client().await
+    }
+
+    pub async fn get_statuskit_client(&self) -> Result<Arc<WrappedStatusKitClient>, WrappedError> {
+        self.get_or_init_statuskit_client().await
+    }
+
+    pub async fn get_sharedstreams_client(&self) -> Result<Arc<WrappedSharedStreamsClient>, WrappedError> {
+        self.get_or_init_sharedstreams_client().await
+    }
+
+    pub async fn findmy_phone_refresh_json(&self) -> Result<String, WrappedError> {
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+        let dsid = tp.inner.get_dsid().await?;
+        let account = tp.inner.get_account();
+        let anisette = account.lock().await.anisette.clone();
+
+        let mut client = rustpush::findmy::FindMyPhoneClient::new(
+            self.os_config.as_ref(),
+            dsid,
+            self.conn.clone(),
+            anisette,
+            tp.inner.clone(),
+        )
+        .await?;
+        client.refresh(self.os_config.as_ref()).await?;
+
+        serde_json::to_string(&client.devices).map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to encode Find My Phone devices: {}", e),
+        })
+    }
+
+    pub async fn findmy_friends_refresh_json(&self, daemon: bool) -> Result<String, WrappedError> {
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+        let dsid = tp.inner.get_dsid().await?;
+        let account = tp.inner.get_account();
+        let anisette = account.lock().await.anisette.clone();
+
+        let mut client = rustpush::findmy::FindMyFriendsClient::new(
+            self.os_config.as_ref(),
+            dsid,
+            tp.inner.clone(),
+            self.conn.clone(),
+            anisette,
+            daemon,
+        )
+        .await?;
+        client.refresh(self.os_config.as_ref()).await?;
+
+        #[derive(serde::Serialize)]
+        struct FriendsSnapshot {
+            selected_friend: Option<String>,
+            followers: Vec<rustpush::findmy::Follow>,
+            following: Vec<rustpush::findmy::Follow>,
+        }
+
+        serde_json::to_string(&FriendsSnapshot {
+            selected_friend: client.selected_friend,
+            followers: client.followers,
+            following: client.following,
+        })
+        .map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to encode Find My Friends snapshot: {}", e),
+        })
+    }
+
+    pub async fn findmy_friends_import(&self, daemon: bool, url: String) -> Result<(), WrappedError> {
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+        let dsid = tp.inner.get_dsid().await?;
+        let account = tp.inner.get_account();
+        let anisette = account.lock().await.anisette.clone();
+
+        let mut client = rustpush::findmy::FindMyFriendsClient::new(
+            self.os_config.as_ref(),
+            dsid,
+            tp.inner.clone(),
+            self.conn.clone(),
+            anisette,
+            daemon,
+        )
+        .await?;
+        client.import(self.os_config.as_ref(), &url).await?;
+        Ok(())
     }
 
     pub async fn validate_targets(
@@ -2917,7 +3848,7 @@ impl Client {
                         image_metadata: None,
                         version: 1,
                         icon_metadata: None,
-                        original_url,
+                        original_url: Some(original_url),
                         url,
                         title,
                         summary,
@@ -2925,6 +3856,11 @@ impl Client {
                         icon: None,
                         images: None,
                         icons: None,
+                        is_incomplete: None,
+                        uses_activity_pub: None,
+                        is_encoded_for_local_use: None,
+                        collaboration_type: None,
+                        specialization2: None,
                     },
                     attachments: vec![],
                 };
@@ -3041,6 +3977,22 @@ impl Client {
         let mut msg = MessageInst::new(conv, &handle, Message::Typing(typing, None));
         self.client.send(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send typing: {}", e) })?;
+        Ok(())
+    }
+
+    pub async fn send_typing_with_app(
+        &self,
+        conversation: WrappedConversation,
+        typing: bool,
+        handle: String,
+        bundle_id: String,
+        icon: Vec<u8>,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let app = TypingApp { bundle_id, icon };
+        let mut msg = MessageInst::new(conv, &handle, Message::Typing(typing, Some(app)));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send typing with app: {}", e) })?;
         Ok(())
     }
 
@@ -3223,7 +4175,6 @@ impl Client {
             proto001: None,
             group_photo_guid: None,
             group_photo: None,
-            dids: vec![],
         };
         let mut chats = std::collections::HashMap::new();
         chats.insert(record_name.clone(), chat);
@@ -3386,7 +4337,7 @@ impl Client {
                     };
 
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        CloudChat::from_record_encrypted(&record.record_field, Some((&pcskey, rec_id)))
+                        CloudChat::from_record_encrypted(&record.record_field, Some(&pcskey))
                     }));
 
                     match result {
@@ -3545,7 +4496,7 @@ impl Client {
                     };
 
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        CloudMessage::from_record_encrypted(&record.record_field, Some((&pcskey, rec_id)))
+                        CloudMessage::from_record_encrypted(&record.record_field, Some(&pcskey))
                     }));
                     if let Ok(msg) = result {
                         if !msg.guid.is_empty() && seen.insert(msg.guid.clone()) {
@@ -3905,6 +4856,292 @@ impl Client {
         self.client.send(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send peer cache invalidate: {}", e) })?;
         Ok(())
+    }
+
+    pub async fn send_sms_activation(
+        &self,
+        conversation: WrappedConversation,
+        enable: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::EnableSmsActivation(enable));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS activation: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_sms_confirm_sent(
+        &self,
+        conversation: WrappedConversation,
+        sms_status: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::SmsConfirmSent(sms_status));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS confirm sent: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_message_read_on_device(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::MessageReadOnDevice);
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send message-read-on-device: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_mark_unread(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::MarkUnread);
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send mark unread: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_error_message(
+        &self,
+        conversation: WrappedConversation,
+        for_uuid: String,
+        error_status: u64,
+        status_str: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Error(rustpush::ErrorMessage {
+                for_uuid,
+                status: error_status,
+                status_str,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send error message: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_update_extension(
+        &self,
+        conversation: WrappedConversation,
+        for_uuid: String,
+        extension: WrappedStickerExtension,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let ext = PartExtension::Sticker {
+            msg_width: extension.msg_width,
+            rotation: extension.rotation,
+            sai: extension.sai,
+            scale: extension.scale,
+            update: Some(false),
+            sli: extension.sli,
+            normalized_x: extension.normalized_x,
+            normalized_y: extension.normalized_y,
+            version: extension.version,
+            hash: extension.hash,
+            safi: extension.safi,
+            effect_type: extension.effect_type,
+            sticker_id: extension.sticker_id,
+        };
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::UpdateExtension(UpdateExtensionMessage { for_uuid, ext }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send update extension: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_permanent_delete_messages(
+        &self,
+        conversation: WrappedConversation,
+        message_uuids: Vec<String>,
+        is_scheduled: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::PermanentDelete(PermanentDeleteMessage {
+                target: DeleteTarget::Messages(message_uuids),
+                is_scheduled,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send permanent delete (messages): {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_permanent_delete_chat(
+        &self,
+        conversation: WrappedConversation,
+        chat_guid: String,
+        is_scheduled: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let bare_handle = handle.replace("mailto:", "").replace("tel:", "");
+        let bare_participants: Vec<String> = conv.participants.iter()
+            .map(|p| p.replace("mailto:", "").replace("tel:", ""))
+            .filter(|p| p != &bare_handle)
+            .collect();
+        let target = DeleteTarget::Chat(OperatedChat {
+            participants: bare_participants,
+            group_id: conv.sender_guid.clone().unwrap_or_default(),
+            guid: chat_guid,
+            delete_incoming_messages: None,
+            was_reported_as_junk: None,
+        });
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::PermanentDelete(PermanentDeleteMessage { target, is_scheduled }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send permanent delete (chat): {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_update_profile(
+        &self,
+        conversation: WrappedConversation,
+        profile: Option<WrappedShareProfileData>,
+        share_contacts: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mapped_profile = profile.map(|p| {
+            let poster = match (p.low_res_wallpaper_tag, p.wallpaper_tag, p.message_tag) {
+                (Some(low), Some(wall), Some(msg)) => Some(SharedPoster {
+                    low_res_wallpaper_tag: low,
+                    wallpaper_tag: wall,
+                    message_tag: msg,
+                }),
+                _ => None,
+            };
+            ShareProfileMessage {
+                cloud_kit_decryption_record_key: p.cloud_kit_decryption_record_key,
+                cloud_kit_record_key: p.cloud_kit_record_key,
+                poster,
+            }
+        });
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::UpdateProfile(UpdateProfileMessage {
+                profile: mapped_profile,
+                share_contacts,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send update profile: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_share_profile(
+        &self,
+        conversation: WrappedConversation,
+        cloud_kit_record_key: String,
+        cloud_kit_decryption_record_key: Vec<u8>,
+        low_res_wallpaper_tag: Option<Vec<u8>>,
+        wallpaper_tag: Option<Vec<u8>>,
+        message_tag: Option<Vec<u8>>,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let poster = match (low_res_wallpaper_tag, wallpaper_tag, message_tag) {
+            (Some(low), Some(wall), Some(msg)) => Some(SharedPoster {
+                low_res_wallpaper_tag: low,
+                wallpaper_tag: wall,
+                message_tag: msg,
+            }),
+            _ => None,
+        };
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::ShareProfile(ShareProfileMessage {
+                cloud_kit_decryption_record_key,
+                cloud_kit_record_key,
+                poster,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send share profile: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_update_profile_sharing(
+        &self,
+        conversation: WrappedConversation,
+        shared_dismissed: Vec<String>,
+        shared_all: Vec<String>,
+        version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::UpdateProfileSharing(UpdateProfileSharingMessage {
+                shared_dismissed,
+                shared_all,
+                version,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send update profile sharing: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_notify_anyways(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::NotifyAnyways);
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send notify anyways: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_set_transcript_background(
+        &self,
+        conversation: WrappedConversation,
+        group_version: u64,
+        image_data: Option<Vec<u8>>,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let chat_id = conv.sender_guid.clone();
+        let mmcs_file = if let Some(data) = image_data {
+            let prepared = MMCSFile::prepare_put(Cursor::new(&data)).await
+                .map_err(|e| WrappedError::GenericError { msg: format!("Failed to prepare transcript background MMCS upload: {}", e) })?;
+            let uploaded = MMCSFile::new(&self.conn, &prepared, Cursor::new(&data), |_current, _total| {}).await
+                .map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload transcript background to MMCS: {}", e) })?;
+            Some(uploaded)
+        } else {
+            None
+        };
+        let update = SetTranscriptBackgroundMessage::from_mmcs(mmcs_file, group_version, chat_id);
+        let mut msg = MessageInst::new(conv, &handle, Message::SetTranscriptBackground(update));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send transcript background update: {}", e) })?;
+        Ok(msg.id.clone())
     }
 
     pub async fn cloud_sync_chats(
@@ -4625,7 +5862,7 @@ impl Client {
 
         // Create CloudKitClient
         let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
-            state: tokio::sync::RwLock::new(cloudkit_state),
+            state: rustpush::DebugRwLock::new(cloudkit_state),
             anisette: anisette.clone(),
             config: os_config.clone(),
             token_provider: tp.inner.clone(),
@@ -4641,7 +5878,7 @@ impl Client {
         let keychain = Arc::new(rustpush::keychain::KeychainClient {
             anisette: anisette.clone(),
             token_provider: tp.inner.clone(),
-            state: tokio::sync::RwLock::new(keychain_state),
+            state: rustpush::DebugRwLock::new(keychain_state),
             config: os_config.clone(),
             update_state: Box::new(|_state| {
                 // For now, don't persist keychain state
@@ -4815,7 +6052,7 @@ async fn fetch_main_zone_page_newest_first(
         let Some(pcskey) = pcskey else { continue };
         let item = CloudMessage::from_record_encrypted(
             &record.record_field,
-            Some((&pcskey, record.record_identifier.as_ref().unwrap())),
+            Some(&pcskey),
         );
         results.insert(identifier, Some(item));
     }
@@ -4901,7 +6138,7 @@ async fn sync_messages_fallback(
 
         // from_record_encrypted may panic on corrupt field data — catch it
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            CloudMessage::from_record_encrypted(&record.record_field, Some((&pcskey, rec_id)))
+            CloudMessage::from_record_encrypted(&record.record_field, Some(&pcskey))
         }));
 
         match result {
