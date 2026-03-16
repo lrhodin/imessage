@@ -145,6 +145,24 @@ void* uniffi_rustpushgo_fn_method_client_delete_cloud_messages(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_findmy_friends_import(
+	void* ptr,
+	int8_t daemon,
+	RustBuffer url,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_findmy_friends_refresh_json(
+	void* ptr,
+	int8_t daemon,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_findmy_phone_refresh_json(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_get_contacts_url(
 	void* ptr,
 	RustCallStatus* out_status
@@ -155,12 +173,37 @@ void* uniffi_rustpushgo_fn_method_client_get_dsid(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_get_facetime_client(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_get_findmy_client(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_get_handles(
 	void* ptr,
 	RustCallStatus* out_status
 );
 
 void* uniffi_rustpushgo_fn_method_client_get_icloud_auth_headers(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_get_passwords_client(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_get_sharedstreams_client(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_get_statuskit_client(
 	void* ptr,
 	RustCallStatus* out_status
 );
@@ -237,6 +280,16 @@ void* uniffi_rustpushgo_fn_method_client_send_edit(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_error_message(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer for_uuid,
+	uint64_t error_status,
+	RustBuffer status_str,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_send_icon_change(
 	void* ptr,
 	RustBuffer conversation,
@@ -254,6 +307,13 @@ void* uniffi_rustpushgo_fn_method_client_send_icon_clear(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_mark_unread(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_send_message(
 	void* ptr,
 	RustBuffer conversation,
@@ -266,6 +326,13 @@ void* uniffi_rustpushgo_fn_method_client_send_message(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_message_read_on_device(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_send_move_to_recycle_bin(
 	void* ptr,
 	RustBuffer conversation,
@@ -274,9 +341,34 @@ void* uniffi_rustpushgo_fn_method_client_send_move_to_recycle_bin(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_notify_anyways(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_send_peer_cache_invalidate(
 	void* ptr,
 	RustBuffer conversation,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_permanent_delete_chat(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer chat_guid,
+	int8_t is_scheduled,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_permanent_delete_messages(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer message_uuids,
+	int8_t is_scheduled,
 	RustBuffer handle,
 	RustCallStatus* out_status
 );
@@ -305,6 +397,43 @@ void* uniffi_rustpushgo_fn_method_client_send_rename_group(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_set_transcript_background(
+	void* ptr,
+	RustBuffer conversation,
+	uint64_t group_version,
+	RustBuffer image_data,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_share_profile(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer cloud_kit_record_key,
+	RustBuffer cloud_kit_decryption_record_key,
+	RustBuffer low_res_wallpaper_tag,
+	RustBuffer wallpaper_tag,
+	RustBuffer message_tag,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_sms_activation(
+	void* ptr,
+	RustBuffer conversation,
+	int8_t enable,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_sms_confirm_sent(
+	void* ptr,
+	RustBuffer conversation,
+	int8_t sms_status,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_send_tapback(
 	void* ptr,
 	RustBuffer conversation,
@@ -325,6 +454,16 @@ void* uniffi_rustpushgo_fn_method_client_send_typing(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_typing_with_app(
+	void* ptr,
+	RustBuffer conversation,
+	int8_t typing,
+	RustBuffer handle,
+	RustBuffer bundle_id,
+	RustBuffer icon,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_send_unschedule(
 	void* ptr,
 	RustBuffer conversation,
@@ -337,6 +476,34 @@ void* uniffi_rustpushgo_fn_method_client_send_unsend(
 	RustBuffer conversation,
 	RustBuffer target_uuid,
 	uint64_t edit_part,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_update_extension(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer for_uuid,
+	RustBuffer extension,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_update_profile(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer profile,
+	int8_t share_contacts,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_update_profile_sharing(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer shared_dismissed,
+	RustBuffer shared_all,
+	uint64_t version,
 	RustBuffer handle,
 	RustCallStatus* out_status
 );
@@ -408,6 +575,139 @@ RustBuffer uniffi_rustpushgo_fn_method_wrappedapsstate_to_string(
 	RustCallStatus* out_status
 );
 
+void uniffi_rustpushgo_fn_free_wrappedfacetimeclient(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_add_members(
+	void* ptr,
+	RustBuffer session_id,
+	RustBuffer handles,
+	int8_t letmein,
+	RustBuffer to_members,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_clear_links(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_create_session(
+	void* ptr,
+	RustBuffer group_id,
+	RustBuffer handle,
+	RustBuffer participants,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_delete_link(
+	void* ptr,
+	RustBuffer pseud,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_export_state_json(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_get_link_for_usage(
+	void* ptr,
+	RustBuffer handle,
+	RustBuffer usage,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_get_session_link(
+	void* ptr,
+	RustBuffer guid,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_list_delegated_letmein_requests(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_remove_members(
+	void* ptr,
+	RustBuffer session_id,
+	RustBuffer handles,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_respond_delegated_letmein(
+	void* ptr,
+	RustBuffer delegation_uuid,
+	RustBuffer approved_group,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_ring(
+	void* ptr,
+	RustBuffer session_id,
+	RustBuffer targets,
+	int8_t letmein,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_use_link_for(
+	void* ptr,
+	RustBuffer old_usage,
+	RustBuffer usage,
+	RustCallStatus* out_status
+);
+
+void uniffi_rustpushgo_fn_free_wrappedfindmyclient(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_accept_item_share(
+	void* ptr,
+	RustBuffer circle_id,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_delete_shared_item(
+	void* ptr,
+	RustBuffer id,
+	int8_t remove_beacon,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_export_state_bytes(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_export_state_json(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_sync_item_positions(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_sync_items(
+	void* ptr,
+	int8_t fetch_shares,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_update_beacon_name(
+	void* ptr,
+	RustBuffer associated_beacon,
+	int64_t role_id,
+	RustBuffer name,
+	RustBuffer emoji,
+	RustCallStatus* out_status
+);
+
 void uniffi_rustpushgo_fn_free_wrappedidsngmidentity(
 	void* ptr,
 	RustCallStatus* out_status
@@ -461,6 +761,245 @@ void uniffi_rustpushgo_fn_free_wrappedosconfig(
 
 RustBuffer uniffi_rustpushgo_fn_method_wrappedosconfig_get_device_id(
 	void* ptr,
+	RustCallStatus* out_status
+);
+
+void uniffi_rustpushgo_fn_free_wrappedpasswordsclient(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_accept_invite(
+	void* ptr,
+	RustBuffer invite_id,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_create_group(
+	void* ptr,
+	RustBuffer name,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_decline_invite(
+	void* ptr,
+	RustBuffer invite_id,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_delete_password_raw_entry(
+	void* ptr,
+	RustBuffer id,
+	RustBuffer group,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_export_state_json(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_get_password_site_counts(
+	void* ptr,
+	RustBuffer site,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_invite_user(
+	void* ptr,
+	RustBuffer group_id,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_list_password_raw_entry_refs(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_query_handle(
+	void* ptr,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_remove_group(
+	void* ptr,
+	RustBuffer id,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_remove_user(
+	void* ptr,
+	RustBuffer group_id,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_rename_group(
+	void* ptr,
+	RustBuffer id,
+	RustBuffer new_name,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_sync_passwords(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedpasswordsclient_upsert_password_raw_entry(
+	void* ptr,
+	RustBuffer id,
+	RustBuffer site,
+	RustBuffer account,
+	RustBuffer secret_data,
+	RustBuffer group,
+	RustCallStatus* out_status
+);
+
+void uniffi_rustpushgo_fn_free_wrappedsharedstreamsclient(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_create_asset_from_bytes(
+	void* ptr,
+	RustBuffer album,
+	RustBuffer filename,
+	RustBuffer data,
+	uint64_t width,
+	uint64_t height,
+	RustBuffer uti_type,
+	RustBuffer video_type,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_delete_assets(
+	void* ptr,
+	RustBuffer album,
+	RustBuffer assets,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_download_file_bytes(
+	void* ptr,
+	RustBuffer checksum_hex,
+	RustBuffer token,
+	RustBuffer url,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_export_state_json(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_get_album_summary(
+	void* ptr,
+	RustBuffer album,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_get_assets_json(
+	void* ptr,
+	RustBuffer album,
+	RustBuffer assets,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_get_changes(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_list_album_ids(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_subscribe(
+	void* ptr,
+	RustBuffer album,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_subscribe_token(
+	void* ptr,
+	RustBuffer token,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_unsubscribe(
+	void* ptr,
+	RustBuffer album,
+	RustCallStatus* out_status
+);
+
+void uniffi_rustpushgo_fn_free_wrappedstatuskitclient(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_clear_interest_tokens(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_configure_aps(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_ensure_channel(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_export_state_json(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_invite_to_channel(
+	void* ptr,
+	RustBuffer sender_handle,
+	RustBuffer handles,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_request_channels(
+	void* ptr,
+	RustBuffer channels,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_request_handles(
+	void* ptr,
+	RustBuffer handles,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_reset_keys(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_roll_keys(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_share_status(
+	void* ptr,
+	int8_t active,
+	RustBuffer mode,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_update_channels(
+	void* ptr,
+	RustBuffer channels,
 	RustCallStatus* out_status
 );
 
@@ -965,6 +1504,18 @@ uint16_t uniffi_rustpushgo_checksum_method_client_delete_cloud_messages(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_findmy_friends_import(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_findmy_friends_refresh_json(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_findmy_phone_refresh_json(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_get_contacts_url(
 	RustCallStatus* out_status
 );
@@ -973,11 +1524,31 @@ uint16_t uniffi_rustpushgo_checksum_method_client_get_dsid(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_get_facetime_client(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_get_findmy_client(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_get_handles(
 	RustCallStatus* out_status
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_get_icloud_auth_headers(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_get_passwords_client(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_get_sharedstreams_client(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_get_statuskit_client(
 	RustCallStatus* out_status
 );
 
@@ -1017,6 +1588,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_edit(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_send_error_message(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_send_icon_change(
 	RustCallStatus* out_status
 );
@@ -1025,7 +1600,15 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_icon_clear(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_send_mark_unread(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_send_message(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_message_read_on_device(
 	RustCallStatus* out_status
 );
 
@@ -1033,7 +1616,19 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_move_to_recycle_bin(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_send_notify_anyways(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_send_peer_cache_invalidate(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_permanent_delete_chat(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_permanent_delete_messages(
 	RustCallStatus* out_status
 );
 
@@ -1049,6 +1644,22 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_rename_group(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_send_set_transcript_background(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_share_profile(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_sms_activation(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_sms_confirm_sent(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_send_tapback(
 	RustCallStatus* out_status
 );
@@ -1057,11 +1668,27 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_typing(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_send_typing_with_app(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_send_unschedule(
 	RustCallStatus* out_status
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_send_unsend(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_update_extension(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_update_profile(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_update_profile_sharing(
 	RustCallStatus* out_status
 );
 
@@ -1097,6 +1724,82 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedapsstate_to_string(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_add_members(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_clear_links(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_create_session(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_delete_link(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_export_state_json(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_get_link_for_usage(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_get_session_link(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_list_delegated_letmein_requests(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_remove_members(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_respond_delegated_letmein(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_ring(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_use_link_for(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_accept_item_share(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_delete_shared_item(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_export_state_bytes(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_export_state_json(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_sync_item_positions(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_sync_items(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_update_beacon_name(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_wrappedidsngmidentity_to_string(
 	RustCallStatus* out_status
 );
@@ -1118,6 +1821,150 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedidsusers_validate_keystore(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedosconfig_get_device_id(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_accept_invite(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_create_group(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_decline_invite(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_delete_password_raw_entry(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_export_state_json(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_get_password_site_counts(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_invite_user(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_list_password_raw_entry_refs(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_query_handle(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_remove_group(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_remove_user(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_rename_group(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_sync_passwords(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_upsert_password_raw_entry(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_create_asset_from_bytes(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_delete_assets(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_download_file_bytes(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_export_state_json(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_get_album_summary(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_get_assets_json(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_get_changes(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_list_album_ids(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_subscribe(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_subscribe_token(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_unsubscribe(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_clear_interest_tokens(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_configure_aps(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_ensure_channel(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_export_state_json(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_invite_to_channel(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_request_channels(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_request_handles(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_reset_keys(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_roll_keys(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_share_status(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_update_channels(
 	RustCallStatus* out_status
 );
 
