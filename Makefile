@@ -119,13 +119,8 @@ ensure-rustpush-source:
 		if [ ! -d third_party/rustpush-upstream/.git ]; then \
 			echo "Cloning upstream rustpush..."; \
 			mkdir -p third_party; \
-			git clone $(UPSTREAM_REPO) third_party/rustpush-upstream; \
+			git clone --recurse-submodules $(UPSTREAM_REPO) third_party/rustpush-upstream; \
 		fi; \
-		echo "Syncing upstream submodules over HTTPS..."; \
-		git -C third_party/rustpush-upstream config -f .gitmodules submodule.apple-private-apis.url https://github.com/OpenBubbles/apple-private-apis.git; \
-		git -C third_party/rustpush-upstream config -f .gitmodules submodule.open-absinthe.url https://github.com/OpenBubbles/OpenAbsinthe-Stub.git; \
-		git -C third_party/rustpush-upstream submodule sync --recursive; \
-		git -C third_party/rustpush-upstream submodule update --init --recursive; \
 		if [ ! -d third_party/rustpush-upstream/certs/fairplay ]; then \
 			echo "Generating FairPlay cert stubs..."; \
 			mkdir -p third_party/rustpush-upstream/certs/fairplay; \
