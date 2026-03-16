@@ -28,6 +28,7 @@ dpkg -s libssl-dev   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libssl-dev"
 # the Rust unicorn-engine-sys crate tries to build QEMU from source via CMake,
 # which often fails on WSL2 due to qemu/configure issues.
 dpkg -s libunicorn-dev >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libunicorn-dev"
+dpkg -s libheif-dev    >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libheif-dev"
 command -v sqlite3 >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES sqlite3"
 
 # Deduplicate

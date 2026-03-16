@@ -20,6 +20,7 @@ import (
 	"image"
 	"image/jpeg"
 	"math"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -58,13 +59,24 @@ import (
 // deletedPortalEntry tracks why a portal was marked as deleted.
 // Entries in recentlyDeletedPortals serve two purposes:
 //  1. Echo suppression: APNs messages with known UUIDs are dropped;
-//     fresh UUIDs are allowed through for new conversations.
+//     unknown UUIDs are only allowed through if they're newer than the
+//     deleted chat's known tail.
 //  2. Re-import guard: ingestCloudMessages marks messages as deleted=TRUE
 //     for portals in this map, preventing periodic re-syncs from re-importing
 //     messages with deleted=FALSE and triggering backfill resurrection.
 type deletedPortalEntry struct {
 	deletedAt   time.Time
 	isTombstone bool
+}
+
+// recycleBinCandidate represents a portal that has messages in Apple's recycle
+// bin. Stored after bootstrap and shown to the user via bridgebot notification
+// so they can choose which chats to delete with !delete-stale.
+type recycleBinCandidate struct {
+	portalID    string
+	displayName string
+	recoverable int
+	total       int
 }
 
 // failedAttachmentEntry tracks a CloudKit attachment download/upload failure
@@ -75,18 +87,22 @@ type failedAttachmentEntry struct {
 	retries   int
 }
 
-type sharedProfileFetchState struct {
-	lastRecordKey string
-	inFlight      bool
-	nextAllowed   time.Time
-	backoff       time.Duration
+type restoreStatusFunc func(format string, args ...any)
+
+type restorePipelineOptions struct {
+	PortalID       string
+	PortalKey      networkid.PortalKey
+	Source         string
+	DisplayName    string
+	Participants   []string
+	ChatID         string
+	GroupID        string
+	GroupPhotoGuid string
+	RecoverOnApple bool
+	Notify         restoreStatusFunc
 }
 
 const maxAttachmentRetries = 3
-const (
-	sharedProfileInitialBackoff = 2 * time.Minute
-	sharedProfileMaxBackoff     = 30 * time.Minute
-)
 
 // recordAttachmentFailure increments the retry count for a failed attachment.
 // Returns the updated entry so callers can log the retry count.
@@ -119,16 +135,6 @@ type IMClient struct {
 	// Contact source for name resolution (iCloud or external CardDAV)
 	contacts contactSource
 
-	// sharedProfiles caches iMessage profile data (Name & Me card) received
-	// via ShareProfile / UpdateProfile messages, keyed by sender identifier
-	// (e.g. "tel:+1234567890" or "mailto:user@icloud.com").
-	// Used as a supplement to CardDAV contacts in GetUserInfo.
-	sharedProfiles sync.Map // map[string]*rustpushgo.WrappedProfileRecord
-	// sharedProfileFetch tracks per-sender in-flight state and backoff so
-	// repeated ShareProfile events don't hammer Apple's profile API.
-	sharedProfileFetch   map[string]sharedProfileFetchState
-	sharedProfileFetchMu sync.Mutex
-
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool
 	contactsReadyLock sync.RWMutex
@@ -140,6 +146,12 @@ type IMClient struct {
 	// resurrect deleted portals before CloudKit sync confirms they're gone.
 	cloudSyncDone     bool
 	cloudSyncDoneLock sync.RWMutex
+
+	// cloudSyncRunning is true while any CloudKit sync cycle (bootstrap or
+	// periodic re-sync) is actively paging and importing records. Used by
+	// handleChatRecover to defer portal creation until messages are imported.
+	cloudSyncRunning     bool
+	cloudSyncRunningLock sync.RWMutex
 
 	// Cloud backfill local cache store.
 	cloudStore *cloudBackfillStore
@@ -153,6 +165,12 @@ type IMClient struct {
 	// Unsend re-delivery suppression
 	recentUnsends     map[string]time.Time
 	recentUnsendsLock sync.Mutex
+
+	// SMS reaction echo suppression: tracks UUIDs of SMS reaction messages sent
+	// from Matrix so the outgoing echo from the iPhone relay is not processed as
+	// a duplicate plain-text message in the Matrix room.
+	recentSmsReactionEchoes     map[string]time.Time
+	recentSmsReactionEchoesLock sync.Mutex
 
 	// Outbound unsend echo suppression: tracks target UUIDs of unsends
 	// initiated from Matrix so the APNs echo doesn't get double-processed.
@@ -213,6 +231,24 @@ type IMClient struct {
 	// dropped, fresh UUIDs are allowed through for new conversations.
 	recentlyDeletedPortals   map[string]deletedPortalEntry
 	recentlyDeletedPortalsMu sync.RWMutex
+
+	// recycleBinCandidates stores portal IDs found in Apple's recycle bin
+	// during bootstrap. NOT auto-deleted — shown to the user via bridgebot
+	// notification so they can decide which to remove with !delete-stale.
+	recycleBinCandidates   []recycleBinCandidate
+	recycleBinCandidatesMu sync.Mutex
+
+	// restoreMu serializes chat restores to prevent race conditions when
+	// multiple restores run concurrently (e.g. undeleting DB rows, refreshing
+	// metadata, and queuing ChatResync events for two portals at once).
+	restoreMu sync.Mutex
+	// restorePipelines tracks portals with an active restore worker.
+	// Used to dedupe duplicate restore requests for the same portal.
+	restorePipelines   map[string]bool
+	restorePipelinesMu sync.Mutex
+	// cloudSyncRunMu serializes manual restore-triggered CloudKit sync passes
+	// with the main sync controller so continuation token updates don't race.
+	cloudSyncRunMu sync.Mutex
 
 	// forwardBackfillSem limits concurrent forward backfills to avoid
 	// overwhelming CloudKit/Matrix with simultaneous attachment downloads.
@@ -280,12 +316,8 @@ var _ bridgev2.IdentifierResolvingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.BackfillingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.BackfillingNetworkAPIWithLimits = (*IMClient)(nil)
 var _ bridgev2.DeleteChatHandlingNetworkAPI = (*IMClient)(nil)
-var _ bridgev2.RoomNameHandlingNetworkAPI = (*IMClient)(nil)
-var _ bridgev2.RoomAvatarHandlingNetworkAPI = (*IMClient)(nil)
-var _ bridgev2.MembershipHandlingNetworkAPI = (*IMClient)(nil)
 var _ rustpushgo.MessageCallback = (*IMClient)(nil)
 var _ rustpushgo.UpdateUsersCallback = (*IMClient)(nil)
-var _ rustpushgo.StatusCallback = (*IMClient)(nil)
 
 // ============================================================================
 // APNs message reorder buffer
@@ -523,6 +555,20 @@ func (c *IMClient) onForwardBackfillDone() {
 			c.msgBuffer.flush()
 		}
 		c.flushPendingPortalMsgs()
+
+		// Re-run ghost name refresh now that all backfill ghosts are in the DB.
+		// If contacts loaded before backfill finished, the earlier
+		// refreshGhostNamesFromContacts call (triggered by setContactsReady)
+		// may have scanned the DB before backfill ghosts existed, leaving them
+		// with fallback display names. Multi-handle contacts are especially
+		// affected because makeCloudSender does not call canonicalizeDMSender,
+		// creating phantom sender ghosts that also need display names set.
+		c.contactsReadyLock.RLock()
+		contactsReady := c.contactsReady
+		c.contactsReadyLock.RUnlock()
+		if contactsReady {
+			go c.refreshGhostNamesFromContacts(log.Logger)
+		}
 	}
 }
 
@@ -539,7 +585,6 @@ func (c *IMClient) loadSenderGuidsFromDB(log zerolog.Logger) {
 	}
 
 	loadedGuids := 0
-	loadedNames := 0
 	for _, portal := range portals {
 		if portal.Receiver != c.UserLogin.ID {
 			continue // Skip portals for other users
@@ -563,9 +608,6 @@ func (c *IMClient) loadSenderGuidsFromDB(log zerolog.Logger) {
 	if loadedGuids > 0 {
 		log.Info().Int("count", loadedGuids).Msg("Pre-populated sender_guid cache from database")
 	}
-	if loadedNames > 0 {
-		log.Info().Int("count", loadedNames).Msg("Pre-populated group name cache from database")
-	}
 }
 
 func (c *IMClient) Connect(ctx context.Context) {
@@ -586,7 +628,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 		meta.IDSUsers = ""
 		meta.IDSIdentity = ""
 		meta.APSState = ""
-		_ = c.UserLogin.Save(ctx)
+		if err := c.UserLogin.Save(ctx); err != nil {
+			log.Error().Err(err).Msg("Failed to persist cleared login state after key loss")
+		}
 		c.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Message:    "Signing keys lost — please re-login to iMessage",
@@ -675,17 +719,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 	}
 
+	if c.Main.Config.HEICConversion {
+		log.Info().Msg("HEIC conversion enabled (libheif)")
+	}
+
 	// Persist state after connect (APS tokens, IDS keys, device ID)
 	c.persistState(log)
-
-	// Initialize StatusKit presence system (non-fatal — runs in background)
-	go func() {
-		if err := c.client.InitStatuskit(c); err != nil {
-			log.Warn().Err(err).Msg("StatusKit initialization failed — presence updates unavailable")
-		} else {
-			log.Info().Msg("StatusKit presence system initialized")
-		}
-	}()
 
 	// Pre-populate sender_guid cache from existing portal metadata
 	go c.loadSenderGuidsFromDB(log)
@@ -700,8 +739,15 @@ func (c *IMClient) Connect(ctx context.Context) {
 	if err = c.ensureCloudSyncStore(context.Background()); err != nil {
 		cloudStoreReady = false
 		log.Error().Err(err).Msg("Failed to initialize cloud backfill store")
+	} else {
+		// Fix any group messages that were mis-routed to the wrong portal
+		// (e.g., self-chat) due to the ";+;" CloudChatId routing bug.
+		if healed, healErr := c.cloudStore.healMisroutedGroupMessages(context.Background()); healErr != nil {
+			log.Warn().Err(healErr).Msg("Failed to heal mis-routed group messages")
+		} else if healed > 0 {
+			log.Info().Int("healed", healed).Msg("Healed mis-routed group messages at startup")
+		}
 	}
-
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 
 	// Set up contact source: external CardDAV > local macOS > iCloud CardDAV
@@ -732,8 +778,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 			log.Warn().Msg("Local macOS contacts unavailable — contact names will not be resolved")
 		}
 	} else {
-		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
-		cloudContacts := newCloudContactsClient(c.client, meta.MmeDelegateJSON, log)
+		cloudContacts := newCloudContactsClient(c.client, log)
 		if cloudContacts != nil {
 			c.contacts = cloudContacts
 			log.Info().Str("url", cloudContacts.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
@@ -786,7 +831,6 @@ func (c *IMClient) Disconnect() {
 		c.stopChan = nil
 	}
 	if c.client != nil {
-		c.client.UnsubscribeAllStatus()
 		c.client.Stop()
 		c.client.Destroy()
 		c.client = nil
@@ -819,48 +863,6 @@ func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal)
 // ============================================================================
 // Callbacks from rustpush
 // ============================================================================
-
-// OnStatusUpdate is called by the StatusKit presence system when a contact's
-// availability changes.  Maps iMessage presence → Matrix ghost presence.
-func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
-	log := c.UserLogin.Log.With().
-		Str("component", "statuskit").
-		Str("user", user).
-		Logger()
-
-	presence := event.PresenceUnavailable
-	statusMsg := ""
-	if available {
-		presence = event.PresenceOnline
-	} else if mode != nil && *mode != "" {
-		statusMsg = *mode // e.g. "com.apple.donotdisturb.mode.default"
-	}
-	log.Debug().
-		Str("presence", string(presence)).
-		Str("status_msg", statusMsg).
-		Msg("Received iMessage presence update")
-
-	ctx := context.Background()
-	ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
-	if err != nil || ghost == nil || ghost.Intent == nil {
-		log.Debug().Err(err).Msg("No ghost found for presence update — ignoring")
-		return
-	}
-
-	asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent)
-	if !ok {
-		log.Debug().Msg("Ghost intent is not *matrix.ASIntent — cannot set presence")
-		return
-	}
-
-	err = asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
-		Presence:  presence,
-		StatusMsg: statusMsg,
-	})
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to set Matrix presence for ghost")
-	}
-}
 
 // OnMessage is called by rustpush when a message is received via APNs.
 func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
@@ -898,23 +900,18 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 			Uint64("status", ptrUint64Or(msg.ErrorStatus, 0)).
 			Str("status_str", ptrStringOr(msg.ErrorStatusStr, "")).
 			Msg("Received iMessage error")
-		go c.handleMessageError(log, msg)
 		return
 	}
 	if msg.IsPeerCacheInvalidate {
-		log.Debug().Str("sender", ptrStringOr(msg.Sender, "")).Msg("Peer cache invalidated")
-		if msg.Sender != nil && *msg.Sender != "" && !c.isMyHandle(*msg.Sender) {
-			go func(sender string) {
-				conv := rustpushgo.WrappedConversation{Participants: []string{c.handle, sender}}
-				if err := c.client.SendPeerCacheInvalidate(conv, c.handle); err != nil {
-					log.Warn().Err(err).Str("sender", sender).Msg("Failed to send peer cache invalidate response")
-				}
-			}(ptrStringOr(msg.Sender, ""))
-		}
+		log.Debug().Msg("Peer cache invalidated")
 		return
 	}
 	if msg.IsMoveToRecycleBin || msg.IsPermanentDelete {
 		c.handleChatDelete(log, msg)
+		return
+	}
+	if msg.IsRecoverChat {
+		c.handleChatRecover(log, msg)
 		return
 	}
 	// Unsends bypass the buffer — they need to apply immediately and
@@ -935,102 +932,6 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	}
 	if msg.IsIconChange {
 		go c.handleIconChange(log, msg)
-		return
-	}
-
-	// Handle informational message types that don't produce Matrix events
-	if msg.IsMarkUnread {
-		log.Debug().Str("sender", ptrStringOr(msg.Sender, "")).Msg("Received mark-unread request")
-		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
-		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatResync{
-			EventMeta: simplevent.EventMeta{
-				Type:         bridgev2.RemoteEventChatResync,
-				PortalKey:    portalKey,
-				CreatePortal: false,
-				Timestamp:    time.UnixMilli(int64(msg.TimestampMs)),
-			},
-			GetChatInfoFunc: c.GetChatInfo,
-		})
-		return
-	}
-	if msg.IsRecoverChat {
-		c.handleRecoverChat(log, msg)
-		return
-	}
-	if msg.IsSmsActivation != nil {
-		enable := *msg.IsSmsActivation
-		log.Debug().Bool("enable", enable).Msg("Received SMS activation toggle")
-		if !enable {
-			// SMS relay was deactivated on the paired iPhone — report a transient
-			// disconnect so clients know SMS bridging is temporarily unavailable.
-			c.UserLogin.BridgeState.Send(status.BridgeState{
-				StateEvent: status.StateTransientDisconnect,
-				Error:      "sms-relay-deactivated",
-				Reason:     "SMS relay was deactivated on the paired iPhone",
-			})
-		} else {
-			// SMS relay re-enabled; restore to connected state.
-			c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
-		}
-		return
-	}
-	if msg.IsSmsConfirmSent != nil {
-		confirmed := *msg.IsSmsConfirmSent
-		log.Debug().Bool("confirmed", confirmed).Msg("Received SMS confirm sent")
-		// Wire SMS send confirmation to Matrix message status so the sender sees
-		// a delivery indicator. msg.Uuid is the UUID of the SMS being confirmed.
-		if msg.Uuid != "" {
-			go c.handleSmsConfirmSent(log, msg.Uuid, confirmed)
-		}
-		return
-	}
-	if msg.IsMessageReadOnDevice {
-		// Another Apple device has confirmed the message was read on the native
-		// iMessage client. Propagate this as a read receipt in the Matrix room
-		// so the read marker advances to match the device state.
-		log.Debug().Msg("Received message-read-on-device — routing as read receipt")
-		go c.handleReadReceipt(log, msg)
-		return
-	}
-	if msg.IsNotifyAnyways {
-		// Sender broke through Do Not Disturb. Trigger a resync so the room state
-		// is current and Matrix clients re-evaluate notification counts.
-		log.Debug().Msg("Received notify-anyways — queuing chat resync")
-		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
-		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatResync{
-			EventMeta: simplevent.EventMeta{
-				Type:         bridgev2.RemoteEventChatResync,
-				PortalKey:    portalKey,
-				CreatePortal: false,
-				Timestamp:    time.UnixMilli(int64(msg.TimestampMs)),
-			},
-			GetChatInfoFunc: c.GetChatInfo,
-		})
-		return
-	}
-	if msg.IsUnschedule || msg.IsUpdateExtension || msg.IsUpdateProfileSharing || msg.IsSetTranscriptBackground {
-		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
-		log.Debug().
-			Bool("unschedule", msg.IsUnschedule).
-			Bool("update_extension", msg.IsUpdateExtension).
-			Str("update_extension_for_uuid", ptrStringOr(msg.UpdateExtensionForUuid, "")).
-			Bool("update_profile_sharing", msg.IsUpdateProfileSharing).
-			Bool("set_transcript_background", msg.IsSetTranscriptBackground).
-			Str("portal_id", string(portalKey.ID)).
-			Msg("Received control message, queuing chat resync")
-		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatResync{
-			EventMeta: simplevent.EventMeta{
-				Type:         bridgev2.RemoteEventChatResync,
-				PortalKey:    portalKey,
-				CreatePortal: false,
-				Timestamp:    time.UnixMilli(int64(msg.TimestampMs)),
-			},
-			GetChatInfoFunc: c.GetChatInfo,
-		})
-		return
-	}
-	if msg.IsShareProfile && msg.Sender != nil && *msg.Sender != "" {
-		go c.handleShareProfile(log, msg)
 		return
 	}
 
@@ -1091,6 +992,23 @@ func (c *IMClient) flushPendingPortalMsgs() {
 	}
 }
 
+// reviveDeletedPortalShell clears chat-level deleted state without restoring
+// soft-deleted transcript rows. The chat becomes live again so a new portal
+// can be created, while old message UUIDs remain soft-deleted for stale-echo
+// suppression. OpenBubbles unconditionally revives on any incoming message;
+// we gate on tail-timestamp to avoid APNs replay false-positives.
+func (c *IMClient) reviveDeletedPortalShell(ctx context.Context, portalID string) error {
+	if c.cloudStore != nil {
+		if err := c.cloudStore.undeleteCloudChatByPortalID(ctx, portalID); err != nil {
+			return err
+		}
+	}
+	c.recentlyDeletedPortalsMu.Lock()
+	delete(c.recentlyDeletedPortals, portalID)
+	c.recentlyDeletedPortalsMu.Unlock()
+	return nil
+}
+
 // UpdateUsers is called when IDS keys are refreshed.
 // NOTE: This callback runs on the Tokio async runtime thread.  We must NOT
 // make blocking FFI calls back into Rust (e.g. connection.State()) on this
@@ -1118,19 +1036,51 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		log.Debug().Str("uuid", msg.Uuid).Msg("Suppressing re-delivery of unsent message")
 		return
 	}
+	if c.wasSmsReactionEcho(msg.Uuid) {
+		log.Debug().Str("uuid", msg.Uuid).Msg("Suppressing SMS reaction echo")
+		return
+	}
 
-	// Skip stored (re-delivered) APNs messages that were already bridged in a
-	// previous session. IsStoredMessage=true marks messages Apple buffered while
-	// the bridge was offline; if their UUID is already in the Bridge DB they've
-	// been processed before (or were sent by us and echo-suppressed). Re-delivering
-	// them would create duplicate or resurrected Matrix events, especially for
-	// messages whose portals were subsequently deleted.
-	if msg.IsStoredMessage && msg.Uuid != "" {
+	// Skip APNs messages that were already bridged (e.g. via CloudKit backfill
+	// or a previous session). After the initial backfill completes and the APNs
+	// buffer flushes, delayed APNs deliveries can arrive with IsStoredMessage=false
+	// for messages that CloudKit already bridged. Check the Bridge DB for any
+	// message whose UUID is already known to prevent duplicates.
+	if msg.Uuid != "" {
 		if dbMsgs, err := c.Main.Bridge.DB.Message.GetAllPartsByID(
 			context.Background(), c.UserLogin.ID, makeMessageID(msg.Uuid),
 		); err == nil && len(dbMsgs) > 0 {
-			log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored message already in bridge DB")
+			log.Debug().Str("uuid", msg.Uuid).Bool("is_stored", msg.IsStoredMessage).Msg("Skipping message already in bridge DB")
 			return
+		}
+		// Also check for UUID_* suffix variants (e.g. UUID_att0, UUID_att1, UUID_avid).
+		// Two past regressions left image messages in the bridge DB with suffixed
+		// IDs instead of the base UUID:
+		//
+		//   1. Pre-0755816: the attachment-index condition used the raw msg.Text
+		//      value (non-empty for "\ufffc" placeholder) instead of the stripped
+		//      form, so ALL image-only APNs messages were stored as UUID_att0.
+		//
+		//   2. baf5354 era: injectLivePhotoCompanion appended the MOV companion
+		//      at original index 1 and the HEIC-drop filter kept it there, so
+		//      Live Photo companions were stored as UUID_att1.
+		//
+		// An exact-match lookup on UUID misses both. A LIKE prefix query catches
+		// all suffix forms with a single round-trip.
+		rows, likeErr := c.Main.Bridge.DB.Database.Query(
+			context.Background(),
+			`SELECT 1 FROM message
+			 WHERE bridge_id=$1 AND (room_receiver=$2 OR room_receiver='') AND id LIKE $3
+			 LIMIT 1`,
+			c.Main.Bridge.ID, c.UserLogin.ID, string(makeMessageID(msg.Uuid))+"_%",
+		)
+		if likeErr == nil {
+			found := rows.Next()
+			_ = rows.Close()
+			if found {
+				log.Debug().Str("uuid", msg.Uuid).Bool("is_stored", msg.IsStoredMessage).Msg("Skipping message: UUID suffix variant found in bridge DB")
+				return
+			}
 		}
 	}
 
@@ -1149,6 +1099,26 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		return
 	}
 
+	// SMS/RCS group reactions and other messages sometimes arrive from the
+	// iPhone relay with an empty participant list. makePortalKey() then falls
+	// back to [sender, our_number] and computes a DM portal key, which can split
+	// one group chat into spurious DM portals.
+	//
+	// Only redirect DM->group when there is unambiguous evidence that this
+	// payload belongs to a known group. If evidence is ambiguous, keep the DM
+	// portal to avoid misrouting legitimate 1:1 SMS traffic.
+	if msg.IsSms && isComputedDMPortalID(portalKey.ID) {
+		if groupKey, ok := c.resolveSMSGroupRedirectPortal(msg); ok {
+			log.Debug().
+				Str("sender", ptr.Val(msg.Sender)).
+				Str("sender_guid", ptr.Val(msg.SenderGuid)).
+				Str("dm_portal", string(portalKey.ID)).
+				Str("group_portal", string(groupKey.ID)).
+				Msg("Redirecting SMS message from DM portal to known group portal")
+			portalKey = groupKey
+		}
+	}
+
 	// Track SMS portals so outbound replies use the correct service type
 	if msg.IsSms {
 		c.markPortalSMS(string(portalKey.ID))
@@ -1162,50 +1132,104 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// Two cases:
 	// 1. Portal is mid-deletion (still has MXID, but in recentlyDeletedPortals):
 	//    Drop known UUIDs — they're echoes of messages we already bridged.
-	//    Fresh UUIDs pass through (genuinely new conversation).
+	//    Unknown UUIDs are only allowed through if they advance the deleted tail.
 	// 2. Portal is fully gone (no MXID): Drop known UUIDs — CloudKit sync
 	//    knew about this message but chose not to create a portal.
 	portalID := string(portalKey.ID)
 	c.recentlyDeletedPortalsMu.RLock()
 	deletedEntry, isDeletedPortal := c.recentlyDeletedPortals[portalID]
 	c.recentlyDeletedPortalsMu.RUnlock()
+	backgroundCtx := context.Background()
+	msgTS := int64(msg.TimestampMs)
+	existingPortal, _ := c.Main.Bridge.GetExistingPortalByKey(backgroundCtx, portalKey)
+	missingPortal := existingPortal == nil || existingPortal.MXID == ""
+
+	// Lazy-load soft-deleted portal info. Only queries the DB when we
+	// actually need it (deleted portal checks or soft-delete guard), not
+	// on every message to a missing portal.
+	var softDeletedInfo softDeletedPortalInfo
+	softDeletedInfoLoaded := false
+	loadSoftDeletedInfo := func() bool {
+		if softDeletedInfoLoaded {
+			return softDeletedInfo.Deleted
+		}
+		softDeletedInfoLoaded = true
+		if c.cloudStore == nil {
+			return false
+		}
+		info, err := c.cloudStore.getSoftDeletedPortalInfo(backgroundCtx, portalID)
+		if err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to query soft-deleted portal state")
+			return false
+		}
+		softDeletedInfo = info
+		return info.Deleted
+	}
+
+	// reviveAndAllow clears the chat-level deleted state and flushes
+	// held messages so the genuinely newer message can create a portal.
+	// Returns true if the revive succeeded (or wasn't needed).
+	reviveAndAllow := func(reason string) bool {
+		revived := true
+		if softDeletedInfo.Deleted {
+			if err := c.reviveDeletedPortalShell(backgroundCtx, portalID); err != nil {
+				log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to revive deleted chat shell before allowing newer message")
+				revived = false
+			}
+		}
+		log.Info().
+			Str("portal_id", portalID).
+			Str("msg_uuid", msg.Uuid).
+			Bool("is_tombstone", deletedEntry.isTombstone).
+			Int64("deleted_tail_ts", softDeletedInfo.NewestTS).
+			Uint64("msg_ts", msg.TimestampMs).
+			Msg(reason)
+		if c.msgBuffer != nil {
+			c.msgBuffer.flush()
+		}
+		c.flushPendingPortalMsgs()
+		return revived
+	}
 
 	// Suppress stale echoes that would resurrect deleted portals.
 	if isDeletedPortal && createPortal {
-		existing, _ := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
-		if existing == nil || existing.MXID == "" {
-			// Portal is fully gone. Use deletedAt as the suppression threshold:
-			// APNs can replay messages sent ANY time before re-connect, including
-			// messages sent after startup but before the delete (e.g. an outgoing
-			// message that was buffered on reconnect). startupTime is too coarse —
-			// it misses that window. deletedAt catches the exact right boundary.
-			// The hasMessageUUID check below provides a complementary second layer.
+		if missingPortal {
+			// Compare against the deleted chat's own latest known timestamp.
+			// OpenBubbles unconditionally revives on any message; we add
+			// tail-timestamp gating to handle APNs replays that OpenBubbles
+			// doesn't encounter (it syncs via CloudKit, not realtime APNs).
+			isSoftDeleted := loadSoftDeletedInfo()
+			if isSoftDeleted && softDeletedInfo.NewestTS > 0 && msgTS <= softDeletedInfo.NewestTS {
+				log.Info().
+					Str("portal_id", portalID).
+					Str("msg_uuid", msg.Uuid).
+					Bool("is_tombstone", deletedEntry.isTombstone).
+					Int64("deleted_tail_ts", softDeletedInfo.NewestTS).
+					Uint64("msg_ts", msg.TimestampMs).
+					Msg("Dropped message: replay for deleted portal is not newer than deleted tail")
+				return
+			}
+			// Use deletedAt as the suppression threshold when available:
+			// APNs can replay messages sent ANY time before re-connect,
+			// including messages sent after startup but before the delete.
+			// startupTime is too coarse — deletedAt catches the exact boundary.
 			suppressBefore := deletedEntry.deletedAt.UnixMilli()
 			if suppressBefore <= 0 {
 				suppressBefore = c.startupTime.UnixMilli()
 			}
-			if int64(msg.TimestampMs) < suppressBefore {
+			if !isSoftDeleted && suppressBefore > 0 && int64(msg.TimestampMs) < suppressBefore {
 				log.Info().
 					Str("portal_id", portalID).
 					Str("msg_uuid", msg.Uuid).
 					Bool("is_tombstone", deletedEntry.isTombstone).
 					Uint64("msg_ts", msg.TimestampMs).
 					Int64("suppress_before_ts", suppressBefore).
-					Msg("Dropped message: pre-delete message for deleted portal (stale echo)")
+					Msg("Dropped message: pre-delete message for deleted portal (stale echo fallback)")
 				return
 			}
-			// Post-startup message → genuinely new conversation with this contact.
-			// Flush the APNs buffer now so any held pre-sync messages are
-			// dispatched before this new message creates a portal.
-			log.Info().
-				Str("portal_id", portalID).
-				Str("msg_uuid", msg.Uuid).
-				Bool("is_tombstone", deletedEntry.isTombstone).
-				Msg("Post-startup message for deleted portal — flushing buffer and allowing new conversation")
-			if c.msgBuffer != nil {
-				c.msgBuffer.flush()
+			if reviveAndAllow("Newer message for deleted portal — reviving chat shell and allowing new conversation") {
+				isDeletedPortal = false
 			}
-			c.flushPendingPortalMsgs()
 			// Fall through with createPortal=true to create the new portal.
 		} else {
 			// Portal still has an MXID (mid-deletion): route to existing room
@@ -1215,7 +1239,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	}
 
 	if c.cloudStore != nil {
-		if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+		if known, _ := c.cloudStore.hasMessageUUID(backgroundCtx, msg.Uuid); known {
 			if isDeletedPortal {
 				// Portal mid-deletion with a known UUID — stale echo.
 				log.Info().
@@ -1224,27 +1248,40 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 					Msg("Dropped message: known UUID for recently-deleted portal (mid-deletion echo)")
 				return
 			}
-			if createPortal {
+			if createPortal && missingPortal {
 				// Portal fully deleted. No bridge portal exists.
-				existing, _ := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
-				if existing == nil || existing.MXID == "" {
-					log.Info().
-						Str("portal_id", portalID).
-						Str("msg_uuid", msg.Uuid).
-						Msg("Dropped message: known UUID with no portal (stale echo of deleted chat)")
-					return
-				}
+				log.Info().
+					Str("portal_id", portalID).
+					Str("msg_uuid", msg.Uuid).
+					Msg("Dropped message: known UUID with no portal (stale echo of deleted chat)")
+				return
 			}
 		}
 	}
+
+	// Suppress stale APNs re-delivery for chats that are still soft-deleted in
+	// our DB, including after restart when recentlyDeletedPortals is empty.
+	// Only genuinely newer traffic is allowed to recreate the portal.
+	if createPortal && missingPortal && !isDeletedPortal && loadSoftDeletedInfo() {
+		if softDeletedInfo.NewestTS > 0 && msgTS <= softDeletedInfo.NewestTS {
+			log.Info().
+				Str("portal_id", portalID).
+				Str("msg_uuid", msg.Uuid).
+				Int64("deleted_tail_ts", softDeletedInfo.NewestTS).
+				Uint64("msg_ts", msg.TimestampMs).
+				Msg("Dropped message: soft-deleted chat replay is not newer than deleted tail")
+			return
+		}
+		reviveAndAllow("Newer message for soft-deleted chat — reviving chat shell and allowing portal recreation")
+	}
+
 	// Hold messages for portals that don't exist yet while CloudKit sync
 	// is in progress. Without this, the framework drops events where
 	// CreatePortal=false and portal.MXID="". We intentionally skip UUID
 	// persistence here so that replayed messages aren't mistakenly treated
 	// as known echoes by hasMessageUUID on the second pass.
 	if !createPortal {
-		existing, _ := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
-		if existing == nil || existing.MXID == "" {
+		if missingPortal {
 			c.pendingPortalMsgsMu.Lock()
 			c.pendingPortalMsgs = append(c.pendingPortalMsgs, msg)
 			c.pendingPortalMsgsMu.Unlock()
@@ -1260,7 +1297,9 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// hasMessageUUID checks cloud_message regardless of the deleted flag,
 	// so soft-deleted UUIDs from prior portal deletions still match.
 	if c.cloudStore != nil {
-		_ = c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe)
+		if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe); err != nil {
+			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist message UUID; duplicates may occur on restart")
+		}
 	}
 	if createPortal || sender.IsFromMe {
 		log.Info().
@@ -1272,7 +1311,8 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Msg("Portal creation decision for message")
 	}
 
-	if msg.Text != nil && *msg.Text != "" && strings.TrimRight(*msg.Text, "\ufffc \n") != "" {
+	hasText := msg.Text != nil && *msg.Text != "" && strings.TrimRight(*msg.Text, "\ufffc \n") != ""
+	if hasText {
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*rustpushgo.WrappedMessage]{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventMessage,
@@ -1290,28 +1330,15 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		})
 	}
 
-	// Live Photo handling: when a message has both an iris (Live Photo) video
-	// and a still image, skip the still so only the motion video is bridged.
-	hasIrisVideo := false
-	for _, att := range msg.Attachments {
-		if att.Iris && strings.HasPrefix(att.MimeType, "video/") {
-			hasIrisVideo = true
-			break
-		}
-	}
-
+	// Live Photo handling: bridge both the still image and the video.
 	attIndex := 0
 	for _, att := range msg.Attachments {
 		// Skip rich link sideband attachments (handled in convertMessage)
 		if att.MimeType == "x-richlink/meta" || att.MimeType == "x-richlink/image" {
 			continue
 		}
-		// Skip the HEIC still when we have the Live Photo video
-		if hasIrisVideo && !att.Iris && strings.HasPrefix(att.MimeType, "image/") {
-			continue
-		}
 		attID := msg.Uuid
-		if attIndex > 0 || (msg.Text != nil && *msg.Text != "") {
+		if attIndex > 0 || hasText {
 			attID = fmt.Sprintf("%s_att%d", msg.Uuid, attIndex)
 		}
 		attMsg := &attachmentMessage{
@@ -1334,13 +1361,37 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Data: attMsg,
 			ID:   makeMessageID(attID),
 			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
-				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding)
+				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
 			},
 		})
 	}
 }
 
 func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	// Skip stored (buffered) tapbacks — CloudKit backfill handles those via
+	// BackfillReaction at the correct historical position. Processing them here
+	// as live events gives them current server time, placing them at the end of
+	// the room timeline and making Beeper show a stale reaction as the room
+	// preview instead of the most recent message.
+	// Same pattern as handleRename and handleParticipantChange.
+	// Regression introduced by PR #20 (lwittwer/pr/tapback-edit-dedup, 693d353):
+	// that commit added IsStoredMessage guards to handleEdit but omitted them
+	// for handleTapback, leaving stored tapbacks to fire as live events.
+	if msg.IsStoredMessage {
+		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored tapback")
+		return
+	}
+
+	// Deduplicate: skip tapbacks already processed (e.g. via CloudKit backfill)
+	// to prevent duplicate reactions and notifications from stale APNs re-delivery.
+	// Uses the same cloud_message UUID table as handleMessage (primary key lookup).
+	if msg.Uuid != "" && c.cloudStore != nil {
+		if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+			log.Debug().Str("uuid", msg.Uuid).Bool("is_stored", msg.IsStoredMessage).Msg("Skipping tapback already in message store")
+			return
+		}
+	}
+
 	targetGUID := ptrStringOr(msg.TapbackTargetUuid, "")
 
 	// Resolve portal by target message UUID first as a safety net.
@@ -1351,33 +1402,24 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	}
 
-	// Sticker tapbacks (type 7) carry an image that was placed on top of a
-	// message bubble. Matrix reactions are text-only, so bridge the sticker
-	// as an image message replying to the target instead.
-	if msg.TapbackType != nil && *msg.TapbackType == 7 && msg.StickerData != nil && len(*msg.StickerData) > 0 {
-		stickerData := *msg.StickerData
-		stickerMime := "image/png"
-		if msg.StickerMime != nil && *msg.StickerMime != "" {
-			stickerMime = *msg.StickerMime
+	// Persist the tapback UUID so cross-restart APNs re-deliveries are caught
+	// by the hasMessageUUID check above. Uses persistTapbackUUID (not
+	// persistMessageUUID) to set tapback_type, preventing getConversationReadByMe
+	// from treating the synthetic row as a substantive message and spuriously
+	// flipping the conversation to unread for incoming reactions.
+	// APNs TapbackType is a 0-6 index; cloud_message stores raw 2000-2006 / 3000-3006.
+	if msg.Uuid != "" && c.cloudStore != nil {
+		sender := c.makeEventSender(msg.Sender)
+		storedType := uint32(2000) // sentinel default (Love) when TapbackType is nil
+		if msg.TapbackType != nil {
+			storedType = *msg.TapbackType + 2000
+			if msg.TapbackRemove {
+				storedType += 1000 // removals: 3000-3006, matching TapbackRemoveOffset
+			}
 		}
-		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*stickerTapbackData]{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventMessage,
-				PortalKey: portalKey,
-				Sender:    c.canonicalizeDMSender(portalKey, c.makeEventSender(msg.Sender)),
-				Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
-			},
-			Data: &stickerTapbackData{
-				ImageData: stickerData,
-				MimeType:  stickerMime,
-				TargetID:  targetGUID,
-			},
-			ID: makeMessageID(msg.Uuid),
-			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *stickerTapbackData) (*bridgev2.ConvertedMessage, error) {
-				return convertStickerTapback(ctx, intent, data)
-			},
-		})
-		return
+		if err := c.cloudStore.persistTapbackUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe, storedType); err != nil {
+			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist tapback UUID; duplicates may occur on restart")
+		}
 	}
 
 	emoji := tapbackTypeToEmoji(msg.TapbackType, msg.TapbackEmoji)
@@ -1409,10 +1451,8 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 	if portalKey.ID == "" {
 		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	}
-	newText := ptrStringOr(msg.EditNewText, "")
 
-	// Capture HTML in a local var for the closure
-	editHtmlVal := msg.Html
+	newText := ptrStringOr(msg.EditNewText, "")
 
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[string]{
 		EventMeta: simplevent.EventMeta{
@@ -1429,19 +1469,14 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 			if len(existing) > 0 {
 				targetPart = existing[0]
 			}
-			content := &event.MessageEventContent{
-				MsgType: event.MsgText,
-				Body:    text,
-			}
-			if editHtmlVal != nil && *editHtmlVal != "" {
-				content.Format = event.FormatHTML
-				content.FormattedBody = *editHtmlVal
-			}
 			return &bridgev2.ConvertedEdit{
 				ModifiedParts: []*bridgev2.ConvertedEditPart{{
 					Part: targetPart,
 					Type: event.EventMessage,
-					Content: content,
+					Content: &event.MessageEventContent{
+						MsgType: event.MsgText,
+						Body:    text,
+					},
 				}},
 			}, nil
 		},
@@ -1476,121 +1511,6 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		},
 		TargetMessage: makeMessageID(targetGUID),
 	})
-}
-
-func (c *IMClient) handleShareProfile(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	sender := *msg.Sender
-	log = log.With().Str("sender", sender).Logger()
-
-	if msg.ShareProfileRecordKey == nil || msg.ShareProfileDecryptionKey == nil {
-		log.Debug().Msg("ShareProfile message has no record key or decryption key, ignoring")
-		return
-	}
-	recordKey := *msg.ShareProfileRecordKey
-
-	if !c.beginSharedProfileFetch(sender, recordKey, log) {
-		return
-	}
-	defer c.endSharedProfileFetch(sender)
-
-	log.Info().Msg("Fetching shared iMessage profile")
-	record, err := c.client.FetchProfile(recordKey, *msg.ShareProfileDecryptionKey, msg.ShareProfileHasPoster)
-	if err != nil {
-		c.recordSharedProfileFetchError(sender, err, log)
-		log.Warn().Err(err).Msg("Failed to fetch shared profile")
-		return
-	}
-	c.recordSharedProfileFetchSuccess(sender)
-
-	c.sharedProfiles.Store(sender, &record)
-	log.Info().
-		Str("display_name", record.DisplayName).
-		Str("first_name", record.FirstName).
-		Str("last_name", record.LastName).
-		Bool("has_avatar", record.Avatar != nil && len(*record.Avatar) > 0).
-		Msg("Cached shared iMessage profile")
-
-	// Refresh the ghost so the Matrix-side display name / avatar updates.
-	ctx := context.Background()
-	userID := makeUserID(sender)
-	ghost, err := c.Main.Bridge.GetGhostByID(ctx, userID)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to get ghost for profile update")
-		return
-	}
-	info, err := c.GetUserInfo(ctx, ghost)
-	if err != nil || info == nil {
-		return
-	}
-	ghost.UpdateInfo(ctx, info)
-	log.Info().Msg("Updated ghost info from shared profile")
-}
-
-func (c *IMClient) beginSharedProfileFetch(sender, recordKey string, log zerolog.Logger) bool {
-	now := time.Now()
-	c.sharedProfileFetchMu.Lock()
-	defer c.sharedProfileFetchMu.Unlock()
-	if c.sharedProfileFetch == nil {
-		c.sharedProfileFetch = make(map[string]sharedProfileFetchState)
-	}
-	state := c.sharedProfileFetch[sender]
-
-	if state.inFlight {
-		if state.lastRecordKey == recordKey {
-			log.Debug().Msg("Skipping shared profile fetch: identical fetch already in flight")
-		} else {
-			log.Debug().Msg("Skipping shared profile fetch: another profile fetch in flight")
-		}
-		return false
-	}
-	if now.Before(state.nextAllowed) {
-		log.Debug().Time("next_allowed", state.nextAllowed).Msg("Skipping shared profile fetch: sender cooldown active")
-		return false
-	}
-
-	state.inFlight = true
-	state.lastRecordKey = recordKey
-	c.sharedProfileFetch[sender] = state
-	return true
-}
-
-func (c *IMClient) endSharedProfileFetch(sender string) {
-	c.sharedProfileFetchMu.Lock()
-	defer c.sharedProfileFetchMu.Unlock()
-	state := c.sharedProfileFetch[sender]
-	state.inFlight = false
-	c.sharedProfileFetch[sender] = state
-}
-
-func (c *IMClient) recordSharedProfileFetchError(sender string, err error, log zerolog.Logger) {
-	errStr := strings.ToLower(err.Error())
-	if !strings.Contains(errStr, "too many requests") {
-		return
-	}
-
-	c.sharedProfileFetchMu.Lock()
-	defer c.sharedProfileFetchMu.Unlock()
-	state := c.sharedProfileFetch[sender]
-	if state.backoff <= 0 {
-		state.backoff = sharedProfileInitialBackoff
-	} else {
-		state.backoff *= 2
-		if state.backoff > sharedProfileMaxBackoff {
-			state.backoff = sharedProfileMaxBackoff
-		}
-	}
-	state.nextAllowed = time.Now().Add(state.backoff)
-	c.sharedProfileFetch[sender] = state
-	log.Warn().Dur("cooldown", state.backoff).Time("next_allowed", state.nextAllowed).Msg("Rate-limited while fetching shared profile; backing off sender")
-}
-
-func (c *IMClient) recordSharedProfileFetchSuccess(sender string) {
-	c.sharedProfileFetchMu.Lock()
-	defer c.sharedProfileFetchMu.Unlock()
-	state := c.sharedProfileFetch[sender]
-	state.backoff = 0
-	state.nextAllowed = time.Time{}
-	c.sharedProfileFetch[sender] = state
 }
 
 func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -1775,6 +1695,85 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 	})
 }
 
+// safeCloudDownloadGroupPhoto wraps the FFI call with panic recovery and a
+// 90-second timeout, matching the pattern used by safeCloudDownloadAttachment.
+func safeCloudDownloadGroupPhoto(ctx context.Context, client *rustpushgo.Client, recordName string) ([]byte, error) {
+	type dlResult struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan dlResult, 1)
+	go func() {
+		var res dlResult
+		defer func() {
+			if r := recover(); r != nil {
+				stack := string(debug.Stack())
+				log.Error().Str("ffi_method", "CloudDownloadGroupPhoto").
+					Str("record_name", recordName).
+					Str("stack", stack).
+					Msgf("FFI panic recovered: %v", r)
+				res = dlResult{err: fmt.Errorf("FFI panic in CloudDownloadGroupPhoto: %v", r)}
+			}
+			ch <- res
+		}()
+		d, e := client.CloudDownloadGroupPhoto(recordName)
+		res = dlResult{data: d, err: e}
+	}()
+	select {
+	case res := <-ch:
+		return res.data, res.err
+	case <-time.After(90 * time.Second):
+		log.Error().Str("ffi_method", "CloudDownloadGroupPhoto").
+			Str("record_name", recordName).
+			Msg("CloudDownloadGroupPhoto timed out after 90s — inner goroutine leaked until FFI unblocks")
+		return nil, fmt.Errorf("CloudDownloadGroupPhoto timed out after 90s")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// fetchAndCacheGroupPhoto attempts to download the group photo from CloudKit
+// using the record_name stored during chat sync. It tries the CloudKit "gp"
+// (group photo) asset field on the chat record. Apple's iMessage clients may
+// not always write to this field (preferring MMCS delivery via APNs IconChange
+// messages), so failures are expected and logged at debug level rather than
+// warning. On success, the bytes are persisted to group_photo_cache so
+// subsequent GetChatInfo calls can serve the photo without a network round-trip.
+// Returns (photoData, timestampMs); both are zero on any failure.
+func (c *IMClient) fetchAndCacheGroupPhoto(ctx context.Context, log zerolog.Logger, portalID string) ([]byte, int64) {
+	if c.cloudStore == nil {
+		return nil, 0
+	}
+	_, recordName, err := c.cloudStore.getGroupPhotoByPortalID(ctx, portalID)
+	if err != nil {
+		log.Debug().Err(err).Msg("group_photo: failed to look up record_name for CloudKit download")
+		return nil, 0
+	}
+	if recordName == "" {
+		log.Debug().Msg("group_photo: no group_photo_guid in cloud_chat, skipping CloudKit download")
+		return nil, 0
+	}
+	log.Debug().Str("record_name", recordName).Msg("group_photo: attempting CloudKit download")
+	data, dlErr := safeCloudDownloadGroupPhoto(ctx, c.client, recordName)
+	if dlErr != nil {
+		log.Debug().Err(dlErr).Str("record_name", recordName).
+			Msg("group_photo: CloudKit download failed (expected if Apple did not write gp asset)")
+		return nil, 0
+	}
+	if len(data) == 0 {
+		log.Debug().Str("record_name", recordName).Msg("group_photo: CloudKit download returned empty data")
+		return nil, 0
+	}
+	ts := time.Now().UnixMilli()
+	if saveErr := c.cloudStore.saveGroupPhoto(ctx, portalID, ts, data); saveErr != nil {
+		log.Warn().Err(saveErr).Msg("group_photo: failed to cache downloaded photo")
+	} else {
+		log.Info().Str("record_name", recordName).Int("bytes", len(data)).
+			Msg("group_photo: downloaded and cached from CloudKit")
+	}
+	return data, ts
+}
+
 // handleIconChange processes a group photo (icon) change from APNs.
 // When a participant changes or clears the group photo from their iMessage
 // client, Apple delivers an IconChange message with MMCS transfer data.
@@ -1856,119 +1855,1282 @@ func (c *IMClient) handleIconChange(log zerolog.Logger, msg rustpushgo.WrappedMe
 	})
 }
 
+// makeDeletePortalKey constructs a PortalKey from the delete/recover-specific
+// fields in a WrappedMessage. Delete and recover APNs messages populate
+// DeleteChatGuid, DeleteChatGroupId, and DeleteChatParticipants instead of
+// the regular Participants/GroupName/Sender/SenderGuid fields.
+//
+// Strategy: look up the portal_id from cloud_chat DB first (most reliable),
+// then fall back to parsing the chat GUID or building from participants.
+func (c *IMClient) makeDeletePortalKey(log zerolog.Logger, msg rustpushgo.WrappedMessage) networkid.PortalKey {
+	ctx := context.Background()
+
+	// Best path: look up portal_id from cloud_chat by chat GUID or group_id.
+	// The cloud_chat table knows the correct portal_id for both DMs and groups.
+	if c.cloudStore != nil {
+		// Try chat GUID first (e.g. "iMessage;-;+1234567890" or "iMessage;+;chat123")
+		if msg.DeleteChatGuid != nil && *msg.DeleteChatGuid != "" {
+			if portalID, err := c.cloudStore.getChatPortalID(ctx, *msg.DeleteChatGuid); err == nil && portalID != "" {
+				log.Debug().Str("portal_id", portalID).Str("chat_guid", *msg.DeleteChatGuid).Msg("Resolved delete portal from cloud_chat by chat GUID")
+				return networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
+			}
+		}
+		// Try group_id (UUID)
+		if msg.DeleteChatGroupId != nil && *msg.DeleteChatGroupId != "" {
+			if portalID, err := c.cloudStore.getChatPortalID(ctx, *msg.DeleteChatGroupId); err == nil && portalID != "" {
+				log.Debug().Str("portal_id", portalID).Str("group_id", *msg.DeleteChatGroupId).Msg("Resolved delete portal from cloud_chat by group ID")
+				return networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
+			}
+		}
+	}
+
+	// Fallback: parse the chat GUID to construct portal ID directly.
+	if msg.DeleteChatGuid != nil && *msg.DeleteChatGuid != "" {
+		parsed := imessage.ParseIdentifier(*msg.DeleteChatGuid)
+		if parsed.LocalID != "" && !parsed.IsGroup {
+			portalID := identifierToPortalID(parsed)
+			log.Debug().Str("portal_id", string(portalID)).Msg("Resolved delete portal from chat GUID parsing")
+			return networkid.PortalKey{ID: portalID, Receiver: c.UserLogin.ID}
+		}
+	}
+
+	// Fallback: use group_id for groups
+	if msg.DeleteChatGroupId != nil && *msg.DeleteChatGroupId != "" && len(msg.DeleteChatParticipants) > 1 {
+		gidID := "gid:" + strings.ToLower(*msg.DeleteChatGroupId)
+		portalKey := networkid.PortalKey{ID: networkid.PortalID(gidID), Receiver: c.UserLogin.ID}
+
+		c.gidAliasesMu.RLock()
+		aliasedID, hasAlias := c.gidAliases[gidID]
+		c.gidAliasesMu.RUnlock()
+		if hasAlias {
+			portalKey.ID = networkid.PortalID(aliasedID)
+			return portalKey
+		}
+		if existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey); existing != nil && existing.MXID != "" {
+			return portalKey
+		}
+		if len(msg.DeleteChatParticipants) > 0 {
+			resolved := c.resolveExistingGroupByGid(gidID, *msg.DeleteChatGroupId, msg.DeleteChatParticipants)
+			return networkid.PortalKey{ID: resolved, Receiver: c.UserLogin.ID}
+		}
+		return portalKey
+	}
+
+	// Last resort: build from participants
+	if len(msg.DeleteChatParticipants) == 1 {
+		portalID := addIdentifierPrefix(msg.DeleteChatParticipants[0])
+		return networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
+	}
+	if len(msg.DeleteChatParticipants) > 1 {
+		members := make([]string, 0, len(msg.DeleteChatParticipants)+1)
+		members = append(members, c.handle)
+		for _, p := range msg.DeleteChatParticipants {
+			members = append(members, addIdentifierPrefix(p))
+		}
+		sort.Strings(members)
+		return networkid.PortalKey{
+			ID:       networkid.PortalID(strings.Join(members, ",")),
+			Receiver: c.UserLogin.ID,
+		}
+	}
+
+	log.Warn().Msg("Delete/recover message has no delete-specific fields, falling back to regular makePortalKey")
+	return c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+}
+
+func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	deleteType := "MoveToRecycleBin"
+	if msg.IsPermanentDelete {
+		deleteType = "PermanentDelete"
+	}
+
+	log.Info().
+		Str("delete_type", deleteType).
+		Int("uuid_count", len(msg.DeleteMessageUuids)).
+		Msg("Processing per-message delete")
+
+	for _, targetUUID := range msg.DeleteMessageUuids {
+		portalKey := c.resolvePortalByTargetMessage(log, targetUUID)
+		if portalKey.ID == "" {
+			log.Debug().
+				Str("target_uuid", targetUUID).
+				Msg("Message UUID not found in bridge DB, skipping")
+			continue
+		}
+
+		log.Info().
+			Str("target_uuid", targetUUID).
+			Str("portal_id", string(portalKey.ID)).
+			Msg("Sending redaction for deleted message")
+
+		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.MessageRemove{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventMessageRemove,
+				PortalKey: portalKey,
+				Sender:    c.makeEventSender(msg.Sender),
+				Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
+			},
+			TargetMessage: makeMessageID(targetUUID),
+		})
+	}
+}
+
 func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
 	deleteType := "MoveToRecycleBin"
 	if msg.IsPermanentDelete {
 		deleteType = "PermanentDelete"
 	}
-	portalKey := c.resolveDeletePortalKey(log, msg)
-	if portalKey.ID == "" || portalKey.ID == "unknown" {
-		log.Warn().
-			Str("delete_type", deleteType).
-			Str("chat_guid", ptrStringOr(msg.DeleteChatGuid, "")).
-			Strs("participants", msg.DeleteChatParticipants).
-			Msg("Couldn't resolve portal for incoming Apple delete event")
+
+	// Per-message delete: DeleteMessageUuids is populated, chat-level fields are empty.
+	// Route to handleMessageDelete which does per-message redaction via the bridge DB.
+	if len(msg.DeleteMessageUuids) > 0 {
+		c.handleMessageDelete(log, msg)
 		return
 	}
 
-	sender := c.makeEventSender(msg.Sender)
-	if sender.Sender == "" {
-		sender = bridgev2.EventSender{IsFromMe: true, SenderLogin: c.UserLogin.ID, Sender: makeUserID(c.handle)}
+	// chatdb backend: preserve master behavior — ignore Apple-initiated deletes.
+	if !c.Main.Config.UseCloudKitBackfill() {
+		log.Info().Str("delete_type", deleteType).Msg("Ignoring incoming Apple chat delete (chatdb backend)")
+		return
 	}
 
-	timestamp := time.Now()
-	if msg.TimestampMs > 0 {
-		timestamp = time.UnixMilli(int64(msg.TimestampMs))
+	portalKey := c.makeDeletePortalKey(log, msg)
+	portalID := string(portalKey.ID)
+
+	log.Info().
+		Str("delete_type", deleteType).
+		Str("portal_id", portalID).
+		Str("msg_uuid", msg.Uuid).
+		Msg("Processing incoming Apple chat delete")
+
+	// Track as recently deleted so APNs echoes don't recreate it.
+	c.trackDeletedChat(portalID)
+
+	// Soft-delete local DB records (preserves UUIDs for echo detection).
+	if c.cloudStore != nil {
+		if err := c.cloudStore.clearRestoreOverride(context.Background(), portalID); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to clear restore override for Apple-deleted chat")
+		}
+		if err := c.cloudStore.deleteLocalChatByPortalID(context.Background(), portalID); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete local records for Apple-deleted chat")
+		}
 	}
 
-	if len(msg.DeleteMessageUuids) == 0 {
-		// Chat-level delete target.
+	// Queue bridge portal deletion if it exists.
+	existing, _ := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
+	if existing != nil && existing.MXID != "" {
+		log.Info().
+			Str("portal_id", portalID).
+			Str("delete_type", deleteType).
+			Msg("Deleting Beeper portal for Apple-deleted chat")
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatDelete{
 			EventMeta: simplevent.EventMeta{
 				Type:      bridgev2.RemoteEventChatDelete,
 				PortalKey: portalKey,
-				Sender:    sender,
-				Timestamp: timestamp,
+				Timestamp: time.Now(),
+				LogContext: func(lc zerolog.Context) zerolog.Context {
+					return lc.Str("source", "apns_chat_delete").Str("delete_type", deleteType)
+				},
 			},
 			OnlyForMe: true,
-			Children:  false,
 		})
-		log.Info().Str("delete_type", deleteType).Str("portal_id", string(portalKey.ID)).Msg("Queued chat delete from incoming Apple delete event")
+	} else {
+		log.Debug().
+			Str("portal_id", portalID).
+			Msg("No existing portal for Apple-deleted chat (already gone or never created)")
+	}
+}
+
+func (c *IMClient) handleChatRecover(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	// chatdb backend: no-op. Recovery is CloudKit-only.
+	if !c.Main.Config.UseCloudKitBackfill() {
+		log.Debug().Msg("Ignoring RecoverChat (chatdb backend)")
 		return
 	}
 
-	// Message-level delete target.
-	for _, target := range msg.DeleteMessageUuids {
-		if target == "" {
-			continue
+	// Log all available fields from the recover APNs message for diagnostics.
+	// Recovery failures are often caused by missing/empty delete-specific fields.
+	recoverLog := log.With().
+		Str("msg_uuid", msg.Uuid).
+		Interface("delete_chat_guid", msg.DeleteChatGuid).
+		Interface("delete_chat_group_id", msg.DeleteChatGroupId).
+		Int("delete_participants_count", len(msg.DeleteChatParticipants)).
+		Strs("delete_participants", msg.DeleteChatParticipants).
+		Interface("sender_guid", msg.SenderGuid).
+		Logger()
+
+	portalKey := c.makeDeletePortalKey(recoverLog, msg)
+	portalID := string(portalKey.ID)
+
+	if portalID == "" {
+		recoverLog.Warn().Msg("Chat recovery: could not resolve portal ID from recover message — skipping")
+		return
+	}
+
+	// For group portals, cross-reference cloud_chat to find the canonical
+	// portal_id. The APNs recover message may carry the chat_id UUID
+	// (different from the group_id UUID), producing gid:<chat_uuid> while
+	// the existing portal uses gid:<group_uuid>. Without this, we'd create
+	// a duplicate portal for the same group.
+	if strings.HasPrefix(portalID, "gid:") && c.cloudStore != nil {
+		uuid := strings.TrimPrefix(portalID, "gid:")
+		if altPortalIDs, err := c.cloudStore.findPortalIDsByGroupID(context.Background(), uuid); err == nil {
+			for _, altID := range altPortalIDs {
+				if altID != portalID {
+					recoverLog.Info().
+						Str("original_portal_id", portalID).
+						Str("canonical_portal_id", altID).
+						Msg("Resolved group recovery portal to canonical portal_id via cloud_chat")
+					portalID = altID
+					portalKey.ID = networkid.PortalID(altID)
+					break
+				}
+			}
 		}
-		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.MessageRemove{
-			EventMeta: simplevent.EventMeta{
-				Type:      bridgev2.RemoteEventMessageRemove,
-				PortalKey: portalKey,
-				Sender:    sender,
-				Timestamp: timestamp,
-			},
-			TargetMessage: makeMessageID(target),
-			OnlyForMe:     true,
-		})
 	}
-	log.Info().
-		Str("delete_type", deleteType).
-		Str("portal_id", string(portalKey.ID)).
-		Int("message_count", len(msg.DeleteMessageUuids)).
-		Msg("Queued message deletes from incoming Apple delete event")
+
+	// Always honor RecoverChat from APNs. Two scenarios:
+	// 1. Echo of our own !restore-chat → portal already exists → ChatResync is a no-op.
+	// 2. User recovered from iPhone/Mac → legitimate recovery → we should recreate the portal.
+	// Previously this blocked non-tombstone entries, but that prevented legitimate
+	// iPhone recoveries of chats deleted from Beeper.
+	recoverLog.Info().
+		Str("portal_id", portalID).
+		Msg("Processing incoming Apple chat recovery from trash — queuing")
+
+	// Cache participants from the recover message so resolveGroupMembers can find
+	// them during ChatResync even before cloud_chat persistence settles.
+	var seedParticipants []string
+	for _, p := range msg.DeleteChatParticipants {
+		if n := normalizeIdentifierForPortalID(p); n != "" {
+			seedParticipants = append(seedParticipants, n)
+		}
+	}
+	if strings.HasPrefix(portalID, "gid:") && len(msg.DeleteChatParticipants) > 0 {
+		normalized := make([]string, 0, len(msg.DeleteChatParticipants)+1)
+		normalized = append(normalized, c.handle)
+		for _, p := range msg.DeleteChatParticipants {
+			normalized = append(normalized, addIdentifierPrefix(p))
+		}
+		sort.Strings(normalized)
+		c.imGroupParticipantsMu.Lock()
+		c.imGroupParticipants[portalID] = normalized
+		c.imGroupParticipantsMu.Unlock()
+	}
+
+	chatID := ""
+	if msg.DeleteChatGuid != nil {
+		chatID = *msg.DeleteChatGuid
+	}
+	groupID := ""
+	if msg.DeleteChatGroupId != nil {
+		groupID = *msg.DeleteChatGroupId
+	}
+	if err := c.startRestoreBackfillPipeline(restorePipelineOptions{
+		PortalID:     portalID,
+		PortalKey:    portalKey,
+		Source:       "apns_chat_recover",
+		Participants: seedParticipants,
+		ChatID:       chatID,
+		GroupID:      groupID,
+		// APNs recover indicates Apple-side recovery already happened.
+		RecoverOnApple: false,
+	}); err != nil {
+		recoverLog.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to start restore pipeline for recovered chat")
+	}
 }
 
-func (c *IMClient) handleRecoverChat(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.resolveDeletePortalKey(log, msg)
-	if portalKey.ID == "" || portalKey.ID == "unknown" {
-		log.Warn().
-			Str("chat_guid", ptrStringOr(msg.DeleteChatGuid, "")).
-			Strs("participants", msg.DeleteChatParticipants).
-			Msg("Couldn't resolve portal for incoming Apple recover-chat event")
-		return
+func (c *IMClient) startRestoreBackfillPipeline(opts restorePipelineOptions) error {
+	portalID := strings.TrimSpace(opts.PortalID)
+	if portalID == "" {
+		return fmt.Errorf("restore portal ID is empty")
+	}
+	opts.PortalID = portalID
+	if opts.PortalKey.ID == "" {
+		opts.PortalKey.ID = networkid.PortalID(portalID)
+	}
+	if opts.PortalKey.Receiver == "" && c.UserLogin != nil {
+		opts.PortalKey.Receiver = c.UserLogin.ID
+	}
+	if opts.Source == "" {
+		opts.Source = "restore_pipeline"
 	}
 
-	if err := c.restorePortalByID(context.Background(), string(portalKey.ID)); err != nil {
-		log.Warn().Err(err).
-			Str("portal_id", string(portalKey.ID)).
-			Msg("Failed to restore chat from incoming Apple recover-chat event")
-		return
+	c.restorePipelinesMu.Lock()
+	if c.restorePipelines == nil {
+		c.restorePipelines = make(map[string]bool)
 	}
+	if c.restorePipelines[portalID] {
+		c.restorePipelinesMu.Unlock()
+		if opts.Notify != nil {
+			label := opts.DisplayName
+			if label == "" {
+				label = portalID
+			}
+			opts.Notify("Restore for **%s** is already in progress.", label)
+		}
+		return nil
+	}
+	c.restorePipelines[portalID] = true
+	c.restorePipelinesMu.Unlock()
 
-	log.Info().
-		Str("portal_id", string(portalKey.ID)).
-		Msg("Restored chat from incoming Apple recover-chat event")
+	go c.runRestoreBackfillPipeline(opts)
+	return nil
 }
 
-func (c *IMClient) resolveDeletePortalKey(log zerolog.Logger, msg rustpushgo.WrappedMessage) networkid.PortalKey {
+func (c *IMClient) finishRestoreBackfillPipeline(portalID string) {
+	c.restorePipelinesMu.Lock()
+	delete(c.restorePipelines, portalID)
+	c.restorePipelinesMu.Unlock()
+}
+
+func (c *IMClient) notifyRestoreStatus(opts restorePipelineOptions, format string, args ...any) {
+	if opts.Notify == nil {
+		return
+	}
+	opts.Notify(format, args...)
+}
+
+func restoreRetryDelay(attempt int) time.Duration {
+	switch attempt {
+	case 1:
+		return 15 * time.Second
+	case 2:
+		return 60 * time.Second
+	case 3:
+		return 3 * time.Minute
+	default:
+		return 10 * time.Minute
+	}
+}
+
+
+func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
+	defer c.finishRestoreBackfillPipeline(opts.PortalID)
+
+	portalID := opts.PortalID
+	portalKey := opts.PortalKey
 	ctx := context.Background()
 
-	if msg.DeleteChatGuid != nil && *msg.DeleteChatGuid != "" && c.cloudStore != nil {
-		if portalID, err := c.cloudStore.getChatPortalID(ctx, *msg.DeleteChatGuid); err != nil {
-			log.Warn().Err(err).Str("chat_guid", *msg.DeleteChatGuid).Msg("Failed to resolve portal by cloud chat ID")
-		} else if portalID != "" {
-			return networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
+	displayName := strings.TrimSpace(opts.DisplayName)
+	if displayName == "" {
+		displayName = friendlyPortalName(ctx, c.Main.Bridge, c, portalKey, portalID)
+	}
+	if displayName == "" {
+		displayName = portalID
+	}
+
+	log := c.UserLogin.Log.With().
+		Str("portal_id", portalID).
+		Str("source", opts.Source).
+		Logger()
+
+	if !c.Main.Config.UseCloudKitBackfill() || c.cloudStore == nil {
+		log.Warn().Msg("Restore pipeline started without CloudKit backfill; queueing plain ChatResync")
+		c.refreshRecoveredPortalAfterCloudSync(log, portalKey, opts.Source)
+		c.notifyRestoreStatus(opts, "Restore of **%s** queued.", displayName)
+		return
+	}
+
+	c.notifyRestoreStatus(opts, "Restoring **%s** — syncing iCloud history…", displayName)
+
+	// Stage 1: restore prerequisites (undelete + metadata seeding).
+	// Lock only covers DB mutations. Network I/O (metadata refresh,
+	// recycle bin recovery, Apple APNs) runs after unlock to avoid
+	// starving concurrent restores during slow CloudKit calls.
+	c.restoreMu.Lock()
+	if err := c.cloudStore.setRestoreOverride(ctx, portalID); err != nil {
+		log.Warn().Err(err).Msg("Failed to persist restore override")
+	}
+	c.recentlyDeletedPortalsMu.Lock()
+	delete(c.recentlyDeletedPortals, portalID)
+	c.recentlyDeletedPortalsMu.Unlock()
+	if len(opts.Participants) > 0 || opts.DisplayName != "" || opts.ChatID != "" || opts.GroupID != "" || opts.GroupPhotoGuid != "" {
+		c.cloudStore.seedChatFromRecycleBin(
+			ctx,
+			portalID,
+			opts.ChatID,
+			opts.GroupID,
+			opts.DisplayName,
+			opts.GroupPhotoGuid,
+			opts.Participants,
+		)
+	}
+	// Clear the chat-level tombstone (deleted=TRUE) that seedDeletedChatsFromRecycleBin
+	// may have set. Without this, the main CloudKit zone message sync's portalHasChat
+	// check returns false and silently discards all messages for this portal.
+	if err := c.cloudStore.undeleteCloudChatByPortalID(ctx, portalID); err != nil {
+		log.Warn().Err(err).Msg("Failed to undelete cloud_chat tombstone for restore")
+	} else {
+		log.Info().Msg("Cleared cloud_chat tombstone for restore portal")
+	}
+	undeleted, err := c.cloudStore.undeleteCloudMessagesByPortalID(ctx, portalID)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to undelete cloud_message rows")
+	} else {
+		log.Info().Int("undeleted", undeleted).Msg("Undeleted cloud_message rows for restore")
+	}
+	needsRecoverMessages := false
+	if hasMessages, err := c.cloudStore.hasPortalMessages(ctx, portalID); err != nil {
+		log.Warn().Err(err).Msg("Failed to check portal messages during restore")
+	} else if !hasMessages {
+		needsRecoverMessages = true
+	}
+	c.restoreMu.Unlock()
+
+	// Network I/O: refresh metadata and recover messages outside the mutex.
+	// The restorePipelines map already prevents per-portal concurrency.
+	if strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",") {
+		c.refreshRecoveredChatMetadata(log, portalID, opts.Participants)
+	}
+	if needsRecoverMessages {
+		c.recoverMessagesFromRecycleBin(log, portalID, opts.Participants)
+	}
+	if opts.RecoverOnApple {
+		c.recoverChatOnApple(portalID)
+	}
+
+	// Stage 2: Attempt to import CloudKit message history.
+	//
+	// Retry up to maxRestoreAttempts times. CloudKit is eventually consistent —
+	// after Apple recovers a chat, messages may still be propagating from the
+	// recycle bin zone back to the main zone. Each attempt runs the full
+	// targeted+unfiltered CloudFetchRecentMessages path.
+	//
+	// We do NOT do a forced full-zone re-sync here. Clearing global zone tokens
+	// causes every message in every portal to be re-ingested through
+	// resolveConversationID. When cloud_chat rows for other portals are
+	// soft-deleted at that moment, from-me messages can be misrouted to the
+	// self-chat portal, corrupting it.
+
+	// Create a context that cancels on shutdown so CloudKit fetches
+	// are bounded and interruptible.
+	fetchCtx, fetchCancel := context.WithCancel(context.Background())
+	defer fetchCancel()
+	if c.stopChan != nil {
+		stopCh := c.stopChan
+		go func() {
+			select {
+			case <-stopCh:
+				fetchCancel()
+			case <-fetchCtx.Done():
+			}
+		}()
+	}
+
+	const maxRestoreAttempts = 4
+	historyImported := false
+	for attempt := range maxRestoreAttempts {
+		if attempt > 0 {
+			delay := restoreRetryDelay(attempt)
+			c.notifyRestoreStatus(opts, "Restore for **%s** is still syncing. Retrying in %s.", displayName, delay.Round(time.Second))
+			select {
+			case <-time.After(delay):
+			case <-fetchCtx.Done():
+				log.Info().Int("attempt", attempt).Msg("Restore pipeline stopped during retry wait")
+			}
+			if fetchCtx.Err() != nil {
+				break
+			}
+		}
+
+		attemptCtx, attemptCancel := context.WithTimeout(fetchCtx, 2*time.Minute)
+		imported, diag, importErr := c.fetchRecoveredMessagesFromCloudKit(attemptCtx, log.With().Int("attempt", attempt+1).Logger(), portalID)
+		attemptCancel()
+
+		if fetchCtx.Err() != nil {
+			break
+		}
+		if importErr != nil {
+			log.Warn().Err(importErr).Int("attempt", attempt+1).Msg("Targeted restore fetch failed")
+		} else if imported > 0 {
+			log.Info().
+				Int("imported", imported).
+				Int("attempt", attempt+1).
+				Msg("Restore pipeline: imported messages from CloudKit")
+			historyImported = true
+			break
+		} else {
+			// Emit a diagnostic notification to help diagnose zero-message fetches.
+			// Two cases:
+			//   diag.UnfilteredTotal == 0: messages not yet in main CloudKit zone
+			//     (likely still propagating from recycle bin after Apple recovery)
+			//     → worth retrying later, CloudKit is eventually consistent
+			//   diag.UnfilteredTotal > 0 but matched == 0: messages are in the
+			//     zone but under a different chatId (e.g. phone number vs email).
+			//     SampleChatIDs shows what chatIds ARE present.
+			//     → retrying will never help; stop and report to the user
+			if diag != nil && diag.UnfilteredTotal > 0 {
+				log.Warn().Int("attempt", attempt+1).
+					Int("zone_total", diag.UnfilteredTotal).
+					Strs("sample_chat_ids", diag.SampleChatIDs).
+					Msg("Restore pipeline: messages in zone but none matched portal — chatId format mismatch, stopping retries")
+				c.notifyRestoreStatus(opts,
+					"Restore of **%s** — scanned %d messages in recovery zone but none matched this chat. "+
+						"The chat may be in the main iCloud zone (will appear once sync completes). "+
+						"Sample IDs found: %s. Check logs for `Unfiltered scan complete`.",
+					displayName, diag.UnfilteredTotal, strings.Join(diag.SampleChatIDs, ", "))
+				// A chatId format mismatch won't resolve on its own — break out of
+				// the retry loop immediately.
+				break
+			}
+			// diag.UnfilteredTotal == 0 (or diag is nil): messages not yet visible
+			// in the main zone — may still be in recycle bin. Worth retrying.
+			if diag != nil {
+				log.Warn().Int("attempt", attempt+1).
+					Msg("Restore pipeline: CloudKit main zone empty (messages may still be in recycle bin)")
+				if attempt == 0 {
+					c.notifyRestoreStatus(opts, "Restore of **%s** — iCloud history not yet available (messages may still be moving from recycle bin to main zone). Retrying…", displayName)
+				}
+			} else {
+				log.Warn().Int("attempt", attempt+1).Msg("Restore pipeline: fetch returned 0 messages")
+			}
 		}
 	}
 
-	if msg.DeleteChatGroupId != nil && *msg.DeleteChatGroupId != "" {
-		return networkid.PortalKey{ID: networkid.PortalID("gid:" + strings.ToLower(*msg.DeleteChatGroupId)), Receiver: c.UserLogin.ID}
+	// If shutdown was the reason we exited the retry loop, don't create
+	// portals or send messages — just exit cleanly.
+	if fetchCtx.Err() != nil {
+		log.Info().Msg("Restore pipeline: shutdown detected, skipping portal recreation")
+		return
 	}
 
-	if len(msg.DeleteChatParticipants) > 0 {
-		return c.makePortalKey(msg.DeleteChatParticipants, nil, msg.Sender, msg.DeleteChatGroupId)
+	// Always recreate the portal regardless of whether we found history.
+	// The old code always did this — without it, a failed/delayed fetch means
+	// the portal never comes back at all. The normal CloudKit sync will
+	// backfill history when messages become available in the main zone.
+	//
+	// When no history was imported, send a bot notice into the restored room
+	// so the user sees the chat in Beeper (empty rooms may be hidden) and
+	// understands why there's no message history.
+	var postCreate func(context.Context, *bridgev2.Portal)
+	if !historyImported {
+		postCreate = func(ctx context.Context, portal *bridgev2.Portal) {
+			if portal == nil || portal.MXID == "" {
+				return
+			}
+			notice := "Chat restored from iCloud. No message history was available — messages may have expired from Apple's recycle bin."
+			_, err := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+				Parsed: &event.MessageEventContent{
+					MsgType: event.MsgNotice,
+					Body:    notice,
+				},
+			}, nil)
+			if err != nil {
+				log.Warn().Err(err).Str("portal_id", string(portal.ID)).
+					Msg("Failed to send empty-restore notice to room")
+			}
+		}
+	}
+	c.queueRecoveredPortalResync(log, portalKey, opts.Source, postCreate)
+	if historyImported {
+		c.notifyRestoreStatus(opts, "Restore of **%s** complete — history backfill is running.", displayName)
+	} else {
+		log.Warn().Int("attempts", maxRestoreAttempts).Msg("Restore pipeline: no CloudKit history found after all attempts; portal recreated anyway")
+		c.notifyRestoreStatus(opts, "Restore of **%s** — chat recreated. Message history may appear once iCloud finishes syncing.", displayName)
+	}
+}
+
+// refreshRecoveredChatMetadata performs a targeted CloudKit chat scan and
+// re-ingests matching chat records for a recovered portal. This is restore-flow
+// specific and ensures recovered group portals pick up custom names/photos even
+// when the local tombstone row had sparse metadata.
+func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID string, knownParticipants ...[]string) {
+	if c.client == nil || c.cloudStore == nil {
+		return
 	}
 
-	if msg.Sender != nil && *msg.Sender != "" {
-		normalized := normalizeIdentifierForPortalID(*msg.Sender)
-		if normalized != "" {
-			return networkid.PortalKey{ID: networkid.PortalID(normalized), Receiver: c.UserLogin.ID}
+	ctx := context.Background()
+	targetGroupID := ""
+	targetUUID := ""
+	if strings.HasPrefix(portalID, "gid:") {
+		targetUUID = strings.TrimPrefix(portalID, "gid:")
+		targetGroupID = targetUUID
+	}
+	targetChatID := c.cloudStore.getChatIdentifierByPortalID(ctx, portalID)
+
+	// Search the RECYCLE BIN for metadata, not the main chatManateeZone.
+	// Deleted chats are moved to the recycle bin zone — they no longer
+	// appear in the main zone. Paging chatManateeZone would never find
+	// them, wasting hundreds of CloudKit API calls for nothing.
+	recoverableChats, err := c.client.ListRecoverableChats()
+	if err != nil {
+		log.Warn().Err(err).Str("portal_id", portalID).
+			Msg("Failed to list recoverable chats for metadata refresh")
+		return
+	}
+
+	log.Info().
+		Str("portal_id", portalID).
+		Str("target_chat_id", targetChatID).
+		Str("target_group_id", targetGroupID).
+		Int("recycle_bin_count", len(recoverableChats)).
+		Msg("refreshRecoveredChatMetadata: searching recycle bin")
+	for i, chat := range recoverableChats {
+		dn := ""
+		if chat.DisplayName != nil {
+			dn = *chat.DisplayName
+		}
+		log.Debug().
+			Int("index", i).
+			Str("cloud_chat_id", chat.CloudChatId).
+			Str("group_id", chat.GroupId).
+			Int64("style", chat.Style).
+			Str("display_name", dn).
+			Int("participants", len(chat.Participants)).
+			Msg("refreshRecoveredChatMetadata: recycle bin entry")
+	}
+
+	var matched []rustpushgo.WrappedCloudSyncChat
+	for _, chat := range recoverableChats {
+		sameChatID := targetChatID != "" && normalizeUUID(chat.CloudChatId) == normalizeUUID(targetChatID)
+		sameGroupID := targetGroupID != "" && normalizeUUID(chat.GroupId) == normalizeUUID(targetGroupID)
+		sameChatUUID := targetUUID != "" && normalizeUUID(chat.CloudChatId) == normalizeUUID(targetUUID)
+		if sameChatID || sameGroupID || sameChatUUID {
+			matched = append(matched, chat)
 		}
 	}
 
-	return networkid.PortalKey{ID: "unknown", Receiver: c.UserLogin.ID}
+	// Fallback: if UUID matching failed (e.g. portal ID is a per-participant
+	// encryption UUID, not the real group_id), try matching by participants.
+	// Per-participant encryption envelopes each get a unique UUID, so the
+	// portal's gid:<uuid> won't match any recycle bin chat record. But the
+	// chat record's participants WILL overlap with our known participants.
+	if len(matched) == 0 && len(knownParticipants) > 0 && len(knownParticipants[0]) > 0 {
+		knownSet := make(map[string]bool)
+		for _, p := range knownParticipants[0] {
+			norm := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(p, "tel:"), "mailto:"))
+			if norm != "" {
+				knownSet[norm] = true
+			}
+		}
+		for _, chat := range recoverableChats {
+			if chat.Style != 43 || len(chat.Participants) == 0 {
+				continue
+			}
+			overlapCount := 0
+			for _, cp := range chat.Participants {
+				norm := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(normalizeIdentifierForPortalID(cp), "tel:"), "mailto:"))
+				if norm != "" && knownSet[norm] {
+					overlapCount++
+				}
+			}
+			if overlapCount > 0 {
+				matched = append(matched, chat)
+			}
+		}
+		if len(matched) > 0 {
+			log.Info().Str("portal_id", portalID).Int("matched", len(matched)).
+				Msg("Matched recycle bin chat by participant overlap (per-participant UUID fallback)")
+			// Seed directly with our portal ID rather than going through
+			// ingestCloudChats, which would resolve to gid:<real-group-id>
+			// (not our per-participant UUID portal ID).
+			for _, chat := range matched {
+				displayName := ""
+				if chat.DisplayName != nil {
+					displayName = *chat.DisplayName
+				}
+				var normParts []string
+				for _, p := range chat.Participants {
+					if n := normalizeIdentifierForPortalID(p); n != "" {
+						normParts = append(normParts, n)
+					}
+				}
+				photoGuid := ""
+				if chat.GroupPhotoGuid != nil {
+					photoGuid = *chat.GroupPhotoGuid
+				}
+				c.cloudStore.seedChatFromRecycleBin(ctx, portalID, chat.CloudChatId, chat.GroupId, displayName, photoGuid, normParts)
+			}
+			log.Info().Str("portal_id", portalID).Int("matched", len(matched)).
+				Msg("Seeded chat metadata from recycle bin (participant fallback)")
+			return
+		}
+	}
+
+	if len(matched) == 0 {
+		log.Debug().Str("portal_id", portalID).
+			Msg("No match in recycle bin — scanning main CloudKit chat zone for group metadata")
+		// Recycle bin is empty (Apple already recovered the chat back to the
+		// main zone). Scan CloudSyncChats to find the group record with the
+		// custom name and photo. Limit to 30 pages to avoid excessive API use;
+		// recently-recovered chats should appear near the top of the feed.
+		knownSet := make(map[string]bool)
+		for _, slice := range knownParticipants {
+			for _, p := range slice {
+				norm := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(p, "tel:"), "mailto:"))
+				if norm != "" {
+					knownSet[norm] = true
+				}
+			}
+		}
+		// Also build from cloud_chat participants if knownParticipants is empty.
+		if len(knownSet) == 0 {
+			dbParts, _ := c.cloudStore.getChatParticipantsByPortalID(ctx, portalID)
+			for _, p := range dbParts {
+				norm := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(p, "tel:"), "mailto:"))
+				if norm != "" {
+					knownSet[norm] = true
+				}
+			}
+		}
+		if len(knownSet) > 0 {
+			var token *string
+			const maxChatScanPages = 30
+			for page := 0; page < maxChatScanPages; page++ {
+				chatsPage, pageErr := c.client.CloudSyncChats(token)
+				if pageErr != nil {
+					log.Warn().Err(pageErr).Int("page", page).
+						Msg("CloudSyncChats page failed during main-zone name scan")
+					break
+				}
+				for _, chat := range chatsPage.Chats {
+					if chat.Style != 43 || len(chat.Participants) == 0 {
+						continue
+					}
+					overlapCount := 0
+					for _, cp := range chat.Participants {
+						norm := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(normalizeIdentifierForPortalID(cp), "tel:"), "mailto:"))
+						if norm != "" && knownSet[norm] {
+							overlapCount++
+						}
+					}
+					if overlapCount > 0 {
+						matched = append(matched, chat)
+					}
+				}
+				if len(matched) > 0 {
+					log.Info().Str("portal_id", portalID).Int("page", page).Int("matched", len(matched)).
+						Msg("Found group chat in main CloudKit zone (participant match)")
+					break
+				}
+				if chatsPage.ContinuationToken == nil {
+					break
+				}
+				token = chatsPage.ContinuationToken
+			}
+		}
+		if len(matched) == 0 {
+			log.Debug().Str("portal_id", portalID).
+				Msg("No matching chat metadata found in recycle bin or main zone")
+			return
+		}
+		// Seed from main zone match using same logic as recycle bin path.
+		for _, chat := range matched {
+			displayName := ""
+			if chat.DisplayName != nil {
+				displayName = *chat.DisplayName
+			}
+			var normParts []string
+			for _, p := range chat.Participants {
+				if n := normalizeIdentifierForPortalID(p); n != "" {
+					normParts = append(normParts, n)
+				}
+			}
+			photoGuid := ""
+			if chat.GroupPhotoGuid != nil {
+				photoGuid = *chat.GroupPhotoGuid
+			}
+			c.cloudStore.seedChatFromRecycleBin(ctx, portalID, chat.CloudChatId, chat.GroupId, displayName, photoGuid, normParts)
+		}
+		log.Info().Str("portal_id", portalID).Int("matched", len(matched)).
+			Msg("Seeded group chat metadata from main CloudKit zone")
+		return
+	}
+
+	// Seed matched records directly with our portal ID rather than using
+	// ingestCloudChats. ingestCloudChats calls resolvePortalIDForCloudChat
+	// which can resolve to a DIFFERENT portal ID (e.g. gid:<real-group-id>
+	// instead of our gid:<per-participant-uuid>), causing messages to be
+	// routed to wrong portals (including the self-chat).
+	for _, chat := range matched {
+		displayName := ""
+		if chat.DisplayName != nil {
+			displayName = *chat.DisplayName
+		}
+		var normParts []string
+		for _, p := range chat.Participants {
+			if n := normalizeIdentifierForPortalID(p); n != "" {
+				normParts = append(normParts, n)
+			}
+		}
+		photoGuid := ""
+		if chat.GroupPhotoGuid != nil {
+			photoGuid = *chat.GroupPhotoGuid
+		}
+		c.cloudStore.seedChatFromRecycleBin(ctx, portalID, chat.CloudChatId, chat.GroupId, displayName, photoGuid, normParts)
+	}
+
+	log.Info().Str("portal_id", portalID).Int("matched", len(matched)).
+		Msg("Seeded recovered chat metadata from recycle bin (UUID match)")
+}
+
+// recoverMessagesFromRecycleBin attempts to recover messages for a portal from
+// Apple's recycle bin zone. When a chat is deleted, its messages are moved to
+// recoverableMessageDeleteZone — NOT the main messageManateeZone. This function
+// uses ListRecoverableMessageGuids to find those messages and cross-references
+// them with the local cloud_message table to undelete matching rows.
+//
+// This replaces the old approach of paging ALL of messageManateeZone (which was
+// both extremely expensive and incorrect — deleted messages aren't there).
+func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID string, knownParticipants ...[]string) {
+	if c.client == nil || c.cloudStore == nil {
+		return
+	}
+
+	ctx := context.Background()
+
+	// Get recoverable message GUIDs from the recycle bin zone.
+	entries, err := c.client.ListRecoverableMessageGuids()
+	if err != nil {
+		log.Warn().Err(err).Str("portal_id", portalID).
+			Msg("Failed to list recoverable message GUIDs for restore")
+		return
+	}
+
+	if len(entries) == 0 {
+		log.Debug().Str("portal_id", portalID).Msg("No recoverable messages found in recycle bin")
+		return
+	}
+
+	// Extract just the GUIDs from entries (format: "guid|metadata...").
+	var allGUIDs []string
+	for _, entry := range entries {
+		guid := recoverableGUIDFromEntry(entry)
+		if guid != "" {
+			allGUIDs = append(allGUIDs, guid)
+		}
+	}
+
+	if len(allGUIDs) == 0 {
+		return
+	}
+
+	// Undelete cloud_message rows for this portal whose GUIDs appear in the
+	// recycle bin. The rows were soft-deleted during CloudKit sync when their
+	// parent chat was deleted.
+	nowMS := time.Now().UnixMilli()
+	restored := 0
+	const chunkSize = 500
+	for i := 0; i < len(allGUIDs); i += chunkSize {
+		end := i + chunkSize
+		if end > len(allGUIDs) {
+			end = len(allGUIDs)
+		}
+		chunk := allGUIDs[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+3)
+		args = append(args, c.cloudStore.loginID, portalID, nowMS)
+		for j, guid := range chunk {
+			placeholders[j] = fmt.Sprintf("$%d", j+4)
+			args = append(args, guid)
+		}
+		query := fmt.Sprintf(
+			`UPDATE cloud_message SET deleted=FALSE, updated_ts=$3 WHERE login_id=$1 AND portal_id=$2 AND guid IN (%s) AND deleted=TRUE`,
+			strings.Join(placeholders, ","),
+		)
+		result, execErr := c.cloudStore.db.Exec(ctx, query, args...)
+		if execErr != nil {
+			log.Warn().Err(execErr).Msg("Failed to undelete recovered messages from recycle bin")
+			continue
+		}
+		n, _ := result.RowsAffected()
+		restored += int(n)
+	}
+
+	log.Info().Str("portal_id", portalID).Int("recycle_bin_guids", len(allGUIDs)).
+		Int("restored", restored).Msg("Recovered messages from recycle bin")
+
+	// If no existing rows were undeleted (cloud_message is empty), seed
+	// placeholder rows from the recycle bin metadata. This makes
+	// hasPortalMessages() return true so GetChatInfo.CanBackfill enables
+	// backfill. The placeholder rows carry enough metadata (guid, sender,
+	// timestamp, cloud_chat_id) for the bridge to page CloudKit messages.
+	if restored == 0 {
+		// Build a set of acceptable senders from known participants.
+		// This prevents mixing messages from other deleted groups when
+		// accepting per-participant encryption UUID gid: entries.
+		knownSenders := make(map[string]bool)
+		if len(knownParticipants) > 0 {
+			for _, p := range knownParticipants[0] {
+				norm := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(p, "tel:"), "mailto:"))
+				if norm != "" {
+					knownSenders[norm] = true
+				}
+			}
+		}
+		isGidPortal := strings.HasPrefix(portalID, "gid:")
+
+		seeded := 0
+		for _, entry := range entries {
+			metadata, ok := parseRecoverableMessageMetadata(entry)
+			if !ok {
+				continue
+			}
+			guid := recoverableGUIDFromEntry(entry)
+			if guid == "" {
+				continue
+			}
+			resolvedPortal := c.resolveConversationID(ctx, metadata.wrappedMessage(guid))
+			if resolvedPortal == portalID {
+				// Exact match — always accept
+			} else if isGidPortal && strings.HasPrefix(resolvedPortal, "gid:") {
+				// Per-participant encryption UUID. Accept if sender is a
+				// known participant, or if we have no participant data.
+				if len(knownSenders) > 0 {
+					senderNorm := strings.ToLower(strings.TrimPrefix(strings.TrimPrefix(
+						normalizeIdentifierForPortalID(metadata.Sender), "tel:"), "mailto:"))
+					if !knownSenders[senderNorm] && !metadata.IsFromMe {
+						continue
+					}
+				}
+				// Accept: same group, different per-participant UUID
+			} else {
+				continue
+			}
+
+			_, insertErr := c.cloudStore.db.Exec(ctx, `
+				INSERT INTO cloud_message (login_id, guid, chat_id, portal_id, timestamp_ms, sender, is_from_me, service, deleted, created_ts, updated_ts, record_name, has_body)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE, $9, $9, $10, TRUE)
+				ON CONFLICT (login_id, guid) DO UPDATE SET deleted=FALSE, portal_id=$4
+			`, c.cloudStore.loginID, guid, metadata.CloudChatID, portalID, metadata.TimestampMS, metadata.Sender, metadata.IsFromMe, metadata.Service, nowMS, metadata.RecordName)
+			if insertErr != nil {
+				log.Debug().Err(insertErr).Str("guid", guid).Msg("Failed to seed cloud_message from recycle bin")
+				continue
+			}
+			seeded++
+		}
+		if seeded > 0 {
+			log.Info().Str("portal_id", portalID).Int("seeded", seeded).
+				Msg("Seeded cloud_message from recycle bin metadata (cloud_message was empty)")
+		}
+	}
+}
+
+// fetchAndResyncRecoveredChat fetches messages from CloudKit for a recovered
+// chat, imports them into the local cache, then queues ChatResync.
+func (c *IMClient) fetchAndResyncRecoveredChat(log zerolog.Logger, portalKey networkid.PortalKey, portalID string) {
+	imported, _, err := c.fetchRecoveredMessagesFromCloudKit(context.Background(), log, portalID)
+	if err != nil {
+		log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to import CloudKit messages for recovered chat")
+	} else {
+		log.Info().Int("imported", imported).Str("portal_id", portalID).
+			Msg("Imported CloudKit messages for recovered chat")
+	}
+	c.refreshRecoveredPortalAfterCloudSync(log, portalKey, "apns_chat_recover_fetched")
+}
+
+// restoreFetchDiagnostic carries diagnostic info from fetchRecoveredMessagesFromCloudKit
+// for user-visible status messages when the fetch returns 0 messages.
+type restoreFetchDiagnostic struct {
+	// UnfilteredTotal is the total number of non-deleted messages found in
+	// CloudFetchRecentMessages with no chatId filter. If 0, messages are not
+	// yet in the main CloudKit zone (likely still in the recycle bin zone
+	// waiting for Apple-side propagation after chat recovery).
+	UnfilteredTotal int
+	// SampleChatIDs holds up to 20 chatId values from the unfiltered scan
+	// that did NOT match the target portal — helps diagnose chatId format
+	// mismatches (e.g. messages stored under a phone number instead of email).
+	SampleChatIDs []string
+}
+
+// safeCloudFetchRecent wraps CloudFetchRecentMessages in a panic recovery.
+// Rust CloudKit parsing panics (e.g. "Operation UUID has no response?") propagate
+// through FFI as Go panics. Recovering here prevents a single bad CloudKit
+// response from crashing the whole bridge.
+func (c *IMClient) safeCloudFetchRecent(log zerolog.Logger, chatID *string, maxPages, maxMessages uint32) (msgs []rustpushgo.WrappedCloudSyncMessage, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("CloudFetchRecentMessages panicked: %v", r)
+			log.Error().Err(err).Msg("Caught Rust panic in CloudFetchRecentMessages")
+		}
+	}()
+	return c.client.CloudFetchRecentMessages(0, chatID, maxPages, maxMessages)
+}
+
+// fetchRecoveredMessagesFromCloudKit runs the targeted restore fetch path and
+// imports matched rows into cloud_message for the given portal.
+// Returns (importedCount, diagnostic, error). diagnostic is non-nil when the
+// unfiltered fallback ran (all targeted fetches returned 0).
+func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log zerolog.Logger, portalID string) (int, *restoreFetchDiagnostic, error) {
+	if c.cloudStore == nil {
+		return 0, nil, fmt.Errorf("cloud store not initialized")
+	}
+	if c.client == nil {
+		return 0, nil, fmt.Errorf("rustpush client not initialized")
+	}
+
+	// Resolve the CloudKit chat_id for this portal.
+	cloudChatID := c.cloudStore.getChatIdentifierByPortalID(ctx, portalID)
+	// Also try the stored group_id as a fallback chatId — it may differ from
+	// the per-participant UUID in the portal_id (see per-participant UUID lore).
+	groupIDForFetch := ""
+	if strings.HasPrefix(portalID, "gid:") {
+		groupIDForFetch = c.cloudStore.getGroupIDForPortalID(ctx, portalID)
+	}
+	if cloudChatID == "" {
+		if strings.HasPrefix(portalID, "gid:") {
+			uuid := strings.TrimPrefix(portalID, "gid:")
+			cloudChatID = "any;+;" + uuid
+		} else {
+			identifier := strings.TrimPrefix(strings.TrimPrefix(portalID, "mailto:"), "tel:")
+			cloudChatID = "iMessage;-;" + identifier
+		}
+	}
+
+	log.Info().
+		Str("portal_id", portalID).
+		Str("cloud_chat_id", cloudChatID).
+		Msg("Fetching messages from CloudKit for recovered chat with empty local cache")
+
+	// Build the set of portal IDs that should be considered "this portal".
+	acceptableIDs := map[string]bool{portalID: true}
+	if !strings.Contains(portalID, ",") && !strings.HasPrefix(portalID, "gid:") {
+		contactResolved := string(c.resolveContactPortalID(portalID))
+		acceptableIDs[contactResolved] = true
+		contact := c.lookupContact(portalID)
+		if contact != nil {
+			for _, altID := range contactPortalIDs(contact) {
+				acceptableIDs[altID] = true
+			}
+		}
+	}
+
+	rawIdentifier := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(portalID, "tel:"), "mailto:"), "gid:")
+	acceptableChatIDSuffixes := map[string]bool{
+		strings.ToLower(rawIdentifier): true,
+	}
+	if !strings.Contains(portalID, ",") && !strings.HasPrefix(portalID, "gid:") {
+		for id := range acceptableIDs {
+			raw := strings.TrimPrefix(strings.TrimPrefix(id, "tel:"), "mailto:")
+			acceptableChatIDSuffixes[strings.ToLower(raw)] = true
+		}
+	}
+	if strings.HasPrefix(portalID, "gid:") {
+		portalUUID := strings.TrimPrefix(portalID, "gid:")
+		acceptableChatIDSuffixes[normalizeUUID(portalUUID)] = true
+		acceptableChatIDSuffixes[strings.ToLower(portalUUID)] = true
+		if chatID := c.cloudStore.getChatIdentifierByPortalID(ctx, portalID); chatID != "" {
+			acceptableChatIDSuffixes[normalizeUUID(chatID)] = true
+			acceptableChatIDSuffixes[strings.ToLower(chatID)] = true
+		}
+		if gid := c.cloudStore.getGroupIDForPortalID(ctx, portalID); gid != "" {
+			acceptableChatIDSuffixes[normalizeUUID(gid)] = true
+			acceptableChatIDSuffixes[strings.ToLower(gid)] = true
+		}
+	}
+
+	var matched []rustpushgo.WrappedCloudSyncMessage
+	tryTargetedFetch := func(chatID string) {
+		if chatID == "" || ctx.Err() != nil {
+			return
+		}
+		chatIDCopy := chatID
+		targeted, fetchErr := c.safeCloudFetchRecent(log, &chatIDCopy, 50, 5000)
+		if fetchErr != nil {
+			log.Warn().Err(fetchErr).Str("cloud_chat_id", chatID).
+				Msg("CloudFetchRecentMessages failed for recovered chat")
+			return
+		}
+		log.Info().Int("count", len(targeted)).Str("portal_id", portalID).
+			Str("cloud_chat_id", chatID).
+			Msg("Targeted CloudKit fetch for recovered chat")
+		for _, msg := range targeted {
+			if !msg.Deleted {
+				matched = append(matched, msg)
+			}
+		}
+	}
+	tryTargetedFetch(cloudChatID)
+	if len(matched) == 0 && !strings.HasPrefix(portalID, "gid:") {
+		suffix := ""
+		if strings.HasPrefix(cloudChatID, "any;-;") {
+			suffix = strings.TrimPrefix(cloudChatID, "any;-;")
+			tryTargetedFetch("iMessage;-;" + suffix)
+		} else if strings.HasPrefix(cloudChatID, "iMessage;-;") {
+			suffix = strings.TrimPrefix(cloudChatID, "iMessage;-;")
+			tryTargetedFetch("any;-;" + suffix)
+		}
+		if len(matched) == 0 && suffix != "" {
+			tryTargetedFetch("SMS;-;" + suffix)
+		}
+	}
+	if len(matched) == 0 && !strings.Contains(cloudChatID, ";") && cloudChatID != "" {
+		if strings.HasPrefix(portalID, "gid:") {
+			tryTargetedFetch("any;+;" + cloudChatID)
+		} else {
+			tryTargetedFetch("iMessage;-;" + cloudChatID)
+			if len(matched) == 0 {
+				tryTargetedFetch("any;-;" + cloudChatID)
+			}
+			if len(matched) == 0 {
+				tryTargetedFetch("SMS;-;" + cloudChatID)
+			}
+		}
+	}
+	if len(matched) == 0 && groupIDForFetch != "" && groupIDForFetch != strings.TrimPrefix(cloudChatID, "any;+;") {
+		tryTargetedFetch("any;+;" + groupIDForFetch)
+		if len(matched) == 0 {
+			tryTargetedFetch("iMessage;+;" + groupIDForFetch)
+		}
+	}
+
+	var diag *restoreFetchDiagnostic
+	if len(matched) == 0 && ctx.Err() != nil {
+		return 0, nil, ctx.Err()
+	}
+	if len(matched) == 0 {
+		log.Info().Str("portal_id", portalID).
+			Msg("All targeted fetches returned 0 — falling back to unfiltered CloudFetchRecentMessages")
+		// Use the same page/message limits as the targeted fetch (50 pages, 5000 msgs).
+		// Larger limits (e.g. 500 pages) caused CloudKit to return malformed responses
+		// that panicked the Rust code ("Operation UUID has no response?"), crashing the
+		// bridge. 50 pages × ~200 msgs/page = ~10k messages — enough for diagnostics.
+		const maxRecoveryPages = 50
+		unfiltered, scanErr := c.safeCloudFetchRecent(log, nil, maxRecoveryPages, 10000)
+		if scanErr != nil {
+			return 0, nil, fmt.Errorf("unfiltered CloudFetchRecentMessages failed: %w", scanErr)
+		}
+		seenChatIDs := make(map[string]bool)
+		for _, msg := range unfiltered {
+			if msg.Deleted {
+				continue
+			}
+			resolved := c.resolveConversationID(ctx, msg)
+			if acceptableIDs[resolved] {
+				matched = append(matched, msg)
+				continue
+			}
+			if msg.CloudChatId == "" {
+				continue
+			}
+			suffix := strings.ToLower(msg.CloudChatId)
+			if parts := strings.SplitN(suffix, ";-;", 2); len(parts) == 2 {
+				suffix = parts[1]
+			} else if parts := strings.SplitN(suffix, ";+;", 2); len(parts) == 2 {
+				suffix = parts[1]
+			}
+			if acceptableChatIDSuffixes[suffix] || acceptableChatIDSuffixes[normalizeUUID(suffix)] {
+				matched = append(matched, msg)
+			} else if !seenChatIDs[msg.CloudChatId] && len(seenChatIDs) < 20 {
+				seenChatIDs[msg.CloudChatId] = true
+			}
+		}
+		sampleIDs := make([]string, 0, len(seenChatIDs))
+		for k := range seenChatIDs {
+			sampleIDs = append(sampleIDs, k)
+		}
+		sort.Strings(sampleIDs)
+		log.Info().Int("total", len(unfiltered)).Int("matched", len(matched)).
+			Str("portal_id", portalID).
+			Strs("sample_chat_ids", sampleIDs).
+			Msg("Unfiltered scan complete")
+		diag = &restoreFetchDiagnostic{
+			UnfilteredTotal: len(unfiltered),
+			SampleChatIDs:  sampleIDs,
+		}
+	}
+
+	if len(matched) == 0 {
+		return 0, diag, nil
+	}
+
+	rows := make([]cloudMessageRow, 0, len(matched))
+	for _, msg := range matched {
+		if msg.Guid == "" || msg.Deleted {
+			continue
+		}
+		text := ""
+		if msg.Text != nil {
+			text = *msg.Text
+		}
+		subject := ""
+		if msg.Subject != nil {
+			subject = *msg.Subject
+		}
+		timestampMS := msg.TimestampMs
+		if timestampMS <= 0 {
+			timestampMS = time.Now().UnixMilli()
+		}
+		tapbackTargetGUID := ""
+		if msg.TapbackTargetGuid != nil {
+			tapbackTargetGUID = *msg.TapbackTargetGuid
+		}
+		tapbackEmoji := ""
+		if msg.TapbackEmoji != nil {
+			tapbackEmoji = *msg.TapbackEmoji
+		}
+		rows = append(rows, cloudMessageRow{
+			GUID:              msg.Guid,
+			RecordName:        msg.RecordName,
+			CloudChatID:       msg.CloudChatId,
+			PortalID:          portalID,
+			TimestampMS:       timestampMS,
+			Sender:            msg.Sender,
+			IsFromMe:          msg.IsFromMe,
+			Text:              text,
+			Subject:           subject,
+			Service:           msg.Service,
+			Deleted:           false,
+			TapbackType:       msg.TapbackType,
+			TapbackTargetGUID: tapbackTargetGUID,
+			TapbackEmoji:      tapbackEmoji,
+			DateReadMS:        msg.DateReadMs,
+			HasBody:           msg.HasBody,
+		})
+	}
+	if len(rows) == 0 {
+		return 0, diag, nil
+	}
+	if err := c.cloudStore.upsertMessageBatch(ctx, rows); err != nil {
+		return 0, diag, fmt.Errorf("failed to import CloudKit messages for recovered chat: %w", err)
+	}
+	return len(rows), diag, nil
+}
+
+func (c *IMClient) queueRecoveredPortalResync(log zerolog.Logger, portalKey networkid.PortalKey, source string, postCreate func(context.Context, *bridgev2.Portal)) {
+	portalID := string(portalKey.ID)
+
+	// Use the newest BACKFILLABLE content timestamp. Placeholder rows from
+	// recycle-bin seeding can have GUID/timestamp metadata but no message body;
+	// treating those as "latest message" causes false-success resyncs that
+	// still backfill zero messages.
+	var latestMessageTS time.Time
+	if c.cloudStore != nil {
+		if newestTS, err := c.cloudStore.getNewestBackfillableMessageTimestamp(context.Background(), portalID, true); err == nil && newestTS > 0 {
+			latestMessageTS = time.UnixMilli(newestTS)
+		}
+	}
+
+	log.Info().
+		Str("portal_id", portalID).
+		Str("source", source).
+		Time("latest_message_ts", latestMessageTS).
+		Msg("Queueing ChatResync for recovered chat")
+
+	// Always CreatePortal=true for recovery. The portal room may have been
+	// deleted (com.beeper.delete_chat or ChatDelete) but the portal DB row
+	// can linger with a stale MXID. Without CreatePortal=true, bridgev2
+	// treats the resync as a metadata update and skips forward backfill.
+	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatResync{
+		EventMeta: simplevent.EventMeta{
+			Type:         bridgev2.RemoteEventChatResync,
+			PortalKey:    portalKey,
+			CreatePortal: true,
+			Timestamp:    time.Now(),
+			LogContext: func(lc zerolog.Context) zerolog.Context {
+				return lc.Str("source", source)
+			},
+			PostHandleFunc: postCreate,
+		},
+		GetChatInfoFunc: c.GetChatInfo,
+		LatestMessageTS: latestMessageTS,
+	})
+}
+
+func (c *IMClient) refreshRecoveredPortalAfterCloudSync(log zerolog.Logger, portalKey networkid.PortalKey, source string) {
+	c.queueRecoveredPortalResync(log, portalKey, source, nil)
 }
 
 func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -2098,81 +3260,6 @@ resolved:
 	}
 }
 
-// handleMessageError emits a Matrix send-failure status when iMessage reports
-// a delivery error for a previously sent message (Error variant from rustpush).
-// The error_for_uuid field identifies which of our outbound messages failed.
-func (c *IMClient) handleMessageError(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	if msg.ErrorForUuid == nil || *msg.ErrorForUuid == "" {
-		return
-	}
-	ctx := context.Background()
-	msgID := makeMessageID(*msg.ErrorForUuid)
-	dbMessages, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, c.UserLogin.ID, msgID)
-	if err != nil || len(dbMessages) == 0 {
-		log.Debug().Str("uuid", *msg.ErrorForUuid).Msg("Error received for unknown message — no Matrix status to update")
-		return
-	}
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, dbMessages[0].Room)
-	if err != nil || portal == nil || portal.MXID == "" {
-		return
-	}
-	statusStr := "Message delivery failed on iMessage network"
-	if msg.ErrorStatusStr != nil && *msg.ErrorStatusStr != "" {
-		statusStr = *msg.ErrorStatusStr
-	}
-	for _, dbMsg := range dbMessages {
-		c.Main.Bridge.Matrix.SendMessageStatus(ctx, &bridgev2.MessageStatus{
-			Status:      event.MessageStatusFail,
-			ErrorReason: event.MessageStatusNetworkError,
-			Message:     statusStr,
-		}, &bridgev2.MessageStatusEventInfo{
-			RoomID:        portal.MXID,
-			SourceEventID: dbMsg.MXID,
-			Sender:        dbMsg.SenderMXID,
-		})
-	}
-}
-
-// handleSmsConfirmSent emits a Matrix message status event for an SMS that the
-// iPhone relay either successfully sent or failed to send. uuid is the UUID of
-// the original outgoing iMessage/SMS.
-func (c *IMClient) handleSmsConfirmSent(log zerolog.Logger, uuid string, sent bool) {
-	ctx := context.Background()
-	msgID := makeMessageID(uuid)
-	dbMessages, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, c.UserLogin.ID, msgID)
-	if err != nil || len(dbMessages) == 0 {
-		log.Debug().Str("uuid", uuid).Bool("sent", sent).Msg("SmsConfirmSent for unknown message — no Matrix status to update")
-		return
-	}
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, dbMessages[0].Room)
-	if err != nil || portal == nil || portal.MXID == "" {
-		return
-	}
-	if sent {
-		for _, dbMsg := range dbMessages {
-			c.Main.Bridge.Matrix.SendMessageStatus(ctx, &bridgev2.MessageStatus{
-				Status: event.MessageStatusSuccess,
-			}, &bridgev2.MessageStatusEventInfo{
-				RoomID:        portal.MXID,
-				SourceEventID: dbMsg.MXID,
-				Sender:        dbMsg.SenderMXID,
-			})
-		}
-	} else {
-		for _, dbMsg := range dbMessages {
-			c.Main.Bridge.Matrix.SendMessageStatus(ctx, &bridgev2.MessageStatus{
-				Status:      event.MessageStatusFail,
-				ErrorReason: event.MessageStatusNetworkError,
-				Message:     "SMS relay failed to send message",
-			}, &bridgev2.MessageStatusEventInfo{
-				RoomID:        portal.MXID,
-				SourceEventID: dbMsg.MXID,
-				Sender:        dbMsg.SenderMXID,
-			})
-		}
-	}
-}
-
 func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
 	if msg.IsStoredMessage {
 		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored delivery receipt")
@@ -2293,6 +3380,11 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	log := zerolog.Ctx(ctx)
 	body := content.Body
 
+	// Note: we intentionally do NOT treat empty BeeperLinkPreviews ([]) as
+	// "explicitly disabled." Beeper sends [] when it can't generate a preview
+	// itself (e.g. bare domains like "x.com"), but our bridge has its own
+	// og: scraper that can often succeed. So we fall through to auto-detection.
+
 	// Priority 1: Explicit BeeperLinkPreviews from Matrix
 	if len(content.BeeperLinkPreviews) > 0 {
 		lp := content.BeeperLinkPreviews[0]
@@ -2308,11 +3400,12 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 		return "\x00RL\x01" + lp.MatchedURL + "\x01" + canonical + "\x01" + lp.Title + "\x01" + lp.Description + "\x00" + body
 	}
 
-	// Priority 2: Auto-detect URL and fetch preview from homeserver
-	if detectedURL := urlRegex.FindString(body); detectedURL != "" {
+	// Priority 2: Auto-detect URL and fetch preview via homeserver or og: scraping
+	if detectedURL := urlRegex.FindString(body); detectedURL != "" && isLikelyURL(detectedURL) {
 		fetchURL := normalizeURL(detectedURL)
 		log.Debug().Str("detected_url", detectedURL).Msg("Auto-detected URL in outbound message, fetching preview")
 		title, desc := "", ""
+		// Try homeserver preview first
 		if mc, ok := c.Main.Bridge.Matrix.(bridgev2.MatrixConnectorWithURLPreviews); ok {
 			if lp, err := mc.GetURLPreview(ctx, fetchURL); err == nil && lp != nil {
 				title = lp.Title
@@ -2320,6 +3413,15 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from homeserver for outbound")
 			} else if err != nil {
 				log.Debug().Err(err).Msg("Failed to fetch URL preview from homeserver for outbound")
+			}
+		}
+		// Fall back to our own og: scraping if homeserver didn't provide metadata
+		if title == "" && desc == "" {
+			ogData := fetchPageMetadata(ctx, fetchURL)
+			title = ogData["title"]
+			desc = ogData["description"]
+			if title != "" || desc != "" {
+				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from og: scraping for outbound")
 			}
 		}
 		return "\x00RL\x01" + detectedURL + "\x01" + fetchURL + "\x01" + title + "\x01" + desc + "\x00" + body
@@ -2342,28 +3444,26 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 
 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
 
-	// Extract HTML formatting for iMessage rich text
-	var htmlToSend *string
-	if msg.Content.Format == event.FormatHTML && msg.Content.FormattedBody != "" {
-		h := msg.Content.FormattedBody
-		htmlToSend = &h
-	}
-
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
-	uuid, err := c.client.SendMessage(conv, textToSend, htmlToSend, c.handle, replyGuid, replyPart, nil)
+	uuid, err := c.client.SendMessage(conv, textToSend, nil, c.handle, replyGuid, replyPart, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
 	// Persist UUID immediately so echo detection works even if the portal
 	// is deleted before the APNs echo arrives.
 	if c.cloudStore != nil {
-		_ = c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true)
+		if err := c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", uuid).Msg("Failed to persist sent message UUID; echo may be delivered as duplicate")
+		}
 	}
 
-	// If the outbound message has a URL but no link previews from the client,
-	// edit the Matrix event to add com.beeper.linkpreviews so Beeper renders them.
+	// If the outbound message has a URL and the client didn't provide previews,
+	// add com.beeper.linkpreviews so Beeper renders it. Fire the double puppet
+	// edit for both nil (field omitted) and empty slice (client couldn't preview)
+	// since the bridge has its own og: scraper that can often succeed where
+	// the client couldn't.
 	if len(msg.Content.BeeperLinkPreviews) == 0 {
-		if detectedURL := urlRegex.FindString(msg.Content.Body); detectedURL != "" {
+		if detectedURL := urlRegex.FindString(msg.Content.Body); detectedURL != "" && isLikelyURL(detectedURL) {
 			go c.addOutboundURLPreview(msg.Event.ID, msg.Portal.MXID, msg.Content.Body, msg.Content.MsgType, detectedURL)
 		}
 	}
@@ -2394,7 +3494,7 @@ func (c *IMClient) addOutboundURLPreview(eventID id.EventID, roomID id.RoomID, b
 		return
 	}
 
-	preview := fetchURLPreview(ctx, c.Main.Bridge, intent, detectedURL)
+	preview := fetchURLPreview(ctx, c.Main.Bridge, intent, roomID, detectedURL)
 
 	editContent := &event.MessageEventContent{
 		MsgType:            msgType,
@@ -2472,7 +3572,10 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		return nil, fmt.Errorf("failed to download media: %w", err)
 	}
 
-	fileName := msg.Content.Body
+	fileName := msg.Content.FileName
+	if fileName == "" {
+		fileName = msg.Content.Body
+	}
 	if fileName == "" {
 		fileName = "file"
 	}
@@ -2534,6 +3637,7 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	_ = matrixEdited
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
+
 	// When FileName is set, Body contains the caption text rather than the filename.
 	var caption *string
 	if msg.Content.FileName != "" && msg.Content.Body != "" {
@@ -2547,7 +3651,9 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	// Persist UUID immediately so echo detection works even if the portal
 	// is deleted before the APNs echo arrives.
 	if c.cloudStore != nil {
-		_ = c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true)
+		if err := c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", uuid).Msg("Failed to persist sent attachment UUID; echo may be delivered as duplicate")
+		}
 	}
 
 	return &bridgev2.MatrixMessageResponse{
@@ -2593,12 +3699,7 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	conv := c.portalToConversation(msg.Portal)
 	targetGUID := string(msg.EditTarget.ID)
 
-	var editHtml *string
-	if msg.Content.Format == event.FormatHTML && msg.Content.FormattedBody != "" {
-		h := msg.Content.FormattedBody
-		editHtml = &h
-	}
-	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, editHtml, c.handle)
+	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
 	if err == nil {
 		// Work around mautrix-go bridgev2 not incrementing EditCount before saving.
 		msg.EditTarget.EditCount++
@@ -2616,6 +3717,13 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 
 	conv := c.portalToConversation(msg.Portal)
 	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
+
+	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
+	// while preserving the UUID for echo detection.
+	if c.cloudStore != nil {
+		c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID))
+	}
+
 	return err
 }
 
@@ -2633,6 +3741,38 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.Content.RelatesTo.Key)
+
+	if conv.IsSms {
+		// For SMS/RCS portals, send the tapback as an SMS text message via the
+		// iPhone relay format instead of as an iMessage tapback (Message::React).
+		//
+		// SendTapback() generates Message::React, which causes prepare_send() in
+		// Rust to assign a new random sender_guid when the conversation has none
+		// (as SMS/RCS groups always do). The iPhone relay treats any unrecognised
+		// sender_guid as a new iMessage group conversation rather than routing the
+		// tapback to the existing SMS/RCS thread — producing a phantom new thread.
+		//
+		// Sending via SendMessage() with the reaction text uses RawSmsOutgoingMessage
+		// format, which the iPhone routes by participants without needing a stable
+		// sender_guid, correctly delivering to the existing SMS/RCS thread.
+		targetGUID := string(msg.TargetMessage.ID)
+		reactionText := formatSMSReactionText(reaction, emoji, false)
+		if c.cloudStore != nil {
+			if origText, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && origText != "" {
+				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, false)
+			}
+		}
+		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
+		}
+		c.trackSmsReactionEcho(uuid)
+		// Return nil: SMS reactions are sent as plain text, not as structured
+		// tapbacks, so there is no database.Reaction to store. The remove path
+		// (HandleMatrixReactionRemove) reads the target from the Matrix event
+		// directly and does not need a stored Reaction record.
+		return nil, nil
+	}
 
 	_, err := c.client.SendTapback(conv, string(msg.TargetMessage.ID), 0, reaction, emoji, false, c.handle)
 	if err != nil {
@@ -2655,23 +3795,39 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.TargetReaction.Emoji)
+
+	if conv.IsSms {
+		// Same SMS routing fix as HandleMatrixReaction: use SendMessage instead
+		// of SendTapback to avoid the phantom new-thread creation.
+		targetGUID := string(msg.TargetReaction.MessageID)
+		reactionText := formatSMSReactionText(reaction, emoji, true)
+		if c.cloudStore != nil {
+			if origText, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && origText != "" {
+				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, true)
+			}
+		}
+		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
+		if err != nil {
+			return err
+		}
+		c.trackSmsReactionEcho(uuid)
+		return nil
+	}
+
 	_, err := c.client.SendTapback(conv, string(msg.TargetReaction.MessageID), 0, reaction, emoji, true, c.handle)
 	return err
 }
 
 // HandleMatrixDeleteChat is called when the user deletes a chat in Matrix/Beeper.
-// It attempts to mirror that operation to Apple by sending MoveToRecycleBin /
-// PermanentDelete and deleting matching CloudKit records, then cleans up local
-// state for echo suppression and restart safety.
+// It cleans up local state (echo detection, local DB) but does NOT touch Apple:
+// no MoveToRecycleBin APNs message, no CloudKit record deletion. The chat stays
+// on the user's Apple devices; only the Beeper portal is removed.
 func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.MatrixDeleteChat) error {
 	if c.client == nil {
 		return bridgev2.ErrNotLoggedIn
 	}
 
-	// Flush the APNs reorder buffer before processing the delete. Any messages
-	// currently buffered (including echoes for this portal) are dispatched now
-	// while the portal still exists, so they don't float around and try to
-	// resurrect the portal after it's deleted.
+	// Flush the APNs reorder buffer before processing the delete.
 	if c.msgBuffer != nil {
 		c.msgBuffer.flush()
 	}
@@ -2679,116 +3835,38 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 
 	log := zerolog.Ctx(ctx)
 	portalID := string(msg.Portal.ID)
-	// Deleting a chat must target the portal's identity (email/phone as-is), not
-	// the merged "best send target" used for outbound messages. Using
-	// resolveSendTarget here can swap a mailto: portal to a phone number and make
-	// MoveToRecycleBin address the wrong chat.
-	conv := c.portalToDeleteConversation(msg.Portal)
 
-	chatIdentifiers := c.resolveDeleteChatIdentifiers(ctx, msg.Portal)
-	if len(chatIdentifiers) == 0 {
-		log.Warn().Str("portal_id", portalID).Msg("No Apple chat identifiers found for delete mirroring")
-	}
-	moveToRecycleSent := false
-	var moveToRecycleErr error
-	for _, chatID := range chatIdentifiers {
-		attemptConv := conv
-		if candidateConv, ok := c.portalToDeleteConversationForChatIdentifier(msg.Portal, chatID); ok {
-			attemptConv = candidateConv
-		}
-		if err := c.client.SendMoveToRecycleBin(attemptConv, c.handle, chatID); err == nil {
-			moveToRecycleSent = true
-			break
-		} else {
-			moveToRecycleErr = err
-			// Phone-number DMs can be routed as iMessage or SMS depending on the
-			// current Apple-side identity state. If one service fails, try the
-			// alternate service identifier.
-			if altChatID, ok := alternateDeleteChatIdentifier(chatID); ok {
-				altConv := attemptConv
-				if candidateAltConv, ok := c.portalToDeleteConversationForChatIdentifier(msg.Portal, altChatID); ok {
-					altConv = candidateAltConv
-				}
-				if altErr := c.client.SendMoveToRecycleBin(altConv, c.handle, altChatID); altErr == nil {
-					log.Info().
-						Str("portal_id", portalID).
-						Str("chat_identifier", chatID).
-						Str("fallback_chat_identifier", altChatID).
-						Msg("MoveToRecycleBin succeeded via alternate service identifier")
-					moveToRecycleSent = true
-					break
-				}
-			}
-		}
-	}
-	if !moveToRecycleSent && moveToRecycleErr != nil {
-		log.Warn().Err(moveToRecycleErr).Str("portal_id", portalID).Strs("chat_identifiers", chatIdentifiers).Msg("Failed to send MoveToRecycleBin for all candidate identifiers")
-	}
-	if c.Main.Config.CloudKitBackfill {
-		// Fast path: use locally-known CloudKit record_names to delete records
-		// directly, avoiding a 40-second full-scan of all CloudKit records.
-		// SMS portals (tel:+...) never have CloudKit records — skipping the
-		// scan for them cuts delete latency from ~40 s to < 1 s.
-		usedFastPath := false
-		if c.cloudStore != nil {
-			chatRNs, _ := c.cloudStore.getCloudChatRecordNamesByPortalID(ctx, portalID)
-			msgRNs, _ := c.cloudStore.getCloudMessageRecordNamesByPortalID(ctx, portalID)
-			if len(chatRNs) > 0 {
-				if err := c.client.DeleteCloudChats(chatRNs); err != nil {
-					log.Warn().Err(err).Int("count", len(chatRNs)).Str("portal_id", portalID).Msg("Failed to delete cloud chat records via local record_names")
-				} else {
-					log.Info().Int("count", len(chatRNs)).Str("portal_id", portalID).Msg("Deleted cloud chat records via local record_names (fast path)")
-				}
-				usedFastPath = true
-			}
-			if len(msgRNs) > 0 {
-				if err := c.client.DeleteCloudMessages(msgRNs); err != nil {
-					log.Warn().Err(err).Int("count", len(msgRNs)).Str("portal_id", portalID).Msg("Failed to delete cloud message records via local record_names")
-				} else {
-					log.Info().Int("count", len(msgRNs)).Str("portal_id", portalID).Msg("Deleted cloud message records via local record_names (fast path)")
-				}
-				usedFastPath = true
-			}
-		}
-		// Slow-path scan: only when we have no local record_names AND the portal
-		// is iMessage (SMS portals are never stored in CloudKit).
-		if !usedFastPath && !c.isPortalSMS(portalID) {
-			for _, chatID := range chatIdentifiers {
-				c.findAndDeleteCloudChatByIdentifier(log.With().Str("portal_id", portalID).Logger(), chatID)
-				c.findAndDeleteCloudMessagesByChatIdentifier(log.With().Str("portal_id", portalID).Logger(), chatID)
-			}
-		} else if !usedFastPath {
-			log.Debug().Str("portal_id", portalID).Msg("Skipping CloudKit record scan for SMS portal (no CloudKit records)")
-		}
-	}
+	conv := c.portalToConversation(msg.Portal)
+	chatGuid := c.portalToChatGUID(portalID)
 
-	// Purge the recoverable-delete zones from CloudKit so that records parked
-	// in recoverableMessageDeleteZone don't get re-synced and resurrect portals.
-	if c.Main.Config.CloudKitBackfill {
-		if err := c.client.PurgeRecoverableZones(); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to purge CloudKit recoverable zones")
-		}
-	}
+	log.Info().Str("chat_guid", chatGuid).Str("portal_id", portalID).Msg("Deleting chat from Apple")
 
-	// Mark as deleted in memory — NOT a tombstone, just echo protection.
-	// New messages from this contact should still create fresh portals.
-	c.recentlyDeletedPortalsMu.Lock()
-	if c.recentlyDeletedPortals == nil {
-		c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
-	}
-	c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
-		deletedAt: time.Now(),
-	}
-	c.recentlyDeletedPortalsMu.Unlock()
+	// Track as recently deleted so stale APNs echoes don't recreate it.
+	c.trackDeletedChat(portalID)
 
-	// Clean up local DB — soft-deletes cloud_message rows (preserves UUIDs for
-	// echo detection) and hard-deletes cloud_chat rows. This prevents stale APNs
-	// echoes from resurrecting the portal even after a bridge restart.
+	// Clean up local DB FIRST (fast) — prevents portal resurrection on restart
+	// even if the CloudKit calls below hang or fail.
+	var chatRecordNames, msgRecordNames []string
 	if c.cloudStore != nil {
+		if err := c.cloudStore.clearRestoreOverride(ctx, portalID); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to clear restore override for locally deleted chat")
+		}
+		chatRecordNames, _ = c.cloudStore.getCloudRecordNamesByPortalID(ctx, portalID)
+		msgRecordNames, _ = c.cloudStore.getMessageRecordNamesByPortalID(ctx, portalID)
+
+		// Fallback: if no record_names by portal_id, look up by group_id.
 		groupID := ""
 		if strings.HasPrefix(portalID, "gid:") {
 			groupID = strings.TrimPrefix(portalID, "gid:")
 		}
+		if len(chatRecordNames) == 0 && groupID != "" {
+			chatRecordNames, _ = c.cloudStore.getCloudRecordNamesByGroupID(ctx, groupID)
+		}
+		if len(msgRecordNames) == 0 && groupID != "" {
+			msgRecordNames, _ = c.cloudStore.getMessageRecordNamesByGroupID(ctx, groupID)
+		}
+
+		// Soft-delete local records for both portal_id and group_id.
 		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
 			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete local cloud records")
 		} else {
@@ -2801,250 +3879,173 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
+	// Delete from Apple — CloudKit backend only. chatdb users should not have
+	// Apple-side chats deleted when they remove a portal from Beeper.
+	if c.Main.Config.UseCloudKitBackfill() {
+		c.deleteFromApple(portalID, conv, chatGuid, chatRecordNames, msgRecordNames)
+	}
+
 	return nil
 }
 
-// resolveDeleteChatIdentifiers returns CloudKit chat identifiers that can be
-// used for MoveToRecycleBin/PermanentDelete operations.
-func (c *IMClient) resolveDeleteChatIdentifiers(ctx context.Context, portal *bridgev2.Portal) []string {
-	portalID := string(portal.ID)
-	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
-	portalLocalID := stripIdentifierPrefix(portalID)
+// portalToChatGUID constructs the iMessage chat GUID for a portal, used for
+// MoveToRecycleBin messages. Tries the cloud_chat DB first (has the exact
+// chat_identifier from CloudKit), then falls back to constructing it from the
+// portal ID.
+func (c *IMClient) portalToChatGUID(portalID string) string {
 	service := "iMessage"
 	if c.isPortalSMS(portalID) {
 		service = "SMS"
 	}
-	seen := make(map[string]struct{}, 2)
-	out := make([]string, 0, 2)
 
-	add := func(id string) {
-		if id == "" {
-			return
-		}
-		id = strings.TrimSpace(id)
-		if strings.HasPrefix(id, "synthetic:") {
-			id = strings.TrimPrefix(id, "synthetic:")
-		}
-		if strings.HasPrefix(id, "tel:") || strings.HasPrefix(id, "mailto:") {
-			id = stripIdentifierPrefix(id)
-		}
-
-		// Canonical CloudKit chat identifier format expected by delete messages.
-		if strings.Contains(id, ";-;") || strings.Contains(id, ";+;") {
-			if _, ok := seen[id]; ok {
-				return
-			}
-			seen[id] = struct{}{}
-			out = append(out, id)
-			return
-		}
-
-		// Salvage common malformed values persisted in local DB.
-		if !isGroup {
-			if strings.Contains(id, "@") || strings.HasPrefix(id, "+") || isNumeric(id) {
-				id = fmt.Sprintf("%s;-;%s", service, id)
-			} else {
-				return
-			}
-		} else {
-			if strings.HasPrefix(id, "chat") {
-				id = fmt.Sprintf("%s;+;%s", service, id)
-			} else {
-				return
-			}
-		}
-
-		if _, ok := seen[id]; ok {
-			return
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-
+	// Try cloud store first — it has the authoritative chat_identifier.
+	// CloudKit stores just the identifier part (e.g. "rollingonchrome@proton.me"),
+	// so we need to add the service prefix to form a full chat GUID.
 	if c.cloudStore != nil {
-		if ids, err := c.cloudStore.listCloudChatIDsByPortalID(ctx, portalID); err == nil {
-			for _, id := range ids {
-				add(id)
+		if chatID := c.cloudStore.getChatIdentifierByPortalID(context.Background(), portalID); chatID != "" {
+			// If it already has a service prefix (e.g. "iMessage;-;..."), return as-is.
+			if strings.Contains(chatID, ";") {
+				return chatID
 			}
+			// Add the service prefix for bare identifiers.
+			sep := ";-;"
+			if strings.HasPrefix(portalID, "gid:") {
+				sep = ";+;"
+			}
+			return service + sep + chatID
 		}
 	}
-	if !isGroup {
-		for _, guid := range c.chatDBDeleteChatIdentifiers(ctx, portalID) {
-			add(guid)
-		}
+	// Fallback: construct from portal ID.
+	if strings.HasPrefix(portalID, "gid:") {
+		return service + ";+;" + strings.TrimPrefix(portalID, "gid:")
+	}
+	return service + ";-;" + strings.TrimPrefix(strings.TrimPrefix(portalID, "tel:"), "mailto:")
+}
+
+// deleteFromApple sends MoveToRecycleBin via APNs and deletes known CloudKit
+// records synchronously, then kicks off a background scan to catch any records
+// not in the local DB. Local DB is already cleaned before this is called, so
+// restarts are safe even if the background scan is interrupted.
+func (c *IMClient) deleteFromApple(portalID string, conv rustpushgo.WrappedConversation, chatGuid string, chatRecordNames, msgRecordNames []string) {
+	log := c.Main.Bridge.Log.With().Str("portal_id", portalID).Str("chat_guid", chatGuid).Logger()
+
+	// Send MoveToRecycleBin via APNs — notifies other Apple devices.
+	if err := c.client.SendMoveToRecycleBin(conv, c.handle, chatGuid); err != nil {
+		log.Warn().Err(err).Msg("Failed to send MoveToRecycleBin via APNs")
+	} else {
+		log.Info().Msg("Sent MoveToRecycleBin via APNs")
 	}
 
-	// Add direct DM iMessage candidates based on current routing identity.
-	// This mirrors what actually works for outbound traffic and avoids being
-	// blocked by stale cloud_chat_id values.
-	if !isGroup {
-		for _, id := range portalIDToChatGUIDs(portalID) {
-			add(id)
-		}
-
-		if c.client != nil {
-			// Use Apple's canonical identity resolution directly; this can return
-			// the iCloud handle (mailto) for a phone portal when that's how the
-			// chat is keyed on Apple side.
-			query := []string{portalID, portalLocalID}
-			if strings.HasPrefix(portalLocalID, "+") {
-				query = append(query, strings.TrimPrefix(portalLocalID, "+"))
-			}
-			for _, v := range c.client.ValidateTargets(query, c.handle) {
-				local := stripIdentifierPrefix(v)
-				if local != "" {
-					add("any;-;" + local)
-					add(fmt.Sprintf("iMessage;-;%s", local))
-				}
-			}
-		}
-
-		sendTo := stripIdentifierPrefix(c.resolveSendTarget(portalID))
-		if sendTo != "" {
-			add("any;-;" + sendTo)
-			add(fmt.Sprintf("iMessage;-;%s", sendTo))
-			if strings.HasPrefix(sendTo, "+") {
-				add("any;-;" + strings.TrimPrefix(sendTo, "+"))
-				add(fmt.Sprintf("iMessage;-;%s", strings.TrimPrefix(sendTo, "+")))
-			}
-		}
-		if strings.HasPrefix(portalLocalID, "+") {
-			add("any;-;" + strings.TrimPrefix(portalLocalID, "+"))
-			add(fmt.Sprintf("iMessage;-;%s", strings.TrimPrefix(portalLocalID, "+")))
-		}
-
-		// If this phone/email belongs to a merged contact, include all
-		// iMessage-capable alternate identities (especially mailto handles).
-		// Some Apple-side chats are keyed by iCloud email even when the portal
-		// currently appears as a phone DM.
-		if contact := c.lookupContact(portalID); contact != nil {
-			for _, altID := range contactPortalIDs(contact) {
-				for _, guid := range portalIDToChatGUIDs(altID) {
-					add(guid)
-				}
-				local := stripIdentifierPrefix(altID)
-				if local == "" {
-					continue
-				}
-				add("any;-;" + local)
-				add(fmt.Sprintf("iMessage;-;%s", local))
-				if strings.HasPrefix(local, "+") {
-					add("any;-;" + strings.TrimPrefix(local, "+"))
-					add(fmt.Sprintf("iMessage;-;%s", strings.TrimPrefix(local, "+")))
-				}
-			}
-		}
-	}
-
-	// Fallback when cloud metadata doesn't exist yet.
-	// Matches openbubbles behavior:
-	// - DM: <service>;-;<participant>
-	// - Group: <service>;+;chat<random>
-	if len(out) == 0 {
-		if isGroup {
-			add(fmt.Sprintf("%s;+;chat%d", service, time.Now().UnixNano()))
+	// Delete known records from CloudKit synchronously (fast — no full table scan).
+	if len(chatRecordNames) > 0 {
+		if err := c.client.DeleteCloudChats(chatRecordNames); err != nil {
+			log.Warn().Err(err).Strs("record_names", chatRecordNames).Msg("Failed to delete chats from CloudKit")
 		} else {
-			add(fmt.Sprintf("%s;-;%s", service, stripIdentifierPrefix(portalID)))
+			log.Info().Strs("record_names", chatRecordNames).Msg("Deleted chat records from CloudKit")
 		}
 	}
+	// NOTE: We intentionally do NOT call DeleteCloudMessages here.
+	// DeleteCloudMessages is a hard CloudKit delete from messageManateeZone — if
+	// called before iPhone has a chance to process the MoveToRecycleBin APNs
+	// command and move records to recoverableMessageDeleteZone, the messages are
+	// permanently destroyed and can never be recovered.
+	// Instead we rely on:
+	//   1. SendMoveToRecycleBin (APNs) → iPhone moves messages to recycle bin in CloudKit
+	//   2. Local soft-delete via deleteLocalChatByPortalID prevents portal resurrection
+	//      even while messages are still visible in messageManateeZone pending iPhone processing
 
-	return out
+	// Background: scan CloudKit chat records if we don't have record names locally.
+	// Only scans the chat zone (small) — NOT the message zone (can be 100k+ records).
+	// Message records are handled by MoveToRecycleBin moving them to Apple's trash;
+	// local soft-delete of cloud_message rows prevents portal resurrection.
+	if len(chatRecordNames) == 0 && chatGuid != "" {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error().Interface("panic", r).Msg("Panic in background CloudKit chat deletion scan")
+				}
+			}()
+			c.findAndDeleteCloudChatByIdentifier(log, chatGuid)
+		}()
+	}
+
 }
 
-// chatDBDeleteChatIdentifiers returns exact DM chat GUIDs from chat.db for the
-// given portal and any merged contact aliases. These GUIDs are Apple-canonical
-// identifiers and should be preferred over synthesized service IDs.
-func (c *IMClient) chatDBDeleteChatIdentifiers(ctx context.Context, portalID string) []string {
-	if c.chatDB == nil {
-		return nil
-	}
-	chats, err := c.chatDB.api.GetChatsWithMessagesAfter(time.Time{})
-	if err != nil {
-		return nil
+// recoverChatOnApple sends a RecoverChat APNs message (command 182) and
+// re-uploads the chat record to CloudKit. This is the inverse of deleteFromApple
+// and makes the chat reappear on other Apple devices after a Beeper-side restore.
+func (c *IMClient) recoverChatOnApple(portalID string) {
+	if c.client == nil {
+		return
 	}
 
-	allowed := make(map[string]struct{}, 8)
-	allowed[normalizeIdentifierForPortalID(portalID)] = struct{}{}
-	if contact := c.lookupContact(portalID); contact != nil {
-		for _, altID := range contactPortalIDs(contact) {
-			allowed[normalizeIdentifierForPortalID(altID)] = struct{}{}
-		}
-	}
+	log := c.Main.Bridge.Log.With().Str("portal_id", portalID).Logger()
+	chatGuid := c.portalToChatGUID(portalID)
 
-	seen := make(map[string]struct{}, 8)
-	var out []string
-	for _, chat := range chats {
-		parsed := imessage.ParseIdentifier(chat.ChatGUID)
-		if parsed.IsGroup {
-			continue
-		}
-		pid := string(identifierToPortalID(parsed))
-		if _, ok := allowed[normalizeIdentifierForPortalID(pid)]; !ok {
-			continue
-		}
-		if chat.ChatGUID == "" {
-			continue
-		}
-		if _, ok := seen[chat.ChatGUID]; ok {
-			continue
-		}
-		seen[chat.ChatGUID] = struct{}{}
-		out = append(out, chat.ChatGUID)
-	}
-	_ = ctx
-	return out
-}
-
-// alternateDeleteChatIdentifier returns the opposite service variant for a DM
-// chat identifier (iMessage <-> SMS), preserving the participant target.
-// Example: iMessage;-;+1720... -> SMS;-;+1720...
-func alternateDeleteChatIdentifier(chatID string) (string, bool) {
-	if strings.HasPrefix(chatID, "iMessage;-;") {
-		return "SMS;-;" + strings.TrimPrefix(chatID, "iMessage;-;"), true
-	}
-	if strings.HasPrefix(chatID, "SMS;-;") {
-		return "iMessage;-;" + strings.TrimPrefix(chatID, "SMS;-;"), true
-	}
-	return "", false
-}
-
-// portalToDeleteConversationForChatIdentifier builds a DM conversation that
-// matches the target identity encoded in a delete chat identifier
-// (<service>;-;<participant>). This lets MoveToRecycleBin target iCloud handle
-// identifiers even when the portal itself is keyed by phone number.
-func (c *IMClient) portalToDeleteConversationForChatIdentifier(portal *bridgev2.Portal, chatID string) (rustpushgo.WrappedConversation, bool) {
-	portalID := string(portal.ID)
-	if strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",") {
-		return rustpushgo.WrappedConversation{}, false
-	}
-	parts := strings.SplitN(chatID, ";-;", 2)
-	if len(parts) != 2 {
-		return rustpushgo.WrappedConversation{}, false
-	}
-	local := strings.TrimSpace(parts[1])
-	if local == "" {
-		return rustpushgo.WrappedConversation{}, false
-	}
-	target := addIdentifierPrefix(local)
-	return rustpushgo.WrappedConversation{
-		Participants: []string{c.handle, target},
-		IsSms:        strings.EqualFold(parts[0], "SMS"),
-	}, true
-}
-
-// portalToDeleteConversation returns conversation participants for delete
-// operations. For DMs, this intentionally uses the portal's own ID instead of
-// resolveSendTarget: delete targeting must match the chat identity, not the
-// preferred outbound route.
-func (c *IMClient) portalToDeleteConversation(portal *bridgev2.Portal) rustpushgo.WrappedConversation {
-	portalID := string(portal.ID)
+	// Build a minimal conversation for the APNs recover message.
 	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
+	isSms := c.isPortalSMS(portalID)
+	var conv rustpushgo.WrappedConversation
+
 	if isGroup {
-		return c.portalToConversation(portal)
+		var participants []string
+		if c.cloudStore != nil {
+			if parts, err := c.cloudStore.getChatParticipantsByPortalID(context.Background(), portalID); err == nil && len(parts) > 0 {
+				participants = parts
+			}
+		}
+		if len(participants) == 0 && strings.Contains(portalID, ",") {
+			participants = strings.Split(portalID, ",")
+		}
+		var senderGuid *string
+		if strings.HasPrefix(portalID, "gid:") {
+			guid := strings.TrimPrefix(portalID, "gid:")
+			c.imGroupGuidsMu.RLock()
+			if cached := c.imGroupGuids[portalID]; cached != "" {
+				guid = cached
+			}
+			c.imGroupGuidsMu.RUnlock()
+			senderGuid = &guid
+		}
+		conv = rustpushgo.WrappedConversation{
+			Participants: participants,
+			SenderGuid:   senderGuid,
+			IsSms:        isSms,
+		}
+	} else {
+		sendTo := c.resolveSendTarget(portalID)
+		participants := []string{c.handle, sendTo}
+		if c.isMyHandle(sendTo) {
+			participants = []string{sendTo}
+		}
+		conv = rustpushgo.WrappedConversation{
+			Participants: participants,
+			IsSms:        isSms,
+		}
 	}
-	return rustpushgo.WrappedConversation{
-		Participants: []string{c.handle, portalID},
-		IsSms:        c.isPortalSMS(portalID),
+
+	// Send RecoverChat via APNs (command 182) — notifies other Apple devices.
+	if err := c.client.SendRecoverChat(conv, c.handle, chatGuid); err != nil {
+		log.Warn().Err(err).Str("chat_guid", chatGuid).Msg("Failed to send RecoverChat via APNs")
+	} else {
+		log.Info().Str("chat_guid", chatGuid).Msg("Sent RecoverChat via APNs — chat will reappear on Apple devices")
+	}
+
+	// Re-upload the chat record to CloudKit so it reappears in chatManateeZone.
+	if c.cloudStore != nil {
+		rec, err := c.cloudStore.getCloudChatRecordByPortalID(context.Background(), portalID)
+		if err == nil && rec != nil {
+			if err := c.client.RestoreCloudChat(
+				rec.RecordName, rec.ChatIdentifier, rec.GroupID,
+				rec.Style, rec.Service, rec.DisplayName, rec.Participants,
+			); err != nil {
+				log.Warn().Err(err).Msg("Failed to restore chat record in CloudKit")
+			} else {
+				log.Info().Str("record_name", rec.RecordName).Msg("Restored chat record in CloudKit")
+			}
+		} else if err != nil {
+			log.Debug().Err(err).Msg("No cloud_chat record found for CloudKit restore (may be a new chat)")
+		}
 	}
 }
 
@@ -3055,148 +4056,6 @@ func (c *IMClient) portalToDeleteConversation(portal *bridgev2.Portal) rustpushg
 // Note: This uses the same CloudSyncChats API starting from nil token (full scan).
 // CloudKit change tokens are client-side state — this does NOT advance the main
 // sync controller's server-side watermark or cause it to miss changes.
-// HandleMatrixRoomName is called when a Matrix user renames a group chat.
-// It sends an iMessage RenameMessage so all of the user's Apple devices update.
-func (c *IMClient) HandleMatrixRoomName(ctx context.Context, msg *bridgev2.MatrixRoomName) (bool, error) {
-	if c.client == nil {
-		return false, bridgev2.ErrNotLoggedIn
-	}
-	portal := msg.Portal
-	portalID := string(portal.ID)
-	if !strings.HasPrefix(portalID, "gid:") && !strings.Contains(portalID, ",") {
-		return false, fmt.Errorf("room name changes are only supported in group chats")
-	}
-
-	newName := msg.Content.Name
-	conv := c.portalToConversation(portal)
-
-	if _, err := c.client.SendRenameGroup(conv, newName, c.handle); err != nil {
-		return false, fmt.Errorf("failed to send group rename to iMessage: %w", err)
-	}
-
-	// Update in-memory name cache and portal metadata for immediate consistency.
-	c.imGroupNamesMu.Lock()
-	c.imGroupNames[portalID] = newName
-	c.imGroupNamesMu.Unlock()
-	if meta, ok := portal.Metadata.(*PortalMetadata); ok {
-		meta.GroupName = newName
-	}
-
-	return true, nil
-}
-
-// HandleMatrixRoomAvatar is called when a Matrix user changes the group chat icon.
-// It downloads the avatar from Matrix and uploads it to MMCS, then sends an
-// IconChange to all of the user's Apple devices.
-func (c *IMClient) HandleMatrixRoomAvatar(ctx context.Context, msg *bridgev2.MatrixRoomAvatar) (bool, error) {
-	if c.client == nil {
-		return false, bridgev2.ErrNotLoggedIn
-	}
-	portal := msg.Portal
-	portalID := string(portal.ID)
-	if !strings.HasPrefix(portalID, "gid:") && !strings.Contains(portalID, ",") {
-		return false, fmt.Errorf("room avatar changes are only supported in group chats")
-	}
-
-	groupVersion := uint64(time.Now().Unix())
-	conv := c.portalToConversation(portal)
-
-	if msg.Content.URL == "" {
-		// Empty URL means the avatar was removed.
-		if _, err := c.client.SendIconClear(conv, groupVersion, c.handle); err != nil {
-			return false, fmt.Errorf("failed to clear group icon on iMessage: %w", err)
-		}
-		if meta, ok := portal.Metadata.(*PortalMetadata); ok {
-			meta.GroupVersion = groupVersion
-		}
-		return true, nil
-	}
-
-	data, err := c.Main.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.MSC3414File)
-	if err != nil {
-		return false, fmt.Errorf("failed to download avatar from Matrix: %w", err)
-	}
-
-	if _, err := c.client.SendIconChange(conv, data, groupVersion, c.handle); err != nil {
-		return false, fmt.Errorf("failed to send group icon change to iMessage: %w", err)
-	}
-	if meta, ok := portal.Metadata.(*PortalMetadata); ok {
-		meta.GroupVersion = groupVersion
-	}
-
-	return true, nil
-}
-
-// HandleMatrixMembership is called when a Matrix user invites or kicks someone
-// in a group chat. It computes the new full participant list and sends a
-// ChangeParticipants message to the user's Apple devices.
-func (c *IMClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.MatrixMembershipChange) (*bridgev2.MatrixMembershipResult, error) {
-	if c.client == nil {
-		return nil, bridgev2.ErrNotLoggedIn
-	}
-	portal := msg.Portal
-	portalID := string(portal.ID)
-	if !strings.HasPrefix(portalID, "gid:") && !strings.Contains(portalID, ",") {
-		return nil, fmt.Errorf("membership changes are only supported in group chats")
-	}
-
-	// Resolve the target's iMessage identifier from the Ghost.
-	ghost, ok := msg.Target.(*bridgev2.Ghost)
-	if !ok {
-		// Target is the bridge user themselves — no iMessage operation needed.
-		return nil, nil
-	}
-	targetID := string(ghost.ID)
-
-	// Get the current member list for the group.
-	current := c.resolveGroupMembers(ctx, portalID)
-
-	var newParticipants []string
-	switch msg.Type {
-	case bridgev2.Invite, bridgev2.Join:
-		// Validate that the invitee has an iMessage account.
-		valid := c.client.ValidateTargets([]string{targetID}, c.handle)
-		if len(valid) == 0 {
-			return nil, fmt.Errorf("user %s does not have an active iMessage account", targetID)
-		}
-		targetID = valid[0] // use the canonical form returned by IDS
-		// Build the new list: existing members + new member (deduplicated).
-		seen := make(map[string]struct{}, len(current)+1)
-		for _, p := range current {
-			seen[p] = struct{}{}
-			newParticipants = append(newParticipants, p)
-		}
-		if _, exists := seen[targetID]; !exists {
-			newParticipants = append(newParticipants, targetID)
-		}
-
-	case bridgev2.Kick, bridgev2.Leave:
-		// Build the new list: existing members minus the removed member.
-		targetNorm := strings.ToLower(stripIdentifierPrefix(targetID))
-		for _, p := range current {
-			if strings.ToLower(stripIdentifierPrefix(p)) != targetNorm {
-				newParticipants = append(newParticipants, p)
-			}
-		}
-
-	default:
-		// Other membership events (ban, profile change, etc.) are not bridged.
-		return nil, nil
-	}
-
-	groupVersion := uint64(time.Now().Unix())
-	conv := c.portalToConversation(portal)
-
-	if _, err := c.client.SendChangeParticipants(conv, newParticipants, groupVersion, c.handle); err != nil {
-		return nil, fmt.Errorf("failed to send participant change to iMessage: %w", err)
-	}
-	if meta, ok := portal.Metadata.(*PortalMetadata); ok {
-		meta.GroupVersion = groupVersion
-	}
-
-	return nil, nil
-}
-
 func (c *IMClient) findAndDeleteCloudChatByIdentifier(log zerolog.Logger, chatIdentifier string) {
 	log.Info().Str("chat_identifier", chatIdentifier).Msg("Querying CloudKit for chat records to delete")
 
@@ -3230,48 +4089,6 @@ func (c *IMClient) findAndDeleteCloudChatByIdentifier(log zerolog.Logger, chatId
 	}
 }
 
-// findAndDeleteCloudMessagesByChatIdentifier syncs all message records from CloudKit,
-// finds ones belonging to the given chat_identifier (matched via cloud_chat_id),
-// and deletes them. This prevents deleted chat portals from reappearing on fresh sync.
-//
-// Note: Same as findAndDeleteCloudChatByIdentifier — uses full scan from nil token.
-// Does not interfere with the main sync controller's change tokens.
-func (c *IMClient) findAndDeleteCloudMessagesByChatIdentifier(log zerolog.Logger, chatIdentifier string) {
-	log.Info().Str("chat_identifier", chatIdentifier).Msg("Querying CloudKit for message records to delete")
-
-	var matchingRecordNames []string
-	var token *string
-
-	for page := 0; page < 256; page++ {
-		resp, err := safeCloudSyncMessages(c.client, token)
-		if err != nil {
-			log.Warn().Err(err).Msg("Failed to sync messages from CloudKit for delete lookup")
-			return
-		}
-		for _, msg := range resp.Messages {
-			if msg.CloudChatId == chatIdentifier && msg.RecordName != "" {
-				matchingRecordNames = append(matchingRecordNames, msg.RecordName)
-			}
-		}
-		prev := ptrStringOr(token, "")
-		token = resp.ContinuationToken
-		if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
-			break
-		}
-	}
-
-	if len(matchingRecordNames) == 0 {
-		log.Info().Str("chat_identifier", chatIdentifier).Msg("No matching message records found in CloudKit")
-		return
-	}
-
-	if err := c.client.DeleteCloudMessages(matchingRecordNames); err != nil {
-		log.Warn().Err(err).Int("count", len(matchingRecordNames)).Msg("Failed to delete message records found via CloudKit query")
-	} else {
-		log.Info().Int("count", len(matchingRecordNames)).Str("chat_identifier", chatIdentifier).Msg("Deleted message records found via CloudKit query")
-	}
-}
-
 // ============================================================================
 // Chat & user info
 // ============================================================================
@@ -3287,6 +4104,15 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 	} else if c.cloudStore != nil {
 		if hasMessages, err := c.cloudStore.hasPortalMessages(ctx, portalID); err == nil {
 			canBackfill = hasMessages
+		}
+		// Force backfill for portals with a restore override (from
+		// !restore-chat or APNs RecoverChat). Even when cloud_message is
+		// empty, the restore is legitimate and forward backfill should run
+		// to page fresh messages from CloudKit.
+		if !canBackfill {
+			if overridden, err := c.cloudStore.hasRestoreOverride(ctx, portalID); err == nil && overridden {
+				canBackfill = true
+			}
 		}
 	}
 
@@ -3358,45 +4184,35 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			chatInfo.Name = &groupName
 		}
 
-		// Set group photo from locally cached MMCS bytes.
-		// Apple's native iMessage clients deliver group photos via MMCS inside
-		// APNs IconChange messages — they never write to the CloudKit gp asset
-		// field, so a CloudKit round-trip would always fail with MissingGroupPhoto.
-		// handleIconChange persists the MMCS bytes to the DB, so we can apply
-		// the correct avatar here on portal creation or resync after a restart.
-		// As a secondary fallback, try the group_photo_guid stored during
-		// CloudKit chat sync and download it via CloudDownloadGroupPhoto.
+		// Set group photo from cache or CloudKit.
+		//
+		// Primary path: MMCS bytes previously downloaded via an APNs IconChange
+		// message and persisted to group_photo_cache by handleIconChange.
+		//
+		// Fallback path: when the cache is empty (e.g. fresh bridge, or first
+		// sync before any IconChange has arrived), attempt a CloudKit download
+		// using the record_name stored during chat sync. Apple's iMessage
+		// clients may not write the CloudKit "gp" asset field (preferring MMCS
+		// delivery), so this fallback often returns MissingGroupPhoto — logged
+		// at debug level and silently ignored. When it does succeed the bytes
+		// are cached for future calls.
 		if c.cloudStore != nil {
 			photoLog := c.Main.Bridge.Log.With().Str("portal_id", portalID).Logger()
 			photoTS, photoData, gpErr := c.cloudStore.getGroupPhoto(ctx, portalID)
 			if gpErr != nil {
 				photoLog.Warn().Err(gpErr).Msg("group_photo: DB lookup error")
-			} else if len(photoData) > 0 {
+			} else if len(photoData) == 0 {
+				photoLog.Debug().Msg("group_photo: no cached photo in DB, trying CloudKit")
+				photoData, photoTS = c.fetchAndCacheGroupPhoto(ctx, photoLog, portalID)
+			}
+			if len(photoData) > 0 {
 				avatarID := networkid.AvatarID(fmt.Sprintf("icon-change:%d", photoTS))
-				photoLog.Info().Int64("ts", photoTS).Int("bytes", len(photoData)).Msg("group_photo: setting avatar from local cache")
+				photoLog.Info().Int64("ts", photoTS).Int("bytes", len(photoData)).Msg("group_photo: setting avatar from cache")
 				cachedData := photoData
 				chatInfo.Avatar = &bridgev2.Avatar{
 					ID:  avatarID,
 					Get: func(ctx context.Context) ([]byte, error) { return cachedData, nil },
 				}
-			} else if guid, _, ckErr := c.cloudStore.getGroupPhotoByPortalID(ctx, portalID); ckErr == nil && guid != "" {
-				// MMCS cache miss — fall back to CloudKit group photo record.
-				photoLog.Info().Str("guid", guid).Msg("group_photo: no MMCS cache; falling back to CloudKit download")
-				capturedGuid := guid
-				capturedClient := c.client
-				chatInfo.Avatar = &bridgev2.Avatar{
-					ID: networkid.AvatarID("cloudkit-gp:" + guid),
-					Get: func(ctx context.Context) (data []byte, err error) {
-						defer func() {
-							if r := recover(); r != nil {
-								err = fmt.Errorf("CloudKit group photo download failed: %v", r)
-							}
-						}()
-						return capturedClient.CloudDownloadGroupPhoto(capturedGuid)
-					},
-				}
-			} else {
-				photoLog.Debug().Msg("group_photo: no cached photo in DB and no CloudKit GUID")
 			}
 		}
 
@@ -3505,7 +4321,11 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 func (c *IMClient) resolveContactDisplayname(identifier string) string {
 	localID := stripIdentifierPrefix(identifier)
 	if c.contacts != nil {
-		if contact, _ := c.contacts.GetContactInfo(localID); contact != nil && contact.HasName() {
+		contact, contactErr := c.contacts.GetContactInfo(localID)
+		if contactErr != nil {
+			c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
+		}
+		if contact != nil && contact.HasName() {
 			return c.Main.Config.FormatDisplayname(DisplaynameParams{
 				FirstName: contact.FirstName,
 				LastName:  contact.LastName,
@@ -3533,7 +4353,11 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 	localID := stripIdentifierPrefix(identifier)
 	var contact *imessage.Contact
 	if c.contacts != nil {
-		contact, _ = c.contacts.GetContactInfo(localID)
+		var contactErr error
+		contact, contactErr = c.contacts.GetContactInfo(localID)
+		if contactErr != nil {
+			zerolog.Ctx(ctx).Debug().Err(contactErr).Str("id", localID).Msg("Failed to resolve contact info")
+		}
 	}
 
 	if contact != nil && contact.HasName() {
@@ -3561,32 +4385,6 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 			}
 		}
 		return ui, nil
-	}
-
-	// Check for a shared iMessage profile (Name & Photo Sharing / Me card)
-	if val, ok := c.sharedProfiles.Load(identifier); ok {
-		profile := val.(*rustpushgo.WrappedProfileRecord)
-		if profile.FirstName != "" || profile.LastName != "" || profile.DisplayName != "" {
-			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
-				FirstName: profile.FirstName,
-				LastName:  profile.LastName,
-				ID:        localID,
-			})
-			ui.Name = &name
-		}
-		if profile.Avatar != nil && len(*profile.Avatar) > 0 {
-			avatarData := *profile.Avatar
-			avatarHash := sha256.Sum256(avatarData)
-			ui.Avatar = &bridgev2.Avatar{
-				ID: networkid.AvatarID(fmt.Sprintf("improfile:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
-				Get: func(ctx context.Context) ([]byte, error) {
-					return avatarData, nil
-				},
-			}
-		}
-		if ui.Name != nil {
-			return ui, nil
-		}
 	}
 
 	// Fallback: format from identifier
@@ -3893,6 +4691,11 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			// Beeper clients display as "Read at [now]". Instead, rely on
 			// the synthetic receipts below for correct timestamps.
 			CompleteCallback: func() {
+				// Compute read state BEFORE markForwardBackfillDone, which may
+				// insert a synthetic cloud_chat row with is_filtered=0 default
+				// that would defeat the "no chat row → unread" safeguard.
+				readByMe, readErr := cloudStoreDone.getConversationReadByMe(context.Background(), portalID)
+
 				cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
 
 				// NOTE: Receipt 1 (ghost "they read my message") is intentionally
@@ -3902,14 +4705,14 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				// Real-time read receipts via APNs still work after backfill.
 
 				// --- Receipt 2: Double puppet receipt ("I read their message") ---
-				// Works for both DMs and group chats. Uses getConversationReadByMe
-				// heuristic (last message is from_me → user has read everything).
-				// Independent of date_read_ms — covers conversations where the
-				// recipient hasn't sent read receipts (SMS, disabled receipts, etc.).
+				// Marks all non-filtered CloudKit conversations as read, since
+				// they exist on the user's Apple devices and the user receives
+				// push notifications for them. Filtered chats and portals
+				// without cloud_chat metadata are left unread.
 				// Targets the latest backfilled message to mark the entire
 				// conversation as read, overwriting forceMarkRead's server-time
 				// receipt via SetBeeperInboxState with correct BeeperReadExtra["ts"].
-				if readByMe, err := cloudStoreDone.getConversationReadByMe(context.Background(), portalID); err == nil && readByMe {
+				if readErr == nil && readByMe {
 					c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
 						EventMeta: simplevent.EventMeta{
 							Type:      bridgev2.RemoteEventReadReceipt,
@@ -3929,8 +4732,8 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						Str("last_msg_id", string(lastMsgID)).
 						Str("last_msg_ts", lastMsgTS.UTC().Format(time.RFC3339)).
 						Msg("Queued double puppet read receipt (I read their message)")
-				} else if err != nil {
-					log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to check if conversation is read by me")
+				} else if readErr != nil {
+					log.Warn().Err(readErr).Str("portal_id", portalID).Msg("Failed to check if conversation is read by me")
 				}
 
 				c.onForwardBackfillDone()
@@ -3962,10 +4765,50 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	if beforeTS == 0 && beforeGUID == "" {
 		// If forward backfill hasn't completed yet, don't permanently mark backward
 		// as done — the anchor will appear once sendBatch finishes.
+		// But if the portal has no messages at all, stop waiting — there's
+		// nothing for forward backfill to anchor against, and deferring
+		// creates an infinite retry loop.
 		if !c.cloudStore.isForwardBackfillDone(ctx, portalID) {
+			hasMessages, _ := c.cloudStore.hasPortalMessages(ctx, portalID)
+			if hasMessages {
+				log.Info().Str("portal_id", portalID).
+					Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
+				return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
+			}
 			log.Info().Str("portal_id", portalID).
-				Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
-			return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
+				Msg("Backward backfill: no anchor and no messages — stopping (nothing to backfill)")
+			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
+		}
+		// No anchor but forward backfill is done — this happens for recovered
+		// portals where the room already exists but has no messages (e.g. chat
+		// was deleted and recovered). Fetch the latest messages forward-style
+		// so the portal gets populated.
+		if c.cloudStore != nil {
+			if hasMessages, _ := c.cloudStore.hasPortalMessages(ctx, portalID); hasMessages {
+				log.Info().Str("portal_id", portalID).
+					Msg("Backward backfill: no anchor but portal has messages — doing recovery backfill")
+				rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
+				if queryErr != nil {
+					return nil, queryErr
+				}
+				if len(rows) > 0 {
+					// Reverse to chronological order
+					for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+						rows[i], rows[j] = rows[j], rows[i]
+					}
+					allMessages := c.cloudRowsToBackfillMessages(ctx, rows, groupDisplayName)
+					log.Info().
+						Str("portal_id", portalID).
+						Int("db_rows", len(rows)).
+						Int("backfill_msgs", len(allMessages)).
+						Msg("Recovery backfill COMPLETE")
+					return &bridgev2.FetchMessagesResponse{
+						Messages: allMessages,
+						HasMore:  false,
+						Forward:  false,
+					}, nil
+				}
+			}
 		}
 		log.Debug().Str("portal_id", portalID).
 			Msg("Backward backfill: no anchor or cursor, nothing to paginate from")
@@ -4111,15 +4954,16 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	}
 
 	// Skip system/service messages (group renames, participant changes, etc.).
-	// Two complementary signals — either is sufficient:
-	//   !HasBody: rows stored after the has_body column was added have
-	//     has_body=FALSE when there is no attributedBody (i.e. system
-	//     messages). All real user messages always carry an attributedBody.
+	// Two complementary signals:
+	//   !HasBody with no text/attachments: genuine system rows often have no
+	//     attributedBody, no attachments, and an empty body. Restored Apple
+	//     messages can legitimately arrive with has_body=FALSE but still carry
+	//     text, so don't drop those.
 	//   text==groupDisplayName: for older rows whose has_body defaulted to
 	//     TRUE, the rename-notification text exactly matches the group name.
 	// The startup DB cleanup (ensureSchema) hard-deletes matching rows so
 	// this filter is a second line of defence for any that slipped through.
-	isSystemByHasBody := !row.HasBody && row.AttachmentsJSON == "" && row.TapbackType == nil
+	isSystemByHasBody := !row.HasBody && strings.TrimSpace(row.Text) == "" && row.AttachmentsJSON == "" && row.TapbackType == nil
 	isSystemByName := row.Text != "" && groupDisplayName != "" && row.Text == groupDisplayName && row.AttachmentsJSON == "" && row.TapbackType == nil
 	if isSystemByHasBody || isSystemByName {
 		return nil
@@ -4155,7 +4999,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 		}
 		if detectedURL := urlRegex.FindString(row.Text); detectedURL != "" {
 			textContent.BeeperLinkPreviews = []*event.BeeperLinkPreview{
-				fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, detectedURL),
+				fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, "", detectedURL),
 			}
 		}
 		messages = append(messages, &bridgev2.BackfillMessage{
@@ -4210,6 +5054,12 @@ func (c *IMClient) makeCloudSender(row cloudMessageRow) bridgev2.EventSender {
 		}
 	}
 	normalizedSender := normalizeIdentifierForPortalID(row.Sender)
+	if normalizedSender == "" {
+		portalID := strings.TrimSpace(row.PortalID)
+		if portalID != "" && !strings.HasPrefix(portalID, "gid:") && !strings.Contains(portalID, ",") {
+			normalizedSender = portalID
+		}
+	}
 	if normalizedSender == "" {
 		normalizedSender = row.Sender
 	}
@@ -4274,6 +5124,8 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 	}
 	var atts []cloudAttachmentRow
 	if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
+		c.Main.Bridge.Log.Warn().Err(err).Str("guid", row.GUID).
+			Msg("Failed to unmarshal attachment JSON, skipping attachments for this message")
 		return nil
 	}
 
@@ -4289,36 +5141,9 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 		}
 	}
 
-	// Live Photo handling: when a message has a companion MOV (HideAttachment
-	// from filename matching) or an avid-backed HEIC (HasAvid), filter out
-	// redundant stills/companions so only one video per Live Photo is bridged.
-	hasHiddenVideo := false
-	hasAvid := false
-	for _, da := range downloadable {
-		if da.att.HideAttachment && strings.HasPrefix(da.att.MimeType, "video/") {
-			hasHiddenVideo = true
-		}
-		if da.att.HasAvid {
-			hasAvid = true
-		}
-	}
-	if hasHiddenVideo || hasAvid {
-		var filtered []indexedAtt
-		for _, da := range downloadable {
-			// When we have avid, drop filename-matched companion MOVs
-			// (they're redundant — avid on the HEIC record IS the video).
-			if hasAvid && da.att.HideAttachment {
-				continue
-			}
-			// When we have a hidden MOV companion (but no avid), drop
-			// the HEIC still so only the MOV is bridged.
-			if hasHiddenVideo && !hasAvid && !da.att.HideAttachment && strings.HasPrefix(da.att.MimeType, "image/") {
-				continue
-			}
-			filtered = append(filtered, da)
-		}
-		downloadable = filtered
-	}
+	// Live Photo handling: when HasAvid is true on an attachment, the download
+	// step will fetch both the lqa (HEIC still) and avid (video) from the same
+	// CloudKit record and return two BackfillMessages.
 	if len(downloadable) == 0 {
 		return nil
 	}
@@ -4468,9 +5293,12 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// Cache hit: preUploadCloudAttachments already downloaded and uploaded this
 	// attachment in the cloud sync goroutine. Return immediately without touching
 	// CloudKit, keeping the portal event loop unblocked.
-	// NOTE: Skip cache for non-MP4 videos that need transcoding — they may have
-	// been cached before transcoding support was added.
-	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok {
+	// NOTE: Skip cache for non-MP4 videos that need transcoding, and for
+	// Live Photo HasAvid records (old cache entries only have one part, not
+	// both still+video). Regular videos with HasAvid use the cache normally
+	// since we only bridge the lqa (the video itself), not the avid duplicate.
+	isLivePhoto := att.HasAvid && !strings.HasPrefix(att.MimeType, "video/")
+	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok && !isLivePhoto {
 		cachedContent := cached.(*event.MessageEventContent)
 		if cachedContent.Info != nil && cachedContent.Info.MimeType == "video/quicktime" {
 			// Stale cache entry — video needs transcoding. Fall through to re-download.
@@ -4490,24 +5318,8 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
-	// Live Photo: if the attachment has an avid (video) asset, download that
-	// instead of the lqa (HEIC still). This gives recipients the motion video
-	// as intended on iOS. Falls back to lqa if avid download fails.
-	var data []byte
-	var err error
-	usedAvid := false
-	if att.HasAvid {
-		data, err = safeCloudDownloadAttachmentAvid(c.client, att.RecordName)
-		if err != nil || len(data) == 0 {
-			log.Warn().Err(err).Str("guid", row.GUID).Str("record_name", att.RecordName).
-				Msg("Live Photo avid download failed, falling back to lqa")
-			data, err = safeCloudDownloadAttachment(c.client, att.RecordName)
-		} else {
-			usedAvid = true
-		}
-	} else {
-		data, err = safeCloudDownloadAttachment(c.client, att.RecordName)
-	}
+	// Download the lqa (still image) — this is always the baseline.
+	data, err := safeCloudDownloadAttachment(c.client, att.RecordName)
 	if err != nil {
 		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
 		log.Warn().Err(err).
@@ -4528,23 +5340,6 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	mimeType := att.MimeType
 	fileName := att.Filename
-	if usedAvid {
-		// Downloaded the Live Photo video — override metadata from the HEIC still.
-		mimeType = "video/quicktime"
-		if fileName != "" {
-			base := filenameBase(fileName)
-			if base != "" {
-				fileName = base + ".MOV"
-			} else {
-				fileName = "livephoto.MOV"
-			}
-		} else {
-			fileName = "livephoto.MOV"
-		}
-		log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
-			Int("bytes", len(data)).
-			Msg("Live Photo: downloaded avid video instead of HEIC still")
-	}
 	if mimeType == "" {
 		mimeType = utiToMIME(att.UTIType)
 	}
@@ -4590,19 +5385,31 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
+	// Convert HEIC/HEIF images to JPEG since most Matrix clients can't display HEIC.
+	var heicImg image.Image
+	data, mimeType, fileName, heicImg = maybeConvertHEIC(&log, data, mimeType, fileName, c.Main.Config.HEICJPEGQuality, c.Main.Config.HEICConversion)
+
 	// Convert non-JPEG images to JPEG and extract dimensions/thumbnail
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
-	if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
+	if heicImg != nil {
+		// Use the already-decoded image from HEIC conversion
+		b := heicImg.Bounds()
+		imgWidth, imgHeight = b.Dx(), b.Dy()
+		if imgWidth > 800 || imgHeight > 800 {
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+		}
+	} else if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
 		if mimeType == "image/gif" {
 			if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 				imgWidth, imgHeight = cfg.Width, cfg.Height
 			}
-		} else if img, _, isJPEG := decodeImageData(data); img != nil {
+		} else if img, fmtName, _ := decodeImageData(data); img != nil {
 			b := img.Bounds()
 			imgWidth, imgHeight = b.Dx(), b.Dy()
-			if !isJPEG {
+			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
+			if fmtName == "tiff" {
 				var buf bytes.Buffer
 				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
 					data = buf.Bytes()
@@ -4654,7 +5461,10 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	if thumbData != nil {
 		thumbURL, thumbEnc, thumbErr := intent.UploadMedia(ctx, "", thumbData, "thumbnail.jpg", "image/jpeg")
-		if thumbErr == nil {
+		if thumbErr != nil {
+			log.Warn().Err(thumbErr).Str("record_name", att.RecordName).
+				Msg("Failed to upload attachment thumbnail")
+		} else {
 			if thumbEnc != nil {
 				content.Info.ThumbnailFile = thumbEnc
 			} else {
@@ -4682,7 +5492,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
-	return []*bridgev2.BackfillMessage{{
+	messages := []*bridgev2.BackfillMessage{{
 		Sender:    sender,
 		ID:        makeMessageID(attID),
 		Timestamp: ts,
@@ -4693,6 +5503,94 @@ func (c *IMClient) downloadAndUploadAttachment(
 			}},
 		},
 	}}
+
+	// Live Photo: if this attachment has an avid (video) asset, also download
+	// and bridge the video so recipients see both the still and the motion.
+	// Skip when the lqa itself is already a video — that means this is a regular
+	// video attachment (not a Live Photo), and CloudKit stores the same video in
+	// both lqa and avid fields. Bridging both would produce duplicates.
+	if att.HasAvid && !strings.HasPrefix(mimeType, "video/") {
+		avidData, avidErr := safeCloudDownloadAttachmentAvid(c.client, att.RecordName)
+		if avidErr != nil || len(avidData) == 0 {
+			log.Warn().Err(avidErr).Str("guid", row.GUID).Str("record_name", att.RecordName).
+				Msg("Live Photo avid download failed, bridging still only")
+			return messages
+		}
+		avidMime := "video/quicktime"
+		avidFileName := "livephoto.MOV"
+		if fileName != "" {
+			base := filenameBase(fileName)
+			if base != "" {
+				avidFileName = base + ".MOV"
+			}
+		}
+
+		// Remux/transcode the avid video if enabled.
+		if c.Main.Config.VideoTranscoding && ffmpeg.Supported() {
+			origSize := len(avidData)
+			method := "remux"
+			converted, convertErr := ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
+				[]string{"-c", "copy", "-movflags", "+faststart"},
+				avidMime)
+			if convertErr != nil {
+				method = "re-encode"
+				converted, convertErr = ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
+					[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
+						"-c:a", "aac", "-movflags", "+faststart"},
+					avidMime)
+			}
+			if convertErr != nil {
+				log.Warn().Err(convertErr).Str("guid", row.GUID).
+					Msg("Live Photo avid ffmpeg conversion failed, uploading original")
+			} else {
+				log.Info().Str("guid", row.GUID).
+					Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).
+					Msg("Live Photo avid transcoded to MP4")
+				avidData = converted
+				avidMime = "video/mp4"
+				avidFileName = strings.TrimSuffix(avidFileName, filepath.Ext(avidFileName)) + ".mp4"
+			}
+		}
+
+		avidMsgType := mimeToMsgType(avidMime)
+		avidContent := &event.MessageEventContent{
+			MsgType: avidMsgType,
+			Body:    avidFileName,
+			Info: &event.FileInfo{
+				MimeType: avidMime,
+				Size:     len(avidData),
+			},
+		}
+		avidURL, avidEnc, avidUploadErr := intent.UploadMedia(ctx, "", avidData, avidFileName, avidMime)
+		if avidUploadErr != nil {
+			log.Warn().Err(avidUploadErr).Str("guid", row.GUID).
+				Msg("Live Photo avid upload failed, bridging still only")
+			return messages
+		}
+		if avidEnc != nil {
+			avidContent.File = avidEnc
+		} else {
+			avidContent.URL = avidURL
+		}
+
+		log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
+			Int("bytes", len(avidData)).
+			Msg("Live Photo: bridging both HEIC still and avid video")
+
+		messages = append(messages, &bridgev2.BackfillMessage{
+			Sender:    sender,
+			ID:        makeMessageID(attID + "_avid"),
+			Timestamp: ts,
+			ConvertedMessage: &bridgev2.ConvertedMessage{
+				Parts: []*bridgev2.ConvertedMessagePart{{
+					Type:    event.EventMessage,
+					Content: avidContent,
+				}},
+			},
+		})
+	}
+
+	return messages
 }
 
 // preUploadCloudAttachments downloads every CloudKit attachment recorded in the
@@ -4733,7 +5631,10 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		loaded := 0
 		for recordName, jsonBytes := range cachedJSON {
 			var content event.MessageEventContent
-			if err := json.Unmarshal(jsonBytes, &content); err == nil {
+			if err := json.Unmarshal(jsonBytes, &content); err != nil {
+				log.Debug().Err(err).Str("record_name", recordName).
+					Msg("Pre-upload: skipping corrupted attachment cache entry")
+			} else {
 				// Skip stale cache entries for non-MP4 videos that need transcoding
 				if content.Info != nil && content.Info.MimeType == "video/quicktime" {
 					continue
@@ -4773,6 +5674,8 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		portalDone := donePortals[row.PortalID]
 		var atts []cloudAttachmentRow
 		if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
+			log.Warn().Err(err).Str("guid", row.GUID).
+				Msg("Pre-upload: failed to unmarshal attachment JSON, skipping message")
 			continue
 		}
 		sender := c.makeCloudSender(row)
@@ -4902,6 +5805,8 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 		}
 		var atts []cloudAttachmentRow
 		if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
+			log.Warn().Err(err).Str("guid", row.GUID).
+				Msg("Forward backfill: failed to unmarshal attachment JSON, skipping message")
 			continue
 		}
 		sender := c.makeCloudSender(row)
@@ -5027,10 +5932,6 @@ func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
 	for {
 		select {
 		case <-ticker.C:
-			if c.contacts == nil {
-				log.Warn().Msg("Periodic CardDAV sync skipped: contacts source unavailable")
-				continue
-			}
 			if err := c.contacts.SyncContacts(log); err != nil {
 				log.Warn().Err(err).Msg("Periodic CardDAV sync failed")
 			} else {
@@ -5080,11 +5981,9 @@ func (c *IMClient) retryCloudContacts(log zerolog.Logger) {
 		select {
 		case <-ticker.C:
 			log.Info().Msg("Retrying cloud contacts initialization...")
-			meta := c.UserLogin.Metadata.(*UserLoginMetadata)
-			cloudContacts := newCloudContactsClient(c.client, meta.MmeDelegateJSON, log)
-			if cloudContacts != nil {
-				c.contacts = cloudContacts
-				if syncErr := cloudContacts.SyncContacts(log); syncErr != nil {
+			c.contacts = newCloudContactsClient(c.client, log)
+			if c.contacts != nil {
+				if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
 					log.Warn().Err(syncErr).Msg("Cloud contacts retry: sync failed")
 				} else {
 					c.setContactsReady(log)
@@ -5094,7 +5993,7 @@ func (c *IMClient) retryCloudContacts(log zerolog.Logger) {
 					return
 				}
 			} else {
-				log.Debug().Msg("Cloud contacts retry: still unavailable")
+				log.Warn().Msg("Cloud contacts retry: still unavailable")
 			}
 		case <-c.stopChan:
 			return
@@ -5516,6 +6415,70 @@ func (c *IMClient) resolveExistingGroupPortalID(computedID string, senderGuid *s
 // Prefers the group where the member last sent a message; falls back to the
 // sole group containing them. Used when typing/read receipts lack full
 // participant lists.
+func isComputedDMPortalID(id networkid.PortalID) bool {
+	s := string(id)
+	return !strings.HasPrefix(s, "gid:") && !strings.Contains(s, ",")
+}
+
+func (c *IMClient) resolveSMSGroupRedirectPortal(msg rustpushgo.WrappedMessage) (networkid.PortalKey, bool) {
+	if len(msg.Participants) != 0 || msg.Sender == nil || *msg.Sender == "" {
+		return networkid.PortalKey{}, false
+	}
+
+	candidates := make(map[string]struct{}, 3)
+	addCandidate := func(portalID string) {
+		if portalID == "" {
+			return
+		}
+		candidates[portalID] = struct{}{}
+	}
+
+	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
+		// Apple group GUIDs are stable across messages; this bridge stores them
+		// as portal IDs prefixed with "gid:".
+		addCandidate("gid:" + strings.ToLower(*msg.SenderGuid))
+
+		c.imGroupGuidsMu.RLock()
+		matches := make([]string, 0, 1)
+		for portalID, guid := range c.imGroupGuids {
+			if strings.EqualFold(guid, *msg.SenderGuid) {
+				matches = append(matches, portalID)
+			}
+		}
+		c.imGroupGuidsMu.RUnlock()
+		if len(matches) == 1 {
+			addCandidate(matches[0])
+		}
+	}
+
+	// Fallback: unique group membership match only (no "last active" heuristic).
+	normalized := normalizeIdentifierForPortalID(*msg.Sender)
+	if normalized != "" {
+		c.ensureGroupPortalIndex()
+		c.groupPortalMu.RLock()
+		portals := c.groupPortalIndex[normalized]
+		c.groupPortalMu.RUnlock()
+		if len(portals) == 1 {
+			for portalID := range portals {
+				addCandidate(portalID)
+			}
+		}
+	}
+
+	if len(candidates) != 1 {
+		return networkid.PortalKey{}, false
+	}
+
+	ctx := context.Background()
+	for portalID := range candidates {
+		groupKey := networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
+		if existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, groupKey); existing != nil && existing.MXID != "" {
+			return groupKey, true
+		}
+	}
+	return networkid.PortalKey{}, false
+}
+
 func (c *IMClient) findGroupPortalForMember(member string) (networkid.PortalKey, bool) {
 	normalized := normalizeIdentifierForPortalID(member)
 	if normalized == "" {
@@ -5599,10 +6562,14 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	}
 
 	// 2. Check imGroupParticipants cache: find portals (including other gid:
-	//    portals) with matching participant sets.
+	//    portals) with matching participant sets. Skip DM portals — they
+	//    can accidentally match via ±1 participant tolerance.
 	c.imGroupParticipantsMu.RLock()
 	for portalIDStr, parts := range c.imGroupParticipants {
 		if portalIDStr == gidPortalID {
+			continue
+		}
+		if !strings.HasPrefix(portalIDStr, "gid:") && !strings.Contains(portalIDStr, ",") {
 			continue
 		}
 		if participantSetsMatch(parts, normalizedParts) {
@@ -5670,11 +6637,18 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	// 4. Fall back to cloud_chat DB for portals not in memory caches
 	//    (e.g., gid: portals from CloudKit sync that haven't received
 	//    live messages yet, so imGroupParticipants is empty).
+	//    Only consider group portals (gid: or comma-based). DM portals
+	//    can accidentally match via ±1 participant tolerance because a
+	//    DM's [self, A] is one member short of a group's [self, A, B].
 	if c.cloudStore != nil {
 		matches, err := c.cloudStore.findPortalIDsByParticipants(ctx, normalizedParts)
 		if err == nil {
 			for _, matchPortalID := range matches {
 				if matchPortalID == gidPortalID {
+					continue
+				}
+				// Skip DM portals — they can't be the same group.
+				if !strings.HasPrefix(matchPortalID, "gid:") && !strings.Contains(matchPortalID, ",") {
 					continue
 				}
 				key := networkid.PortalKey{ID: networkid.PortalID(matchPortalID), Receiver: c.UserLogin.ID}
@@ -6057,8 +7031,16 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 	// the portal ID might be an inactive number that rustpush can't send to.
 	sendTo := c.resolveSendTarget(portalID)
 
+	// For self-chats, only include one participant. Duplicating our own
+	// handle (e.g. [self, self]) causes rustpush to reject the message
+	// with NoValidTargets because all targets belong to the sender.
+	participants := []string{c.handle, sendTo}
+	if c.isMyHandle(sendTo) {
+		participants = []string{sendTo}
+	}
+
 	return rustpushgo.WrappedConversation{
-		Participants: []string{c.handle, sendTo},
+		Participants: participants,
 		IsSms:        isSms,
 	}
 }
@@ -6133,7 +7115,11 @@ func (c *IMClient) buildGroupName(members []string) string {
 		name := ""
 		var contact *imessage.Contact
 		if c.contacts != nil {
-			contact, _ = c.contacts.GetContactInfo(lookupID)
+			var contactErr error
+			contact, contactErr = c.contacts.GetContactInfo(lookupID)
+			if contactErr != nil {
+				c.Main.Bridge.Log.Debug().Err(contactErr).Str("id", lookupID).Msg("Failed to resolve contact info")
+			}
 		}
 
 		if contact != nil && contact.HasName() {
@@ -6236,7 +7222,7 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 				imageMime = "image/jpeg"
 			}
 			log.Debug().Int("image_bytes", len(*rlImage.InlineData)).Str("mime", imageMime).Msg("Uploading rich link preview image")
-			url, encFile, err := intent.UploadMedia(ctx, "", *rlImage.InlineData, "preview", imageMime)
+			url, encFile, err := intent.UploadMedia(ctx, portal.MXID, *rlImage.InlineData, "preview", imageMime)
 			if err == nil {
 				if encFile != nil {
 					preview.ImageEncryption = encFile
@@ -6257,7 +7243,7 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 	// No rich link from iMessage — auto-detect URL and fetch og: metadata + image
 	if detectedURL := urlRegex.FindString(bodyText); detectedURL != "" {
 		log.Debug().Str("detected_url", detectedURL).Msg("No iMessage rich link, fetching URL preview")
-		return []*event.BeeperLinkPreview{fetchURLPreview(ctx, portal.Bridge, intent, detectedURL)}
+		return []*event.BeeperLinkPreview{fetchURLPreview(ctx, portal.Bridge, intent, portal.MXID, detectedURL)}
 	}
 
 	return nil
@@ -6277,17 +7263,6 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 		} else {
 			content.Body = *msg.Subject
 		}
-	} else if msg.Html != nil && *msg.Html != "" {
-		content.Format = event.FormatHTML
-		content.FormattedBody = *msg.Html
-	}
-
-	if msg.Effect != nil && *msg.Effect != "" {
-		if content.Format != event.FormatHTML {
-			content.Format = event.FormatHTML
-			content.FormattedBody = html.EscapeString(content.Body)
-		}
-		content.FormattedBody = fmt.Sprintf(`<span data-mx-imessage-effect="%s">%s</span>`, html.EscapeString(*msg.Effect), content.FormattedBody)
 	}
 
 	content.BeeperLinkPreviews = convertURLPreviewToBeeper(ctx, portal, intent, msg, text)
@@ -6307,7 +7282,7 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 	return cm, nil
 }
 
-func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding bool) (*bridgev2.ConvertedMessage, error) {
+func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {
 	att := attMsg.Attachment
 	mimeType := att.MimeType
 	fileName := att.Filename
@@ -6353,11 +7328,25 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		}
 	}
 
+	// Convert HEIC/HEIF images to JPEG since most Matrix clients can't display HEIC.
+	var heicImg image.Image
+	if inlineData != nil {
+		log := zerolog.Ctx(ctx)
+		inlineData, mimeType, fileName, heicImg = maybeConvertHEIC(log, inlineData, mimeType, fileName, heicQuality, heicConversion)
+	}
+
 	// Process images: extract dimensions, convert non-JPEG to JPEG, generate thumbnail
 	var imgWidth, imgHeight int
 	var thumbData []byte
 	var thumbW, thumbH int
-	if inlineData != nil && (strings.HasPrefix(mimeType, "image/") || looksLikeImage(inlineData)) {
+	if heicImg != nil {
+		// Use the already-decoded image from HEIC conversion
+		b := heicImg.Bounds()
+		imgWidth, imgHeight = b.Dx(), b.Dy()
+		if imgWidth > 800 || imgHeight > 800 {
+			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
+		}
+	} else if inlineData != nil && (strings.HasPrefix(mimeType, "image/") || looksLikeImage(inlineData)) {
 		log := zerolog.Ctx(ctx)
 		log.Debug().Str("mime_type", mimeType).Str("file_name", fileName).Int("data_len", len(inlineData)).Msg("Processing image attachment")
 		if mimeType == "image/gif" {
@@ -6365,20 +7354,20 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 			if err == nil {
 				imgWidth, imgHeight = cfg.Width, cfg.Height
 			}
-		} else if img, fmtName, isJPEG := decodeImageData(inlineData); img != nil {
+		} else if img, fmtName, _ := decodeImageData(inlineData); img != nil {
 			b := img.Bounds()
 			imgWidth, imgHeight = b.Dx(), b.Dy()
-			log.Debug().Str("decoded_format", fmtName).Int("width", imgWidth).Int("height", imgHeight).Bool("is_jpeg", isJPEG).Msg("Image decoded successfully")
-			// Re-encode non-JPEG images (PNG, TIFF, etc.) as JPEG for compatibility
-			if !isJPEG {
+			log.Debug().Str("decoded_format", fmtName).Int("width", imgWidth).Int("height", imgHeight).Msg("Image decoded successfully")
+			// Re-encode TIFF as JPEG for compatibility (PNG is fine as-is)
+			if fmtName == "tiff" {
 				var buf bytes.Buffer
 				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
 					inlineData = buf.Bytes()
 					mimeType = "image/jpeg"
 					fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
-					log.Debug().Int("jpeg_size", len(inlineData)).Msg("Re-encoded image as JPEG")
+					log.Debug().Int("jpeg_size", len(inlineData)).Msg("Re-encoded TIFF as JPEG")
 				} else {
-					log.Warn().Err(err).Msg("Failed to re-encode image as JPEG")
+					log.Warn().Err(err).Msg("Failed to re-encode TIFF as JPEG")
 				}
 			}
 			if imgWidth > 800 || imgHeight > 800 {
@@ -6417,11 +7406,6 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 			Duration: durationMs,
 		}
 		content.Info.Size = len(inlineData)
-	}
-
-	// Also mark as voice if the iMessage voice flag is set
-	if attMsg.WrappedMessage.IsVoice && content.MSC3245Voice == nil {
-		content.MSC3245Voice = &event.MSC3245Voice{}
 	}
 
 	if inlineData != nil && intent != nil {
@@ -6469,49 +7453,6 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		cm.ReplyTo = &networkid.MessageOptionalPartID{MessageID: replyToID}
 	}
 
-	return cm, nil
-}
-
-// stickerTapbackData holds the image bytes for a sticker placed on a message
-// bubble (iMessage sticker tapback, type 7).
-type stickerTapbackData struct {
-	ImageData []byte
-	MimeType  string
-	TargetID  string // UUID of the message the sticker was placed on
-}
-
-func convertStickerTapback(ctx context.Context, intent bridgev2.MatrixAPI, data *stickerTapbackData) (*bridgev2.ConvertedMessage, error) {
-	content := &event.MessageEventContent{
-		MsgType: event.MsgImage,
-		Body:    "sticker.png",
-		Info: &event.FileInfo{
-			MimeType: data.MimeType,
-			Size:     len(data.ImageData),
-		},
-	}
-
-	if intent != nil {
-		url, encFile, err := intent.UploadMedia(ctx, "", data.ImageData, "sticker.png", data.MimeType)
-		if err != nil {
-			return nil, fmt.Errorf("failed to upload sticker: %w", err)
-		}
-		if encFile != nil {
-			content.File = encFile
-		} else {
-			content.URL = url
-		}
-	}
-
-	cm := &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
-			Type:    event.EventMessage,
-			Content: content,
-		}},
-	}
-	if data.TargetID != "" {
-		replyToID := makeMessageID(data.TargetID)
-		cm.ReplyTo = &networkid.MessageOptionalPartID{MessageID: replyToID}
-	}
 	return cm, nil
 }
 
@@ -6675,6 +7616,68 @@ func emojiToTapbackType(emoji string) (uint32, *string) {
 	}
 }
 
+// formatSMSReactionText returns the SMS/RCS reaction text for a tapback with an
+// empty quoted body (when the original message text is not available). The result
+// matches Apple's SMS relay format exactly so the iPhone can thread it correctly.
+func formatSMSReactionText(tapbackType uint32, customEmoji *string, isRemove bool) string {
+	return formatSMSReactionTextWithBody(tapbackType, customEmoji, "", isRemove)
+}
+
+// formatSMSReactionTextWithBody returns the SMS/RCS reaction text with the
+// original message body quoted inside the curly-quote delimiters.
+// Mirrors the Rust ReactMessageType::get_text() output so SMS contacts see the
+// same reaction text they would receive from a native iMessage client.
+func formatSMSReactionTextWithBody(tapbackType uint32, customEmoji *string, body string, isRemove bool) string {
+	var word string
+	if isRemove {
+		switch tapbackType {
+		case 0:
+			word = "Removed a heart from"
+		case 1:
+			word = "Removed a like from"
+		case 2:
+			word = "Removed a dislike from"
+		case 3:
+			word = "Removed a laugh from"
+		case 4:
+			word = "Removed an exclamation from"
+		case 5:
+			word = "Removed a question mark from"
+		case 6:
+			if customEmoji != nil {
+				word = "Removed a " + *customEmoji + " from"
+			} else {
+				word = "Removed a like from"
+			}
+		default:
+			word = "Removed a heart from"
+		}
+		return word + " \u201c" + body + "\u201d"
+	}
+	switch tapbackType {
+	case 0:
+		word = "Loved"
+	case 1:
+		word = "Liked"
+	case 2:
+		word = "Disliked"
+	case 3:
+		word = "Laughed at"
+	case 4:
+		word = "Emphasized"
+	case 5:
+		word = "Questioned"
+	case 6:
+		if customEmoji != nil {
+			return "Reacted " + *customEmoji + " to \u201c" + body + "\u201d"
+		}
+		word = "Liked"
+	default:
+		word = "Loved"
+	}
+	return word + " \u201c" + body + "\u201d"
+}
+
 func mimeToUTI(mime string) string {
 	switch {
 	case mime == "image/jpeg":
@@ -6784,6 +7787,34 @@ func (c *IMClient) wasUnsent(uuid string) bool {
 	return false
 }
 
+func (c *IMClient) trackSmsReactionEcho(uuid string) {
+	if uuid == "" {
+		return
+	}
+	c.recentSmsReactionEchoesLock.Lock()
+	defer c.recentSmsReactionEchoesLock.Unlock()
+	c.recentSmsReactionEchoes[strings.ToUpper(uuid)] = time.Now()
+	for k, t := range c.recentSmsReactionEchoes {
+		if time.Since(t) > 5*time.Minute {
+			delete(c.recentSmsReactionEchoes, k)
+		}
+	}
+}
+
+func (c *IMClient) wasSmsReactionEcho(uuid string) bool {
+	if uuid == "" {
+		return false
+	}
+	c.recentSmsReactionEchoesLock.Lock()
+	defer c.recentSmsReactionEchoesLock.Unlock()
+	key := strings.ToUpper(uuid)
+	if t, ok := c.recentSmsReactionEchoes[key]; ok {
+		delete(c.recentSmsReactionEchoes, key)
+		return time.Since(t) < 5*time.Minute
+	}
+	return false
+}
+
 // resolvePortalByTargetMessage looks up a message by UUID in the bridge database
 // and returns the portal key it belongs to. This is critical for unsends and edits
 // that arrive as self-reflections from the user's other Apple devices: the APNs
@@ -6833,6 +7864,55 @@ func (c *IMClient) wasOutboundUnsend(uuid string) bool {
 // urlRegex matches URLs in message text for rich link matching.
 // Matches explicit schemes (https://...) and bare domains (example.com, example.com/path).
 var urlRegex = regexp.MustCompile(`(?:https?://\S+|(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}(?:/\S*)?)`)
+
+// isLikelyURL validates that a regex-matched string is actually a URL and not
+// a filename or other dotted identifier. Uses url.Parse for validation,
+// mirroring mautrix-whatsapp's approach. Bare domains (google.com, www.example.com)
+// are accepted as long as they parse as valid URLs with a real host.
+func isLikelyURL(s string) bool {
+	normalized := s
+	if !strings.HasPrefix(normalized, "http://") && !strings.HasPrefix(normalized, "https://") {
+		normalized = "https://" + normalized
+	}
+	parsed, err := url.Parse(normalized)
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+	// Must have at least one dot (rules out bare words).
+	dot := strings.LastIndex(host, ".")
+	if dot < 0 {
+		return false
+	}
+	tld := strings.ToLower(host[dot+1:])
+	if tld == "" {
+		return false
+	}
+	// Reject common file extensions that the greedy bare-domain regex matches
+	// (e.g. "config.yaml", "main.go", "notes.txt"). Only applied when the
+	// original string had no scheme — explicit http(s):// URLs are always trusted.
+	if !strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://") && parsed.Path == "" {
+		switch tld {
+		case "go", "rs", "py", "rb", "js", "ts", "tsx", "jsx", "sh", "bash", "zsh",
+			"c", "h", "cc", "cpp", "hpp", "cs", "java", "kt", "scala", "swift",
+			"m", "mm", "pl", "pm", "r", "lua", "zig", "v", "d", "ex", "exs",
+			"md", "txt", "log", "csv", "tsv", "diff", "patch",
+			"json", "yaml", "yml", "toml", "xml", "ini", "cfg", "conf",
+			"html", "css", "scss", "less", "sass",
+			"png", "jpg", "jpeg", "gif", "bmp", "svg", "webp", "ico", "tiff",
+			"mp3", "mp4", "wav", "flac", "ogg", "avi", "mkv", "mov", "webm",
+			"zip", "tar", "gz", "bz2", "xz", "rar", "7z",
+			"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+			"lock", "sum", "mod", "bak", "tmp", "swp", "o", "so", "dylib", "a",
+			"wasm", "bin", "exe", "dll", "dmg", "iso", "img", "apk", "ipa":
+			return false
+		}
+	}
+	return true
+}
 
 // normalizeURL ensures a URL has a scheme for HTTP fetching.
 func normalizeURL(u string) string {

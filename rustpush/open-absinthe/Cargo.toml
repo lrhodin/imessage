@@ -1,0 +1,27 @@
+[package]
+name = "open-absinthe"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+base64 = "0.21"
+unicorn-engine = "2.1.5"
+goblin = "0.10"
+ureq = "2.9"
+sha1 = "0.10"
+rand = "0.8"
+log = "0.4"
+
+[dev-dependencies]
+plist = "1.7"
+ureq = { version = "2.9", features = ["native-tls"] }
+native-tls = "0.2"
+
+[[bin]]
+name = "enrich_hw_key"
+path = "src/bin/enrich_hw_key.rs"
+
+[features]
+serde = []

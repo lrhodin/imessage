@@ -1,0 +1,24 @@
+on: [push, pull_request]
+name: Build
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        features:
+          - remote-clearadi
+          - remote-anisette-v3
+      fail-fast: false
+    name: ${{ matrix.os }} with ${{ matrix.features }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --features '${{ matrix.features }}'

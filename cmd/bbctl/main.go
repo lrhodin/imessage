@@ -112,6 +112,7 @@ func main() {
 			logoutCommand,
 			whoamiCommand,
 			configCommand,
+			stopCommand,
 			deleteCommand,
 		},
 	}

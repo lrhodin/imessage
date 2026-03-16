@@ -7,7 +7,7 @@ mod test_hwinfo;
 use std::{collections::HashMap, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::Duration, sync::atomic::{AtomicU64, Ordering}};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use icloud_auth::AppleAccount;
+use icloud_auth::{AppleAccount, FetchedToken};
 use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
 use log::{debug, error, info, warn};
 use rustpush::{
@@ -15,55 +15,21 @@ use rustpush::{
     APSState, Attachment, AttachmentType, ConversationData, DeleteTarget, EditMessage,
     IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message,
     MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
-    OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage, ScheduleMode,
+    OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
     ChangeParticipantMessage, IconChangeMessage, UnsendMessage,
     IndexedMessagePart, LinkMeta, LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL,
     TextFlags, TextFormat, TextEffect,
     ShareProfileMessage, SharedPoster,
     TokenProvider, MobileMeDelegateResponse,
-    ResourceState,
+    ScheduleMode,
     cloudkit::{ZoneDeleteOperation, CloudKitSession},
-    statuskit::{StatusKitClient, StatusKitState, StatusKitMessage, StatusKitStatus, ChannelInterestToken},
+    util::{base64_decode, encode_hex, ResourceState},
 };
 use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
 use omnisette::default_provider;
 use std::sync::RwLock;
 use tokio::sync::broadcast;
 use util::{plist_from_string, plist_to_string};
-
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut output, "{:02x}", byte);
-    }
-    output
-}
-
-fn decode_hex(input: &str) -> Result<Vec<u8>, WrappedError> {
-    if input.len() % 2 != 0 {
-        return Err(WrappedError::GenericError {
-            msg: "Invalid hex string length".into(),
-        });
-    }
-
-    (0..input.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&input[index..index + 2], 16).map_err(|error| WrappedError::GenericError {
-                msg: format!("Invalid hex string: {}", error),
-            })
-        })
-        .collect()
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    BASE64_STANDARD.encode(bytes)
-}
-
-fn base64_decode(input: &str) -> Vec<u8> {
-    BASE64_STANDARD.decode(input).unwrap_or_default()
-}
 
 // ============================================================================
 // Wrapper types
@@ -98,9 +64,8 @@ pub struct WrappedAPSConnection {
 #[uniffi::export]
 impl WrappedAPSConnection {
     pub fn state(&self) -> Arc<WrappedAPSState> {
-        let state = futures::executor::block_on(self.inner.state.read()).clone();
         Arc::new(WrappedAPSState {
-            inner: Some(state),
+            inner: Some(self.inner.state.blocking_read().clone()),
         })
     }
 }
@@ -464,150 +429,30 @@ pub struct EscrowDeviceInfo {
 #[derive(uniffi::Object)]
 pub struct WrappedTokenProvider {
     inner: Arc<TokenProvider<omnisette::DefaultAnisetteProvider>>,
-    account: Arc<rustpush::DebugMutex<AppleAccount<omnisette::DefaultAnisetteProvider>>>,
-    os_config: Arc<dyn OSConfig>,
-    mme_delegate: tokio::sync::Mutex<Option<MobileMeDelegateResponse>>,
-    mme_refreshed: tokio::sync::Mutex<std::time::SystemTime>,
-}
-
-impl WrappedTokenProvider {
-    fn new(
-        inner: Arc<TokenProvider<omnisette::DefaultAnisetteProvider>>,
-        account: Arc<rustpush::DebugMutex<AppleAccount<omnisette::DefaultAnisetteProvider>>>,
-        os_config: Arc<dyn OSConfig>,
-        mme_delegate: Option<MobileMeDelegateResponse>,
-    ) -> Arc<Self> {
-        let refreshed_at = if mme_delegate.is_some() {
-            std::time::SystemTime::now()
-        } else {
-            std::time::SystemTime::UNIX_EPOCH
-        };
-
-        Arc::new(Self {
-            inner,
-            account,
-            os_config,
-            mme_delegate: tokio::sync::Mutex::new(mme_delegate),
-            mme_refreshed: tokio::sync::Mutex::new(refreshed_at),
-        })
-    }
-
-    async fn get_dsid_value(&self) -> Result<String, WrappedError> {
-        let account = self.account.lock().await;
-        let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
-            msg: "Missing SPD state".into(),
-        })?;
-        Ok(spd
-            .get("DsPrsId")
-            .and_then(|value| value.as_unsigned_integer())
-            .ok_or(WrappedError::GenericError {
-                msg: "Missing DsPrsId in SPD".into(),
-            })?
-            .to_string())
-    }
-
-    async fn get_adsid_value(&self) -> Result<String, WrappedError> {
-        let account = self.account.lock().await;
-        let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
-            msg: "Missing SPD state".into(),
-        })?;
-        Ok(spd
-            .get("adsid")
-            .and_then(|value| value.as_string())
-            .ok_or(WrappedError::GenericError {
-                msg: "Missing adsid in SPD".into(),
-            })?
-            .to_string())
-    }
-
-    async fn refresh_mme_delegate(&self) -> Result<(), WrappedError> {
-        let pet = self
-            .inner
-            .get_gsa_token("com.apple.gs.idms.pet")
-            .await
-            .ok_or(WrappedError::GenericError {
-                msg: "Missing PET token".into(),
-            })?;
-
-        let account = self.account.lock().await;
-        let username = account.username.clone().ok_or(WrappedError::GenericError {
-            msg: "Missing username".into(),
-        })?;
-        let adsid = account
-            .spd
-            .as_ref()
-            .and_then(|spd| spd.get("adsid"))
-            .and_then(|value| value.as_string())
-            .ok_or(WrappedError::GenericError {
-                msg: "Missing adsid in SPD".into(),
-            })?
-            .to_string();
-
-        let delegates = login_apple_delegates(
-            &username,
-            &pet,
-            &adsid,
-            None,
-            &mut *account.anisette.lock().await,
-            &*self.os_config,
-            &[LoginDelegate::MobileMe],
-        )
-        .await?;
-        drop(account);
-
-        let mobileme = delegates.mobileme.ok_or(WrappedError::GenericError {
-            msg: "MobileMe delegate missing from login response".into(),
-        })?;
-        *self.mme_delegate.lock().await = Some(mobileme);
-        *self.mme_refreshed.lock().await = std::time::SystemTime::now();
-        Ok(())
-    }
-
-    async fn get_mme_delegate_value(&self) -> Result<MobileMeDelegateResponse, WrappedError> {
-        let has_delegate = self.mme_delegate.lock().await.is_some();
-        let refreshed_at = self.mme_refreshed.lock().await.clone();
-        let needs_refresh = !has_delegate
-            || std::time::SystemTime::now()
-                .duration_since(refreshed_at)
-                .unwrap_or_default()
-                > Duration::from_secs(60 * 60 * 24 * 7);
-
-        if needs_refresh {
-            self.refresh_mme_delegate().await?;
-        }
-
-        self.mme_delegate
-            .lock()
-            .await
-            .clone()
-            .ok_or(WrappedError::GenericError {
-                msg: "Missing MobileMe delegate".into(),
-            })
-    }
 }
 
 /// Helper: create CloudKit + Keychain clients from a TokenProvider.
 /// Shared by get_escrow_devices, join_keychain_clique, and join_keychain_clique_for_device.
 async fn create_keychain_clients(
-    token_provider: &WrappedTokenProvider,
+    token_provider: &Arc<TokenProvider<omnisette::DefaultAnisetteProvider>>,
 ) -> Result<(
     Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
     Arc<rustpush::cloudkit::CloudKitClient<omnisette::DefaultAnisetteProvider>>,
 ), WrappedError> {
-    let dsid = token_provider.get_dsid_value().await?;
-    let adsid = token_provider.get_adsid_value().await?;
-    let mme_delegate = token_provider.get_mme_delegate_value().await?;
-    let account = token_provider.account.clone();
-    let os_config = token_provider.os_config.clone();
+    let dsid = token_provider.get_dsid().await?;
+    let adsid = token_provider.get_adsid().await?;
+    let mme_delegate = token_provider.get_mme_delegate().await?;
+    let account = token_provider.get_account();
+    let os_config = token_provider.get_os_config();
     let anisette = account.lock().await.anisette.clone();
 
     let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
         .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
     let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
-        state: rustpush::DebugRwLock::new(cloudkit_state),
+        state: tokio::sync::RwLock::new(cloudkit_state),
         anisette: anisette.clone(),
         config: os_config.clone(),
-        token_provider: token_provider.inner.clone(),
+        token_provider: token_provider.clone(),
     });
     let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
     let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
@@ -633,8 +478,8 @@ async fn create_keychain_clients(
     let path_for_closure = keychain_state_path.clone();
     let keychain = Arc::new(rustpush::keychain::KeychainClient {
         anisette: anisette.clone(),
-        token_provider: token_provider.inner.clone(),
-        state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
+        token_provider: token_provider.clone(),
+        state: tokio::sync::RwLock::new(keychain_state.expect("keychain state missing")),
         config: os_config.clone(),
         update_state: Box::new(move |state| {
             if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
@@ -791,61 +636,23 @@ impl WrappedTokenProvider {
     /// Includes Authorization (X-MobileMe-AuthToken) and anisette headers.
     /// Auto-refreshes the mmeAuthToken weekly.
     pub async fn get_icloud_auth_headers(&self) -> Result<HashMap<String, String>, WrappedError> {
-        let token = self.inner.get_mme_token("mmeAuthToken").await?;
-        let dsid = self.get_dsid_value().await?;
-        let adsid = self.get_adsid_value().await?;
-        let account = self.account.lock().await;
-        let anisette = account.anisette.clone();
-        drop(account);
-        let anisette_headers = anisette
-            .lock()
-            .await
-            .get_headers()
-            .await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to get anisette headers: {}", e),
-            })?
-            .clone();
-
-        let mut headers = HashMap::new();
-        headers.insert(
-            "Authorization".to_string(),
-            format!("Basic {}", BASE64_STANDARD.encode(format!("{}:{}", dsid, token))),
-        );
-        headers.insert("X-Client-UDID".to_string(), self.os_config.get_udid().to_lowercase());
-        headers.insert("X-MMe-Country".to_string(), "US".to_string());
-        headers.insert(
-            "X-MMe-Client-Info".to_string(),
-            self.os_config
-                .get_mme_clientinfo("com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)"),
-        );
-        headers.insert("X-MMe-Language".to_string(), "en".to_string());
-        headers.insert("X-Apple-ADSID".to_string(), adsid);
-        headers.extend(anisette_headers);
-        Ok(headers)
+        Ok(self.inner.get_icloud_auth_headers().await?)
     }
 
     /// Get the contacts CardDAV URL from the MobileMe delegate config.
     pub async fn get_contacts_url(&self) -> Result<Option<String>, WrappedError> {
-        let delegate = self.get_mme_delegate_value().await?;
-        Ok(delegate
-            .config
-            .get("com.apple.Dataclass.Contacts")
-            .and_then(|value| value.as_dictionary())
-            .and_then(|dict| dict.get("contactsURL").or_else(|| dict.get("url")))
-            .and_then(|value| value.as_string())
-            .map(|value| value.to_string()))
+        Ok(self.inner.get_contacts_url().await?)
     }
 
     /// Get the DSID for this account.
     pub async fn get_dsid(&self) -> Result<String, WrappedError> {
-        self.get_dsid_value().await
+        Ok(self.inner.get_dsid().await?)
     }
 
     /// Get the serialized MobileMe delegate as JSON (for persistence).
     /// Returns None if no delegate is cached.
     pub async fn get_mme_delegate_json(&self) -> Result<Option<String>, WrappedError> {
-        match self.get_mme_delegate_value().await {
+        match self.inner.get_mme_delegate().await {
             Ok(delegate) => {
                 let json = serde_json::to_string(&delegate)
                     .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize MobileMe delegate: {}", e) })?;
@@ -859,8 +666,7 @@ impl WrappedTokenProvider {
     pub async fn seed_mme_delegate_json(&self, json: String) -> Result<(), WrappedError> {
         let delegate: rustpush::MobileMeDelegateResponse = serde_json::from_str(&json)
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to deserialize MobileMe delegate: {}", e) })?;
-        *self.mme_delegate.lock().await = Some(delegate);
-        *self.mme_refreshed.lock().await = std::time::SystemTime::now();
+        self.inner.seed_mme_delegate(delegate).await;
         Ok(())
     }
 
@@ -869,7 +675,7 @@ impl WrappedTokenProvider {
     /// Call this before join_keychain_clique_for_device to let the user choose.
     pub async fn get_escrow_devices(&self) -> Result<Vec<EscrowDeviceInfo>, WrappedError> {
         info!("Fetching escrow devices...");
-        let (keychain, _cloudkit) = create_keychain_clients(self).await?;
+        let (keychain, _cloudkit) = create_keychain_clients(&self.inner).await?;
 
         let bottles = keychain.get_viable_bottles().await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
@@ -903,7 +709,7 @@ impl WrappedTokenProvider {
     /// Returns a description of the escrow bottle used.
     pub async fn join_keychain_clique(&self, passcode: String) -> Result<String, WrappedError> {
         info!("=== Joining iCloud Keychain Trust Circle ===");
-        let (keychain, cloudkit) = create_keychain_clients(self).await?;
+        let (keychain, cloudkit) = create_keychain_clients(&self.inner).await?;
 
         info!("Fetching escrow bottles...");
         let bottles = keychain.get_viable_bottles().await
@@ -928,7 +734,7 @@ impl WrappedTokenProvider {
     /// falls back to trying other bottles.
     pub async fn join_keychain_clique_for_device(&self, passcode: String, device_index: u32) -> Result<String, WrappedError> {
         info!("=== Joining iCloud Keychain Trust Circle (preferred device {}) ===", device_index);
-        let (keychain, cloudkit) = create_keychain_clients(self).await?;
+        let (keychain, cloudkit) = create_keychain_clients(&self.inner).await?;
 
         info!("Fetching escrow bottles...");
         let bottles = keychain.get_viable_bottles().await
@@ -982,7 +788,8 @@ pub async fn restore_token_provider(
     account.username = Some(username);
 
     // Restore hashed password
-    let hashed_password = decode_hex(&hashed_password_hex)?;
+    let hashed_password = rustpush::util::decode_hex(&hashed_password_hex)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hashed_password hex: {}", e) })?;
     account.hashed_password = Some(hashed_password);
 
     // Restore SPD from base64-encoded plist
@@ -991,17 +798,21 @@ pub async fn restore_token_provider(
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD plist: {}", e) })?;
     account.spd = Some(spd);
 
-    // Keep the PET parameter for compatibility with existing persisted session
-    // data. The account can refresh tokens on first use from username + SPD +
-    // hashed password without explicitly injecting a stale PET token.
-    let _ = pet;
+    // Inject the PET token with an already-expired expiration.
+    // This forces get_token() to call login_email_pass() on first use,
+    // which will obtain a fresh PET via SRP (no 2FA needed if the machine
+    // is trusted via consistent anisette state).
+    account.tokens.insert("com.apple.gs.idms.pet".to_string(), icloud_auth::FetchedToken {
+        token: pet,
+        expiration: std::time::UNIX_EPOCH, // expired — forces auto-refresh on first use
+    });
 
-    let account = Arc::new(rustpush::DebugMutex::new(account));
-    let token_provider = TokenProvider::new(account.clone(), os_config.clone());
+    let account = Arc::new(tokio::sync::Mutex::new(account));
+    let token_provider = TokenProvider::new(account, os_config);
 
     info!("Restored TokenProvider from persisted credentials");
 
-    Ok(WrappedTokenProvider::new(token_provider, account, os_config, None))
+    Ok(Arc::new(WrappedTokenProvider { inner: token_provider }))
 }
 
 // ============================================================================
@@ -1077,9 +888,10 @@ pub struct WrappedMessage {
     // Group chat UUID (persistent identifier for the group conversation)
     pub sender_guid: Option<String>,
 
-    // Delete (MoveToRecycleBin / PermanentDelete)
+    // Delete (MoveToRecycleBin / PermanentDelete) and Recover
     pub is_move_to_recycle_bin: bool,
     pub is_permanent_delete: bool,
+    pub is_recover_chat: bool,
     pub delete_chat_participants: Vec<String>,
     pub delete_chat_group_id: Option<String>,
     pub delete_chat_guid: Option<String>,
@@ -1106,7 +918,6 @@ pub struct WrappedMessage {
 
     // HTML-formatted text body. Some(...) when the message contains any non-plain
     // formatting (bold, italic, underline, strikethrough, text effects, mentions).
-    // Go side should prefer this over `text` when present.
     pub html: Option<String>,
 
     // Voice message flag. True for voice memo / audio message attachments.
@@ -1118,9 +929,6 @@ pub struct WrappedMessage {
     // Scheduled send timestamp in milliseconds. Some(ms) when message is scheduled.
     pub scheduled_ms: Option<u64>,
 
-    // Recover chat: true when a previously deleted chat is being restored.
-    pub is_recover_chat: bool,
-
     // SMS activation: true = activation request, false = deactivation.
     pub is_sms_activation: Option<bool>,
 
@@ -1130,7 +938,7 @@ pub struct WrappedMessage {
     // Mark unread flag.
     pub is_mark_unread: bool,
 
-    // Message-read-on-device acknowledgment (SMS activation flow).
+    // Message-read-on-device acknowledgment.
     pub is_message_read_on_device: bool,
 
     // Unschedule marker for scheduled-message cancellation updates.
@@ -1154,7 +962,6 @@ pub struct WrappedMessage {
     pub sticker_mime: Option<String>,
 
     // Profile sharing: set when a contact shares their name/photo with us.
-    // Go should call fetch_profile with these keys to download the full record.
     pub is_share_profile: bool,
     pub share_profile_record_key: Option<String>,
     pub share_profile_decryption_key: Option<Vec<u8>>,
@@ -1171,15 +978,6 @@ pub struct WrappedAttachment {
     pub inline_data: Option<Vec<u8>>,
     /// True for Live Photo attachments (Apple's "iris" flag).
     pub iris: bool,
-}
-
-/// Result of fetching a shared iMessage profile (Name & Photo Sharing).
-#[derive(uniffi::Record, Clone)]
-pub struct WrappedProfileRecord {
-    pub display_name: String,
-    pub first_name: String,
-    pub last_name: String,
-    pub avatar: Option<Vec<u8>>,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -1228,6 +1026,91 @@ pub struct WrappedCloudSyncChat {
     pub group_photo_guid: Option<String>,
     /// CloudKit `filt` field: 0 = normal, 1 = filtered (spam/junk/unknown sender)
     pub is_filtered: i64,
+}
+
+fn recoverable_record_field_names(fields: &[rustpush::cloudkit_proto::record::Field]) -> Vec<String> {
+    fields
+        .iter()
+        .filter_map(|field| field.identifier.as_ref()?.name.clone())
+        .collect()
+}
+
+fn record_looks_chat_like(fields: &[rustpush::cloudkit_proto::record::Field]) -> bool {
+    let names = recoverable_record_field_names(fields);
+    names.iter().any(|name| matches!(name.as_str(), "stl" | "cid" | "gid" | "ptcpts" | "name" | "lah"))
+}
+
+fn wrap_recoverable_chat(record_name: String, mut chat: rustpush::cloud_messages::CloudChat) -> Option<WrappedCloudSyncChat> {
+    if chat.participants.is_empty() && chat.style == 45 && !chat.last_addressed_handle.is_empty() {
+        chat.participants.push(rustpush::cloud_messages::CloudParticipant {
+            uri: chat.last_addressed_handle.clone(),
+        });
+    }
+
+    let has_identity = !chat.chat_identifier.is_empty()
+        || !chat.group_id.is_empty()
+        || !chat.participants.is_empty()
+        || chat.display_name.as_ref().is_some_and(|name| !name.is_empty());
+    if !has_identity || !matches!(chat.style, 43 | 45) {
+        return None;
+    }
+
+    let cloud_chat_id = if chat.chat_identifier.is_empty() {
+        record_name.clone()
+    } else {
+        chat.chat_identifier.clone()
+    };
+    Some(WrappedCloudSyncChat {
+        record_name,
+        cloud_chat_id,
+        group_id: chat.group_id,
+        style: chat.style,
+        service: chat.service_name,
+        display_name: chat.display_name,
+        participants: chat.participants.into_iter().map(|p| p.uri).collect(),
+        deleted: false,
+        updated_timestamp_ms: 0,
+        group_photo_guid: chat.group_photo_guid,
+        is_filtered: chat.is_filtered,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct RecoverableMessageMetadata {
+    v: u8,
+    record_name: String,
+    cloud_chat_id: String,
+    sender: String,
+    is_from_me: bool,
+    service: String,
+    timestamp_ms: i64,
+}
+
+fn encode_recoverable_message_entry(
+    guid: &str,
+    record_name: &str,
+    msg: &rustpush::cloud_messages::CloudMessage,
+) -> String {
+    if guid.is_empty() {
+        return String::new();
+    }
+
+    let metadata = RecoverableMessageMetadata {
+        v: 1,
+        record_name: record_name.to_string(),
+        cloud_chat_id: msg.chat_id.clone(),
+        sender: msg.sender.clone(),
+        is_from_me: msg.flags.contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
+        service: msg.service.clone(),
+        timestamp_ms: apple_timestamp_ns_to_unix_ms(msg.time),
+    };
+    match serde_json::to_vec(&metadata) {
+        Ok(payload) => format!("{}|{}", guid, BASE64_STANDARD.encode(payload)),
+        Err(err) => {
+            debug!("list_recoverable_message_guids: failed to encode metadata for {}: {}", guid, err);
+            guid.to_string()
+        }
+    }
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -1350,7 +1233,7 @@ impl std::io::Write for SharedWriter {
 /// The attributedBody is an NSAttributedString containing ranges with
 /// __kIMFileTransferGUIDAttributeName → attachment GUID.
 fn extract_attachment_guids_from_attributed_body(data: &[u8]) -> Vec<String> {
-    use rustpush::{coder_decode_flattened, NSAttributedString, StCollapsedValue};
+    use rustpush::util::{coder_decode_flattened, NSAttributedString, StCollapsedValue};
 
     let decoded = match std::panic::catch_unwind(|| {
         let flat = coder_decode_flattened(data);
@@ -1415,6 +1298,65 @@ fn extract_attachment_guids_from_summary_info(data: &[u8]) -> Vec<String> {
 fn apple_timestamp_ns_to_unix_ms(timestamp_ns: i64) -> i64 {
     const APPLE_EPOCH_UNIX_MS: i64 = 978_307_200_000;
     APPLE_EPOCH_UNIX_MS.saturating_add(timestamp_ns / 1_000_000)
+}
+
+fn decode_continuation_token(token_b64: Option<String>) -> Result<Option<Vec<u8>>, WrappedError> {
+    match token_b64 {
+        Some(token) if !token.is_empty() => BASE64_STANDARD
+            .decode(token)
+            .map(Some)
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Invalid continuation token: {}", e),
+            }),
+        _ => Ok(None),
+    }
+}
+
+fn encode_continuation_token(token: Vec<u8>) -> Option<String> {
+    if token.is_empty() {
+        None
+    } else {
+        Some(BASE64_STANDARD.encode(token))
+    }
+}
+
+fn convert_reaction(reaction: &Reaction, enable: bool) -> (Option<u32>, Option<String>, bool) {
+    let tapback_type = match reaction {
+        Reaction::Heart => Some(0),
+        Reaction::Like => Some(1),
+        Reaction::Dislike => Some(2),
+        Reaction::Laugh => Some(3),
+        Reaction::Emphasize => Some(4),
+        Reaction::Question => Some(5),
+        Reaction::Emoji(_) => Some(6),
+        Reaction::Sticker { .. } => Some(7),
+    };
+    let emoji = match reaction {
+        Reaction::Emoji(e) => Some(e.clone()),
+        _ => None,
+    };
+    (tapback_type, emoji, !enable)
+}
+
+fn populate_delete_target(w: &mut WrappedMessage, target: &DeleteTarget) {
+    match target {
+        DeleteTarget::Chat(chat) => {
+            w.delete_chat_participants = chat.participants.clone();
+            w.delete_chat_group_id = if chat.group_id.is_empty() {
+                None
+            } else {
+                Some(chat.group_id.clone())
+            };
+            w.delete_chat_guid = if chat.guid.is_empty() {
+                None
+            } else {
+                Some(chat.guid.clone())
+            };
+        }
+        DeleteTarget::Messages(uuids) => {
+            w.delete_message_uuids = uuids.clone();
+        }
+    }
 }
 
 /// Convert message parts into HTML. Returns Some(html) only if there is any
@@ -1498,7 +1440,6 @@ fn html_escape(s: &str) -> String {
 /// Parse Matrix HTML into iMessage MessageParts with formatting.
 /// Returns None if no formatting tags are found (plain text fallback).
 fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
-    // Quick check: if no HTML tags at all, return None to use plain text
     if !html.contains('<') {
         return None;
     }
@@ -1507,7 +1448,6 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
     let mut pos = 0;
     let bytes = html.as_bytes();
     let len = bytes.len();
-    // Track nested formatting state
     let mut bold = false;
     let mut italic = false;
     let mut underline = false;
@@ -1515,7 +1455,6 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
 
     while pos < len {
         if bytes[pos] == b'<' {
-            // Find end of tag
             let tag_end = match html[pos..].find('>') {
                 Some(e) => pos + e + 1,
                 None => break,
@@ -1531,7 +1470,6 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
                 "del" | "s" | "strike" => strikethrough = true,
                 "/del" | "/s" | "/strike" => strikethrough = false,
                 "br" | "br/" | "br /" => {
-                    // Line break — emit as text
                     let flags = TextFlags { bold, italic, underline, strikethrough };
                     parts.push(IndexedMessagePart {
                         part: MessagePart::Text("\n".to_string(), TextFormat::Flags(flags)),
@@ -1540,115 +1478,43 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
                     });
                 }
                 _ => {
-                    // Skip unknown tags (p, div, span, etc.)
+                    // Skip unknown tags (p, div, span without effect, etc.)
                 }
             }
             pos = tag_end;
         } else {
-            // Collect text until next tag
-            let text_end = html[pos..].find('<').map(|e| pos + e).unwrap_or(len);
-            let raw_text = &html[pos..text_end];
-            let decoded = html_unescape(raw_text);
+            let next_tag = html[pos..].find('<').map(|i| pos + i).unwrap_or(len);
+            let chunk = &html[pos..next_tag];
+            let decoded = chunk
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"");
             if !decoded.is_empty() {
                 let flags = TextFlags { bold, italic, underline, strikethrough };
-                let format = if flags.bold || flags.italic || flags.underline || flags.strikethrough {
-                    TextFormat::Flags(flags)
-                } else {
-                    TextFormat::default()
-                };
                 parts.push(IndexedMessagePart {
-                    part: MessagePart::Text(decoded, format),
+                    part: MessagePart::Text(decoded, TextFormat::Flags(flags)),
                     idx: None,
                     ext: None,
                 });
             }
-            pos = text_end;
+            pos = next_tag;
         }
     }
 
-    // If all parts are plain text (no formatting), return None
-    let has_formatting = parts.iter().any(|p| {
-        if let MessagePart::Text(_, fmt) = &p.part {
-            !matches!(fmt, TextFormat::Flags(TextFlags { bold: false, italic: false, underline: false, strikethrough: false }))
-        } else {
-            false
-        }
-    });
+    if parts.is_empty() {
+        return None;
+    }
 
-    if !has_formatting || parts.is_empty() {
+    let reconstructed: String = parts.iter().map(|p| match &p.part {
+        MessagePart::Text(t, _) => t.as_str(),
+        _ => "",
+    }).collect();
+    if reconstructed == plain_text && !parts.iter().any(|p| matches!(&p.part, MessagePart::Text(_, TextFormat::Flags(f)) if f.bold || f.italic || f.underline || f.strikethrough)) {
         return None;
     }
 
     Some(MessageParts(parts))
-}
-
-/// Basic HTML entity unescaping.
-fn html_unescape(s: &str) -> String {
-    s.replace("&amp;", "&")
-     .replace("&lt;", "<")
-     .replace("&gt;", ">")
-     .replace("&quot;", "\"")
-     .replace("&#39;", "'")
-     .replace("&apos;", "'")
-}
-
-fn decode_continuation_token(token_b64: Option<String>) -> Result<Option<Vec<u8>>, WrappedError> {
-    match token_b64 {
-        Some(token) if !token.is_empty() => BASE64_STANDARD
-            .decode(token)
-            .map(Some)
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Invalid continuation token: {}", e),
-            }),
-        _ => Ok(None),
-    }
-}
-
-fn encode_continuation_token(token: Vec<u8>) -> Option<String> {
-    if token.is_empty() {
-        None
-    } else {
-        Some(BASE64_STANDARD.encode(token))
-    }
-}
-
-fn convert_reaction(reaction: &Reaction, enable: bool) -> (Option<u32>, Option<String>, bool) {
-    let tapback_type = match reaction {
-        Reaction::Heart => Some(0),
-        Reaction::Like => Some(1),
-        Reaction::Dislike => Some(2),
-        Reaction::Laugh => Some(3),
-        Reaction::Emphasize => Some(4),
-        Reaction::Question => Some(5),
-        Reaction::Emoji(_) => Some(6),
-        Reaction::Sticker { .. } => Some(7),
-    };
-    let emoji = match reaction {
-        Reaction::Emoji(e) => Some(e.clone()),
-        _ => None,
-    };
-    (tapback_type, emoji, !enable)
-}
-
-fn populate_delete_target(w: &mut WrappedMessage, target: &DeleteTarget) {
-    match target {
-        DeleteTarget::Chat(chat) => {
-            w.delete_chat_participants = chat.participants.clone();
-            w.delete_chat_group_id = if chat.group_id.is_empty() {
-                None
-            } else {
-                Some(chat.group_id.clone())
-            };
-            w.delete_chat_guid = if chat.guid.is_empty() {
-                None
-            } else {
-                Some(chat.guid.clone())
-            };
-        }
-        DeleteTarget::Messages(uuids) => {
-            w.delete_message_uuids = uuids.clone();
-        }
-    }
 }
 
 fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
@@ -1695,6 +1561,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         sender_guid: conv.and_then(|c| c.sender_guid.clone()),
         is_move_to_recycle_bin: false,
         is_permanent_delete: false,
+        is_recover_chat: false,
         delete_chat_participants: vec![],
         delete_chat_group_id: None,
         delete_chat_guid: None,
@@ -1707,7 +1574,6 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         is_voice: false,
         effect: None,
         scheduled_ms: None,
-        is_recover_chat: false,
         is_sms_activation: None,
         is_sms_confirm_sent: None,
         is_mark_unread: false,
@@ -1733,10 +1599,6 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.reply_guid = normal.reply_guid.clone();
             w.reply_part = normal.reply_part.clone();
             w.is_sms = matches!(normal.service, MessageType::SMS { .. });
-            w.html = parts_to_html(&normal.parts);
-            w.is_voice = normal.voice;
-            w.effect = normal.effect.clone();
-            w.scheduled_ms = normal.scheduled.as_ref().map(|s| s.ms);
 
             for indexed_part in &normal.parts.0 {
                 if let MessagePart::Attachment(att) = &indexed_part.part {
@@ -1758,7 +1620,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
 
             // Encode rich link as special attachments for the Go side
             if let Some(ref lm) = normal.link_meta {
-                let original_url: String = lm.data.original_url.clone().map(|u| u.into()).unwrap_or_default();
+                let original_url: String = lm.data.original_url.clone().into();
                 let url: String = lm.data.url.clone().map(|u| u.into()).unwrap_or_default();
                 let title = lm.data.title.clone().unwrap_or_default();
                 let summary = lm.data.summary.clone().unwrap_or_default();
@@ -1812,13 +1674,30 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                 }
             }
 
-            // Normal messages can embed a profile share (the sender's
-            // Name & Photo Sharing record).
-            if let Some(profile) = &normal.embedded_profile {
-                w.is_share_profile = true;
-                w.share_profile_record_key = Some(profile.cloud_kit_record_key.clone());
-                w.share_profile_decryption_key = Some(profile.cloud_kit_decryption_record_key.clone());
-                w.share_profile_has_poster = profile.poster.is_some();
+            // HTML formatting
+            w.html = parts_to_html(&normal.parts);
+
+            // Voice message flag
+            w.is_voice = normal.voice;
+
+            // Screen/bubble effects
+            w.effect = normal.effect.as_ref().map(|e| e.to_string());
+
+            // Scheduled send
+            if let Some(ref sched) = normal.scheduled {
+                w.scheduled_ms = Some(sched.ms);
+            }
+
+            // Sticker data from extension balloons (icon field)
+            if let Some(ref app) = normal.app {
+                if let Some(ref balloon) = app.balloon {
+                    if let Some(ref icon_data) = balloon.icon {
+                        if !icon_data.is_empty() {
+                            w.sticker_data = Some(icon_data.clone());
+                            w.sticker_mime = Some("image/png".to_string());
+                        }
+                    }
+                }
             }
         }
         Message::React(react) => {
@@ -1837,26 +1716,12 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                     w.tapback_type = Some(7);
                 }
             }
-            // For sticker reactions, try to extract the sticker image data
-            if let ReactMessageType::React { reaction: Reaction::Sticker { body, .. }, .. } = &react.reaction {
-                // Extract inline attachment data from the sticker body parts
-                for indexed_part in &body.0 {
-                    if let MessagePart::Attachment(att) = &indexed_part.part {
-                        if let AttachmentType::Inline(data) = &att.a_type {
-                            w.sticker_data = Some(data.clone());
-                            w.sticker_mime = Some(att.mime.clone());
-                            break;
-                        }
-                    }
-                }
-            }
         }
         Message::Edit(edit) => {
             w.is_edit = true;
             w.edit_target_uuid = Some(edit.tuuid.clone());
             w.edit_part = Some(edit.edit_part);
             w.edit_new_text = Some(edit.new_parts.raw_text());
-            w.html = parts_to_html(&edit.new_parts);
         }
         Message::Unsend(unsend) => {
             w.is_unsend = true;
@@ -1897,6 +1762,12 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.is_permanent_delete = true;
             populate_delete_target(&mut w, &del.target);
         }
+        Message::RecoverChat(chat) => {
+            w.is_recover_chat = true;
+            w.delete_chat_participants = chat.participants.clone();
+            w.delete_chat_group_id = Some(chat.group_id.clone()).filter(|s| !s.is_empty());
+            w.delete_chat_guid = Some(chat.guid.clone()).filter(|s| !s.is_empty());
+        }
         Message::IconChange(change) => {
             w.is_icon_change = true;
             w.group_photo_cleared = change.file.is_none();
@@ -1912,10 +1783,6 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         }
         Message::MessageReadOnDevice => {
             w.is_message_read_on_device = true;
-        }
-        Message::RecoverChat(chat) => {
-            w.is_recover_chat = true;
-            populate_delete_target(&mut w, &DeleteTarget::Chat(chat.clone()));
         }
         Message::Unschedule => {
             w.is_unschedule = true;
@@ -1940,9 +1807,6 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.share_profile_has_poster = profile.poster.is_some();
         }
         Message::UpdateProfile(update) => {
-            // UpdateProfile carries an embedded ShareProfile message with
-            // the sender's current name/photo record. Surface it the same
-            // way as ShareProfile so Go can fetch the updated profile.
             if let Some(profile) = &update.profile {
                 w.is_share_profile = true;
                 w.share_profile_record_key = Some(profile.cloud_kit_record_key.clone());
@@ -1950,6 +1814,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                 w.share_profile_has_poster = profile.poster.is_some();
             }
         }
+        _ => {}
     }
 
     w
@@ -1967,11 +1832,6 @@ pub trait MessageCallback: Send + Sync {
 #[uniffi::export(callback_interface)]
 pub trait UpdateUsersCallback: Send + Sync {
     fn update_users(&self, users: Arc<WrappedIDSUsers>);
-}
-
-#[uniffi::export(callback_interface)]
-pub trait StatusCallback: Send + Sync {
-    fn on_status_update(&self, user: String, mode: Option<String>, available: bool);
 }
 
 // ============================================================================
@@ -2385,7 +2245,7 @@ impl LoginSession {
         let mut spd_bytes = Vec::new();
         plist::to_writer_binary(&mut spd_bytes, spd)
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize SPD: {}", e) })?;
-        let spd_base64 = base64_encode(&spd_bytes);
+        let spd_base64 = rustpush::util::base64_encode(&spd_bytes);
 
         let account_persist = AccountPersistData {
             username: self.username.clone(),
@@ -2469,18 +2329,23 @@ impl LoginSession {
         };
 
         // Take ownership of the account to create a TokenProvider.
-        // The MobileMe delegate from `delegates` is cached locally in the
-        // wrapper so contacts/keychain setup can use it immediately.
+        // The MobileMe delegate from `delegates` is seeded into the provider
+        // so the first get_mme_token() doesn't need to re-fetch.
         let owned_account = guard.take()
             .ok_or(WrappedError::GenericError { msg: "Account already consumed".to_string() })?;
-        let account_arc = Arc::new(rustpush::DebugMutex::new(owned_account));
-        let token_provider = TokenProvider::new(account_arc.clone(), os_config.clone());
-        let mobileme_delegate = delegates.mobileme;
+        let account_arc = Arc::new(tokio::sync::Mutex::new(owned_account));
+        let token_provider = TokenProvider::new(account_arc, os_config.clone());
+
+        // Seed the MobileMe delegate so get_contacts_url() and get_mme_token()
+        // work immediately without a network round-trip.
+        if let Some(mobileme) = delegates.mobileme {
+            token_provider.seed_mme_delegate(mobileme).await;
+        }
 
         Ok(IDSUsersWithIdentityRecord {
             users: Arc::new(WrappedIDSUsers { inner: users }),
             identity: Arc::new(WrappedIDSNGMIdentity { inner: identity }),
-            token_provider: Some(WrappedTokenProvider::new(token_provider, account_arc, os_config.clone(), mobileme_delegate)),
+            token_provider: Some(Arc::new(WrappedTokenProvider { inner: token_provider })),
             account_persist: Some(account_persist),
         })
     }
@@ -2572,10 +2437,6 @@ pub struct Client {
     token_provider: Option<Arc<WrappedTokenProvider>>,
     cloud_messages_client: tokio::sync::Mutex<Option<Arc<rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>>>>,
     cloud_keychain_client: tokio::sync::Mutex<Option<Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>>>,
-    profiles_client: tokio::sync::Mutex<Option<Arc<rustpush::name_photo_sharing::ProfilesClient<omnisette::DefaultAnisetteProvider>>>>,
-    statuskit_client: Arc<tokio::sync::RwLock<Option<Arc<StatusKitClient<omnisette::DefaultAnisetteProvider>>>>>,
-    status_callback: Arc<tokio::sync::RwLock<Option<Arc<dyn StatusCallback>>>>,
-    statuskit_interest_tokens: tokio::sync::Mutex<Vec<ChannelInterestToken>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -2643,15 +2504,10 @@ pub async fn new_client(
     // can be 20-30s earlier during Go startup).
     let reconnected_at = Arc::new(AtomicU64::new(0));
 
-    let statuskit_for_recv: Arc<tokio::sync::RwLock<Option<Arc<StatusKitClient<omnisette::DefaultAnisetteProvider>>>>> = Arc::new(tokio::sync::RwLock::new(None));
-    let status_cb_for_recv: Arc<tokio::sync::RwLock<Option<Arc<dyn StatusCallback>>>> = Arc::new(tokio::sync::RwLock::new(None));
-
     let receive_handle = tokio::spawn({
         let conn = connection.inner.clone();
         let conn_for_download = connection.inner.clone();
         let reconnected_at = reconnected_at.clone();
-        let sk_ref = statuskit_for_recv.clone();
-        let status_cb_ref = status_cb_for_recv.clone();
         async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
             let pending = Arc::new(AtomicU64::new(0));
@@ -2742,42 +2598,12 @@ pub async fn new_client(
             const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
             while let Some((msg, drain_ts)) = rx.recv().await {
-                // --- StatusKit handling: process presence topics before iMessage ---
-                if let Some(sk) = sk_ref.read().await.as_ref().cloned() {
-                    match sk.handle(msg.clone()).await {
-                        Ok(Some(StatusKitMessage::StatusChanged { user, mode, allowed })) => {
-                            if let Some(cb) = status_cb_ref.read().await.as_ref() {
-                                cb.on_status_update(user, mode, allowed);
-                            }
-                            pending.fetch_sub(1, Ordering::Relaxed);
-                            continue; // StatusKit consumed this message
-                        }
-                        Ok(None) => {} // not a StatusKit message, fall through to iMessage
-                        Err(e) => {
-                            warn!("StatusKit handle error: {:?}", e);
-                        }
-                    }
-                }
-
                 let mut retries = 0u32;
                 let mut backoff = INITIAL_BACKOFF;
 
                 loop {
                     match client_for_recv.handle(msg.clone()).await {
                         Ok(Some(msg_inst)) => {
-                            // Perform delivery certification if the message
-                            // includes a certified context.  This tells the
-                            // sender that their message was successfully
-                            // received, preventing "not delivered" indicators.
-                            if let Some(ref context) = msg_inst.certified_context {
-                                if let Err(e) = client_for_recv.identity
-                                    .certify_delivery("com.apple.madrid", context, msg_inst.send_delivered)
-                                    .await
-                                {
-                                    warn!("Failed to certify delivery for {}: {:?}", msg_inst.id, e);
-                                }
-                            }
-
                             if msg_inst.has_payload() || matches!(msg_inst.message, Message::Typing(_, _) | Message::Read | Message::Delivered | Message::Error(_) | Message::PeerCacheInvalidate) {
                                 let mut wrapped = message_inst_to_wrapped(&msg_inst);
 
@@ -2855,10 +2681,6 @@ pub async fn new_client(
         token_provider,
         cloud_messages_client: tokio::sync::Mutex::new(None),
         cloud_keychain_client: tokio::sync::Mutex::new(None),
-        profiles_client: tokio::sync::Mutex::new(None),
-        statuskit_client: statuskit_for_recv,
-        status_callback: status_cb_for_recv,
-        statuskit_interest_tokens: tokio::sync::Mutex::new(Vec::new()),
     }))
 }
 
@@ -2873,11 +2695,11 @@ impl Client {
             msg: "No TokenProvider available".into(),
         })?;
 
-        let dsid = tp.get_dsid_value().await?;
-        let adsid = tp.get_adsid_value().await?;
-        let mme_delegate = tp.get_mme_delegate_value().await?;
-        let account = tp.account.clone();
-        let os_config = tp.os_config.clone();
+        let dsid = tp.inner.get_dsid().await?;
+        let adsid = tp.inner.get_adsid().await?;
+        let mme_delegate = tp.inner.get_mme_delegate().await?;
+        let account = tp.inner.get_account();
+        let os_config = tp.inner.get_os_config();
         let anisette = account.lock().await.anisette.clone();
 
         let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone()).ok_or(
@@ -2886,7 +2708,7 @@ impl Client {
             },
         )?;
         let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
-            state: rustpush::DebugRwLock::new(cloudkit_state),
+            state: tokio::sync::RwLock::new(cloudkit_state),
             anisette: anisette.clone(),
             config: os_config.clone(),
             token_provider: tp.inner.clone(),
@@ -2920,7 +2742,7 @@ impl Client {
         let keychain = Arc::new(rustpush::keychain::KeychainClient {
             anisette,
             token_provider: tp.inner.clone(),
-            state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
+            state: tokio::sync::RwLock::new(keychain_state.expect("keychain state missing")),
             config: os_config,
             update_state: Box::new(move |state| {
                 if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
@@ -2943,7 +2765,7 @@ impl Client {
         sync_keychain_with_retries(&keychain, 6, "Cloud client init").await?;
 
         let cloud_messages = Arc::new(rustpush::cloud_messages::CloudMessagesClient::new(
-            cloudkit.clone(), keychain.clone(),
+            cloudkit, keychain.clone(),
         ));
 
         // Step 3: Pre-fetch and cache zone encryption configs for all Manatee zones.
@@ -2966,12 +2788,6 @@ impl Client {
 
         *locked = Some(cloud_messages.clone());
         *self.cloud_keychain_client.lock().await = Some(keychain);
-
-        // Initialize ProfilesClient for Name & Photo Sharing fetches.
-        *self.profiles_client.lock().await = Some(Arc::new(
-            rustpush::name_photo_sharing::ProfilesClient::new(cloudkit.clone()),
-        ));
-
         Ok(cloud_messages)
     }
 
@@ -3002,118 +2818,6 @@ impl Client {
     pub async fn reset_cloud_client(&self) {
         *self.cloud_messages_client.lock().await = None;
         *self.cloud_keychain_client.lock().await = None;
-        *self.profiles_client.lock().await = None;
-    }
-
-    /// Initialize the StatusKit presence system.  Must be called after login
-    /// when a TokenProvider is available.  The callback receives presence
-    /// updates for subscribed handles.
-    pub async fn init_statuskit(&self, callback: Box<dyn StatusCallback>) -> Result<(), WrappedError> {
-        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
-            msg: "No TokenProvider available — cannot initialize StatusKit".into(),
-        })?;
-
-        let statuskit_path = format!("{}/statuskit.plist", resolve_xdg_data_dir());
-        let state: StatusKitState = std::fs::read(&statuskit_path)
-            .ok()
-            .and_then(|data| plist::from_bytes(&data).ok())
-            .unwrap_or_default();
-
-        let path_for_closure = statuskit_path.clone();
-        let sk = StatusKitClient::new(
-            state,
-            Box::new(move |state| {
-                if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
-                    warn!("Failed to persist statuskit state to {}: {}", path_for_closure, e);
-                }
-            }),
-            tp.inner.clone(),
-            self.conn.clone(),
-            tp.os_config.clone(),
-            self.client.identity.clone(),
-        ).await;
-
-        *self.statuskit_client.write().await = Some(sk);
-        *self.status_callback.write().await = Some(Arc::from(callback));
-        info!("StatusKit initialized — presence system ready");
-        Ok(())
-    }
-
-    /// Publish our own presence status.
-    /// active=true → online, active=false → away/DND.
-    pub async fn set_status(&self, active: bool) -> Result<(), WrappedError> {
-        let sk = self.statuskit_client.read().await.clone().ok_or(WrappedError::GenericError {
-            msg: "StatusKit not initialized".into(),
-        })?;
-        let status = if active {
-            StatusKitStatus::new_active()
-        } else {
-            StatusKitStatus::new_away("com.apple.donotdisturb.mode.default".to_string())
-        };
-        sk.share_status(&status).await.map_err(|e| WrappedError::GenericError {
-            msg: format!("Failed to publish status: {}", e),
-        })
-    }
-
-    /// Subscribe to presence updates for the given handles (e.g. tel:+1..., mailto:...).
-    /// The subscription is held internally until unsubscribe_all_status() is called.
-    pub async fn subscribe_to_status(&self, handles: Vec<String>) -> Result<(), WrappedError> {
-        let sk = self.statuskit_client.read().await.clone().ok_or(WrappedError::GenericError {
-            msg: "StatusKit not initialized".into(),
-        })?;
-        let token = sk.request_handles(&handles).await;
-        self.statuskit_interest_tokens.lock().await.push(token);
-        info!("Subscribed to presence for {} handle(s)", handles.len());
-        Ok(())
-    }
-
-    /// Drop all presence subscriptions.
-    pub async fn unsubscribe_all_status(&self) {
-        self.statuskit_interest_tokens.lock().await.clear();
-        info!("Unsubscribed from all presence channels");
-    }
-
-    /// Fetch a shared iMessage profile (Name & Photo Sharing) from CloudKit.
-    /// Requires the record key and decryption key from a ShareProfile message.
-    pub async fn fetch_profile(
-        &self,
-        record_key: String,
-        decryption_key: Vec<u8>,
-        has_poster: bool,
-    ) -> Result<WrappedProfileRecord, WrappedError> {
-        // Ensure cloud clients are initialized (which also initializes profiles_client).
-        let _ = self.get_or_init_cloud_messages_client().await?;
-        let profiles = self.profiles_client.lock().await.clone().ok_or(WrappedError::GenericError {
-            msg: "No profiles client available".into(),
-        })?;
-
-        let share_msg = rustpush::ShareProfileMessage {
-            cloud_kit_record_key: record_key,
-            cloud_kit_decryption_record_key: decryption_key,
-            poster: if has_poster {
-                // We need a minimal poster struct; the actual poster tags are
-                // not needed for fetching — the fetch code checks poster.is_some()
-                // and extracts tags from the fetched record.
-                Some(rustpush::SharedPoster {
-                    low_res_wallpaper_tag: vec![],
-                    wallpaper_tag: vec![],
-                    message_tag: vec![],
-                })
-            } else {
-                None
-            },
-        };
-        let record = profiles.get_record(&share_msg).await.map_err(|e| {
-            WrappedError::GenericError {
-                msg: format!("Failed to fetch profile: {}", e),
-            }
-        })?;
-        Ok(WrappedProfileRecord {
-            display_name: record.name.name,
-            first_name: record.name.first,
-            last_name: record.name.last,
-            avatar: record.image,
-        })
     }
 
     pub async fn get_handles(&self) -> Vec<String> {
@@ -3124,7 +2828,7 @@ impl Client {
     /// Returns None if no token provider is available.
     pub async fn get_icloud_auth_headers(&self) -> Result<Option<HashMap<String, String>>, WrappedError> {
         match &self.token_provider {
-            Some(tp) => Ok(Some(tp.get_icloud_auth_headers().await?)),
+            Some(tp) => Ok(Some(tp.inner.get_icloud_auth_headers().await?)),
             None => Ok(None),
         }
     }
@@ -3133,7 +2837,7 @@ impl Client {
     /// Returns None if no token provider is available.
     pub async fn get_contacts_url(&self) -> Result<Option<String>, WrappedError> {
         match &self.token_provider {
-            Some(tp) => Ok(tp.get_contacts_url().await?),
+            Some(tp) => Ok(tp.inner.get_contacts_url().await?),
             None => Ok(None),
         }
     }
@@ -3141,7 +2845,7 @@ impl Client {
     /// Get the DSID for this account.
     pub async fn get_dsid(&self) -> Result<Option<String>, WrappedError> {
         match &self.token_provider {
-            Some(tp) => Ok(Some(tp.get_dsid().await?)),
+            Some(tp) => Ok(Some(tp.inner.get_dsid().await?)),
             None => Ok(None),
         }
     }
@@ -3191,10 +2895,10 @@ impl Client {
                 let title_str = fields.get(2).copied().unwrap_or("");
                 let summary_str = fields.get(3).copied().unwrap_or("");
 
-                let original_url = Some(NSURL {
+                let original_url = NSURL {
                     base: "$null".to_string(),
                     relative: original_url_str.to_string(),
-                });
+                };
                 let url = if url_str.is_empty() {
                     None
                 } else {
@@ -3221,11 +2925,6 @@ impl Client {
                         icon: None,
                         images: None,
                         icons: None,
-                        is_incomplete: None,
-                        uses_activity_pub: None,
-                        is_encoded_for_local_use: None,
-                        collaboration_type: None,
-                        specialization2: None,
                     },
                     attachments: vec![],
                 };
@@ -3245,8 +2944,8 @@ impl Client {
 
         let schedule = scheduled_ms.map(|ms| ScheduleMode { ms, schedule: true });
 
-        let mut normal = if let Some(parts) = parts {
-            let mut n = NormalMessage {
+        let normal = if let Some(parts) = parts {
+            NormalMessage {
                 parts,
                 effect: None,
                 reply_guid: reply_guid.clone(),
@@ -3258,8 +2957,7 @@ impl Client {
                 voice: false,
                 scheduled: schedule,
                 embedded_profile: None,
-            };
-            n
+            }
         } else {
             let mut n = NormalMessage::new(actual_text.clone(), service.clone());
             n.link_meta = link_meta;
@@ -3380,31 +3078,20 @@ impl Client {
         target_uuid: String,
         edit_part: u64,
         new_text: String,
-        new_html: Option<String>,
         handle: String,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
-        let new_parts = if let Some(ref html_str) = new_html {
-            parse_html_to_parts(html_str, &new_text)
-                .unwrap_or_else(|| MessageParts(vec![IndexedMessagePart {
-                    part: MessagePart::Text(new_text, Default::default()),
-                    idx: None,
-                    ext: None,
-                }]))
-        } else {
-            MessageParts(vec![IndexedMessagePart {
-                part: MessagePart::Text(new_text, Default::default()),
-                idx: None,
-                ext: None,
-            }])
-        };
         let mut msg = MessageInst::new(
             conv,
             &handle,
             Message::Edit(EditMessage {
                 tuuid: target_uuid,
                 edit_part,
-                new_parts,
+                new_parts: MessageParts(vec![IndexedMessagePart {
+                    part: MessagePart::Text(new_text, Default::default()),
+                    idx: None,
+                    ext: None,
+                }]),
             }),
         );
         self.client.send(&mut msg).await
@@ -3430,23 +3117,6 @@ impl Client {
         );
         self.client.send(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send unsend: {}", e) })?;
-        Ok(msg.id.clone())
-    }
-
-    /// Cancel a previously scheduled message.
-    pub async fn send_unschedule(
-        &self,
-        conversation: WrappedConversation,
-        handle: String,
-    ) -> Result<String, WrappedError> {
-        let conv: ConversationData = (&conversation).into();
-        let mut msg = MessageInst::new(
-            conv,
-            &handle,
-            Message::Unschedule,
-        );
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send unschedule: {}", e) })?;
         Ok(msg.id.clone())
     }
 
@@ -3481,21 +3151,88 @@ impl Client {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
         };
-        let mut msg = MessageInst::new(conv.clone(), &handle, Message::MoveToRecycleBin(delete_msg));
+        let mut msg = MessageInst::new(conv, &handle, Message::MoveToRecycleBin(delete_msg));
         self.client.send(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send MoveToRecycleBin: {}", e) })?;
+        // Note: We intentionally do NOT send PermanentDelete. MoveToRecycleBin
+        // moves the chat to Apple's "Recently Deleted" (30-day retention),
+        // respecting the user's recycle bin. The chat can be restored with
+        // !restore-chat which re-uploads the record to CloudKit.
+        Ok(())
+    }
 
-        // Follow up with PermanentDelete to actually remove from CloudKit.
-        // MoveToRecycleBin only moves to "Recently Deleted" (30-day retention).
-        // Without PermanentDelete, records stay in CloudKit and get re-downloaded
-        // on every sync, resurrecting the portal.
-        let perm_msg = PermanentDeleteMessage {
-            target: DeleteTarget::Chat(operated_chat),
-            is_scheduled: false,
+    /// Send a RecoverChat APNs message (command 182) to notify other Apple
+    /// devices that a chat has been recovered from the recycle bin.
+    /// This is the inverse of send_move_to_recycle_bin.
+    pub async fn send_recover_chat(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+        chat_guid: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let bare_handle = handle.replace("mailto:", "").replace("tel:", "");
+        let bare_participants: Vec<String> = conv.participants.iter()
+            .map(|p| p.replace("mailto:", "").replace("tel:", ""))
+            .filter(|p| p != &bare_handle)
+            .collect();
+        let operated_chat = OperatedChat {
+            participants: bare_participants,
+            group_id: conv.sender_guid.clone().unwrap_or_default(),
+            guid: chat_guid,
+            delete_incoming_messages: None,
+            was_reported_as_junk: None,
         };
-        let mut perm = MessageInst::new(conv, &handle, Message::PermanentDelete(perm_msg));
-        self.client.send(&mut perm).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send PermanentDelete: {}", e) })?;
+        let mut msg = MessageInst::new(conv, &handle, Message::RecoverChat(operated_chat));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send RecoverChat: {}", e) })?;
+        Ok(())
+    }
+
+    /// Restore a chat record to CloudKit so it reappears on Apple devices.
+    /// Re-uploads the chat data using save_chats, which creates or overwrites
+    /// the record in chatManateeZone. Used by restore-chat to sync un-deletion
+    /// back to Apple devices.
+    pub async fn restore_cloud_chat(
+        &self,
+        record_name: String,
+        chat_identifier: String,
+        group_id: String,
+        style: i64,
+        service: String,
+        display_name: Option<String>,
+        participants: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let chat = rustpush::cloud_messages::CloudChat {
+            style,
+            is_filtered: 0,
+            successful_query: 1,
+            state: 3,
+            chat_identifier,
+            group_id: group_id.clone(),
+            service_name: service,
+            original_group_id: group_id,
+            properties: None,
+            participants: participants.into_iter().map(|uri| rustpush::cloud_messages::CloudParticipant { uri }).collect(),
+            prop001: Default::default(),
+            last_read_message_timestamp: 0,
+            last_addressed_handle: String::new(),
+            guid: String::new(),
+            display_name,
+            proto001: None,
+            group_photo_guid: None,
+            group_photo: None,
+            dids: vec![],
+        };
+        let mut chats = std::collections::HashMap::new();
+        chats.insert(record_name.clone(), chat);
+        let results = cloud_messages.save_chats(chats).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to restore CloudKit chat: {}", e) })?;
+        // Check individual result
+        if let Some(Err(e)) = results.get(&record_name) {
+            return Err(WrappedError::GenericError { msg: format!("Failed to save restored chat record: {}", e) });
+        }
         Ok(())
     }
 
@@ -3538,6 +3275,394 @@ impl Client {
         ).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to purge recoverable zones: {}", e) })?;
         Ok(())
+    }
+
+    /// List chat records from Apple's "Recently Deleted" recycle bin.
+    /// Paginates through all known recoverable-delete zones and returns all
+    /// non-tombstone chat records found there.
+    pub async fn list_recoverable_chats(&self) -> Result<Vec<WrappedCloudSyncChat>, WrappedError> {
+        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloudkit_proto::CloudKitRecord;
+        use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudChat};
+
+        info!("list_recoverable_chats: starting recycle bin query");
+
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+
+        let mut all_chats = Vec::new();
+        let mut seen_record_names = std::collections::HashSet::new();
+        // Accumulate diagnostics so they appear in the final summary log
+        // (which we KNOW gets output even if per-page logs are lost).
+        let mut zone_diag: Vec<String> = Vec::new();
+
+        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+            let mut token: Option<Vec<u8>> = None;
+            let mut zone_total_changes = 0usize;
+            let mut zone_tombstones = 0usize;
+            let mut zone_non_chat = 0usize;
+            let mut zone_pcs_err = 0usize;
+            let mut zone_panic = 0usize;
+            let mut zone_incomplete = 0usize;
+            let mut zone_accepted = 0usize;
+            let mut zone_pages = 0usize;
+            let mut zone_last_status = 0i32;
+
+            debug!("list_recoverable_chats: fetching zone encryption config for {}", zone_name);
+
+            for page in 0..256 {
+                zone_pages = page + 1;
+                let zone_id = container.private_zone(zone_name.to_string());
+                let key = container
+                    .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                    .await
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("Failed to get zone key for {}: {}", zone_name, e),
+                    })?;
+
+                debug!("list_recoverable_chats: performing FetchRecordChanges on {} page {}", zone_name, page);
+
+                let (_assets, response) = container
+                    .perform(
+                        &CloudKitSession::new(),
+                        FetchRecordChangesOperation::new(zone_id, token, &NO_ASSETS),
+                    )
+                    .await
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("Failed to fetch recoverable chats from {} page {}: {}", zone_name, page, e),
+                    })?;
+
+                let changes_count = response.change.len();
+                let status = response.status();
+                zone_last_status = status;
+                zone_total_changes += changes_count;
+                debug!("list_recoverable_chats: zone={} page={} changes={} status={}", zone_name, page, changes_count, status);
+
+                for change in &response.change {
+                    let id_proto = match change.identifier.as_ref() {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let id_value = match id_proto.value.as_ref() {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let identifier = id_value.name().to_string();
+
+                    let record = match &change.record {
+                        Some(r) => r,
+                        None => {
+                            zone_tombstones += 1;
+                            debug!("list_recoverable_chats: tombstone record {} in {}", identifier, zone_name);
+                            continue;
+                        }
+                    };
+
+                    let record_type = record
+                        .r#type
+                        .as_ref()
+                        .map(|t| t.name().to_string())
+                        .unwrap_or_else(|| "<missing>".to_string());
+                    let field_names = recoverable_record_field_names(&record.record_field);
+                    if !record_looks_chat_like(&record.record_field) {
+                        zone_non_chat += 1;
+                        debug!("list_recoverable_chats: skipping non-chat record {} in {} type={} fields={:?}", identifier, zone_name, record_type, field_names);
+                        continue;
+                    }
+
+                    let pcskey = match pcs_keys_for_record(record, &key) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            zone_pcs_err += 1;
+                            warn!("list_recoverable_chats: skipping record {} in {}: PCS key error: {}", identifier, zone_name, e);
+                            continue;
+                        }
+                    };
+
+                    let rec_id = match record.record_identifier.as_ref() {
+                        Some(id) => id,
+                        None => continue,
+                    };
+
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        CloudChat::from_record_encrypted(&record.record_field, Some((&pcskey, rec_id)))
+                    }));
+
+                    match result {
+                        Ok(chat) => {
+                            if !seen_record_names.insert(identifier.clone()) {
+                                continue;
+                            }
+                            if let Some(chat) = wrap_recoverable_chat(identifier.clone(), chat) {
+                                zone_accepted += 1;
+                                if record_type != CloudChat::record_type() {
+                                    info!(
+                                        "list_recoverable_chats: accepted recycle-bin record {} in {} with nonstandard type {}",
+                                        identifier, zone_name, record_type
+                                    );
+                                }
+                                all_chats.push(chat);
+                            } else {
+                                zone_incomplete += 1;
+                                warn!(
+                                    "list_recoverable_chats: skipping record {} in {}: chat-like fields decoded to incomplete chat (type={}, fields={:?})",
+                                    identifier,
+                                    zone_name,
+                                    record_type,
+                                    recoverable_record_field_names(&record.record_field),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            zone_panic += 1;
+                            let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                                      else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                                      else { "unknown panic".to_string() };
+                            warn!(
+                                "list_recoverable_chats: skipping record {} in {}: deserialization panic: {} (type={}, fields={:?})",
+                                identifier,
+                                zone_name,
+                                msg,
+                                record_type,
+                                recoverable_record_field_names(&record.record_field),
+                            );
+                        }
+                    }
+                }
+
+                let next_token = response.sync_continuation_token().to_vec();
+                if status == 3 || next_token.is_empty() {
+                    break;
+                }
+                token = Some(next_token);
+            }
+
+            zone_diag.push(format!(
+                "{}:pages={},changes={},status={},tombstones={},non_chat={},pcs_err={},panic={},incomplete={},accepted={}",
+                zone_name, zone_pages, zone_total_changes, zone_last_status,
+                zone_tombstones, zone_non_chat, zone_pcs_err, zone_panic, zone_incomplete, zone_accepted
+            ));
+        }
+
+        // Single summary line with ALL diagnostic info embedded.
+        // This line is confirmed to appear in logs — embed everything here.
+        info!("list_recoverable_chats: found {} chat(s) in recycle bin [{}]", all_chats.len(), zone_diag.join(" | "));
+        Ok(all_chats)
+    }
+
+    /// Read all message GUIDs from Apple's recoverableMessageDeleteZone.
+    /// These are the UUIDs of individually deleted messages (moved to trash).
+    /// When an entire chat is deleted, ALL its messages end up here.
+    /// Returns the list of message GUIDs that can be matched against
+    /// cloud_message.uuid to identify deleted chats.
+    /// Reads both recoverable message zones and returns message GUIDs.
+    /// These GUIDs match cloud_message.guid in the local DB. Entries may also
+    /// include base64-encoded metadata after `guid|...`; GUID-only callers can
+    /// safely ignore the suffix.
+    pub async fn list_recoverable_message_guids(&self) -> Result<Vec<String>, WrappedError> {
+        use std::collections::HashSet;
+        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloudkit_proto::CloudKitRecord;
+        use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+
+        info!("list_recoverable_message_guids: starting");
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+
+        let mut guids = Vec::new();
+        let mut seen = HashSet::new();
+        let mut zone_diag = Vec::new();
+        let mut successful_zones = 0usize;
+        let mut zone_errors = Vec::new();
+
+        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+            let mut token: Option<Vec<u8>> = None;
+            let zone_id = container.private_zone(zone_name.to_string());
+            let key = match container
+                .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                .await
+            {
+                Ok(key) => {
+                    successful_zones += 1;
+                    key
+                }
+                Err(e) => {
+                    let err = format!("{}: {}", zone_name, e);
+                    warn!("list_recoverable_message_guids: failed to get zone key for {}", err);
+                    zone_errors.push(err);
+                    continue;
+                }
+            };
+
+            let mut zone_guid_count = 0usize;
+            for page in 0..256 {
+                let zone_id = container.private_zone(zone_name.to_string());
+                let (_assets, response) = match container
+                    .perform(
+                        &CloudKitSession::new(),
+                        FetchRecordChangesOperation::new(zone_id, token, &NO_ASSETS),
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        let err = format!("{} page {}: {}", zone_name, page, e);
+                        warn!("list_recoverable_message_guids: failed to fetch {}", err);
+                        zone_errors.push(err);
+                        break;
+                    }
+                };
+
+                let changes_count = response.change.len();
+                let status = response.status();
+
+                for change in &response.change {
+                    let identifier = change.identifier.as_ref()
+                        .and_then(|i| i.value.as_ref())
+                        .map(|v| v.name().to_string())
+                        .unwrap_or_default();
+                    let record = match &change.record {
+                        Some(r) => r,
+                        None => continue,
+                    };
+
+                    let record_type = record.r#type.as_ref()
+                        .map(|t| t.name().to_string())
+                        .unwrap_or_default();
+                    if record_type != "recoverableMessage" {
+                        continue;
+                    }
+
+                    let pcskey = match pcs_keys_for_record(record, &key) {
+                        Ok(k) => k,
+                        Err(_) => continue,
+                    };
+                    let rec_id = match record.record_identifier.as_ref() {
+                        Some(id) => id,
+                        None => continue,
+                    };
+
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        CloudMessage::from_record_encrypted(&record.record_field, Some((&pcskey, rec_id)))
+                    }));
+                    if let Ok(msg) = result {
+                        if !msg.guid.is_empty() && seen.insert(msg.guid.clone()) {
+                            guids.push(encode_recoverable_message_entry(&msg.guid, &identifier, &msg));
+                            zone_guid_count += 1;
+                        }
+                    }
+                }
+
+                info!("list_recoverable_message_guids: zone={} page={} changes={} status={} guids_so_far={}", zone_name, page, changes_count, status, guids.len());
+
+                let next_token = response.sync_continuation_token().to_vec();
+                if status == 3 || next_token.is_empty() {
+                    break;
+                }
+                token = Some(next_token);
+            }
+            zone_diag.push(format!("{}:{}", zone_name, zone_guid_count));
+        }
+
+        if successful_zones == 0 && !zone_errors.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: format!("Failed to read recoverable message zones: {}", zone_errors.join(" | ")),
+            });
+        }
+
+        info!("list_recoverable_message_guids: found {} deleted message GUID(s) [{}]", guids.len(), zone_diag.join(" | "));
+        Ok(guids)
+    }
+
+    /// Raw diagnostic dump of the recoverable zone. Returns a human-readable
+    /// string describing every change record in the zone (not just chat-like
+    /// ones). Used by the !debug-recycle-bin bridgebot command.
+    pub async fn debug_recoverable_zones(&self) -> Result<String, WrappedError> {
+        use rustpush::cloudkit::{FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
+
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+
+        let mut lines = Vec::new();
+
+        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+            let mut token: Option<Vec<u8>> = None;
+            let mut total_changes = 0usize;
+
+            // Try to get zone encryption config — if this fails, report the error
+            let zone_id = container.private_zone(zone_name.to_string());
+            let key_result = container
+                .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                .await;
+            let _key = match key_result {
+                Ok(k) => {
+                    lines.push(format!("✅ Zone {} — encryption config OK", zone_name));
+                    k
+                }
+                Err(e) => {
+                    lines.push(format!("❌ Zone {} — encryption config FAILED: {}", zone_name, e));
+                    continue;
+                }
+            };
+
+            for page in 0..10 {
+                let zone_id = container.private_zone(zone_name.to_string());
+                let fetch_result = container
+                    .perform(
+                        &CloudKitSession::new(),
+                        FetchRecordChangesOperation::new(zone_id, token, &NO_ASSETS),
+                    )
+                    .await;
+
+                let (_assets, response) = match fetch_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        lines.push(format!("  ❌ Page {} fetch FAILED: {}", page, e));
+                        break;
+                    }
+                };
+
+                let status = response.status();
+                let changes = response.change.len();
+                total_changes += changes;
+                lines.push(format!("  Page {}: {} changes, status={}", page, changes, status));
+
+                for change in &response.change {
+                    let id = change.identifier.as_ref()
+                        .and_then(|i| i.value.as_ref())
+                        .map(|v| v.name().to_string())
+                        .unwrap_or_else(|| "<no-id>".to_string());
+
+                    match &change.record {
+                        None => {
+                            lines.push(format!("    [tombstone] {}", id));
+                        }
+                        Some(record) => {
+                            let rtype = record.r#type.as_ref()
+                                .map(|t| t.name().to_string())
+                                .unwrap_or_else(|| "<missing>".to_string());
+                            let fields = recoverable_record_field_names(&record.record_field);
+                            let chat_like = record_looks_chat_like(&record.record_field);
+                            lines.push(format!("    [record] {} type={} chat_like={} fields={:?}", id, rtype, chat_like, fields));
+                        }
+                    }
+                }
+
+                let next_token = response.sync_continuation_token().to_vec();
+                if status == 3 || next_token.is_empty() {
+                    break;
+                }
+                token = Some(next_token);
+            }
+
+            lines.push(format!("  Total: {} changes in {}", total_changes, zone_name));
+        }
+
+        Ok(lines.join("\n"))
     }
 
     pub async fn send_attachment(
@@ -3617,7 +3742,7 @@ impl Client {
                     using_number: handle.clone(),
                     from_handle: None,
                 };
-                let sms_parts = vec![IndexedMessagePart {
+                let mut sms_parts = vec![IndexedMessagePart {
                     part: MessagePart::Attachment(attachment),
                     idx: None,
                     ext: None,
@@ -3646,6 +3771,23 @@ impl Client {
             }
             Err(e) => Err(WrappedError::GenericError { msg: format!("Failed to send attachment: {}", e) }),
         }
+    }
+
+    /// Cancel a previously scheduled message.
+    pub async fn send_unschedule(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Unschedule,
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send unschedule: {}", e) })?;
+        Ok(msg.id.clone())
     }
 
     /// Rename an iMessage group chat. Delivers a RenameMessage to all participants
@@ -4314,7 +4456,7 @@ impl Client {
             let mut last_pcs_err: Option<rustpush::PushError> = None;
 
             for attempt in 0..MAX_SYNC_ATTEMPTS {
-                match cloud_messages.sync_messages(token.clone()).await {
+                match fetch_main_zone_page_newest_first(&cloud_messages, token.clone()).await {
                     Ok(result) => {
                         sync_result = Some(result);
                         break;
@@ -4466,11 +4608,11 @@ impl Client {
         info!("=== CloudKit Messages Test ===");
 
         // Get needed credentials
-        let dsid = tp.get_dsid_value().await?;
-        let adsid = tp.get_adsid_value().await?;
-        let mme_delegate = tp.get_mme_delegate_value().await?;
-        let account = tp.account.clone();
-        let os_config = tp.os_config.clone();
+        let dsid = tp.inner.get_dsid().await?;
+        let adsid = tp.inner.get_adsid().await?;
+        let mme_delegate = tp.inner.get_mme_delegate().await?;
+        let account = tp.inner.get_account();
+        let os_config = tp.inner.get_os_config();
 
         info!("DSID: {}, ADSID: {}", dsid, adsid);
 
@@ -4483,7 +4625,7 @@ impl Client {
 
         // Create CloudKitClient
         let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
-            state: rustpush::DebugRwLock::new(cloudkit_state),
+            state: tokio::sync::RwLock::new(cloudkit_state),
             anisette: anisette.clone(),
             config: os_config.clone(),
             token_provider: tp.inner.clone(),
@@ -4499,7 +4641,7 @@ impl Client {
         let keychain = Arc::new(rustpush::keychain::KeychainClient {
             anisette: anisette.clone(),
             token_provider: tp.inner.clone(),
-            state: rustpush::DebugRwLock::new(keychain_state),
+            state: tokio::sync::RwLock::new(keychain_state),
             config: os_config.clone(),
             update_state: Box::new(|_state| {
                 // For now, don't persist keychain state
@@ -4603,6 +4745,83 @@ impl Client {
     }
 }
 
+/// Fetch one page of messageManateeZone with newest-first ordering.
+/// Returns (next_token, messages_map, status) — same shape as sync_messages().
+///
+/// Standalone (not a method on Client) so uniffi doesn't try to generate FFI
+/// bindings for it. We call the CloudKit container directly (same pattern as
+/// list_recoverable_chats) so we can set newest_first=true without touching the
+/// vendored sync_messages path. This lets cloud_fetch_recent_messages find recent
+/// messages in the first ~50 pages instead of requiring 200+ oldest-first pages.
+async fn fetch_main_zone_page_newest_first(
+    cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>,
+    token: Option<Vec<u8>>,
+) -> Result<(Vec<u8>, HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), rustpush::PushError> {
+    use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+    use rustpush::cloudkit_proto::CloudKitRecord;
+    use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+
+    let container = cloud_messages.get_container().await?;
+    let zone_id = container.private_zone("messageManateeZone".to_string());
+    let mut key = container
+        .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+        .await?;
+
+    // Create the op then flip newest_first — the inner proto field is pub, so we
+    // can mutate it here without touching the vendored FetchRecordChangesOperation::new.
+    let mut op = FetchRecordChangesOperation::new(zone_id.clone(), token, &NO_ASSETS);
+    op.0.newest_first = Some(true);
+
+    let (_assets, response) = container.perform(&CloudKitSession::new(), op).await?;
+
+    let mut results = HashMap::new();
+    let mut refreshed = false;
+    for change in &response.change {
+        let identifier = change.identifier.as_ref().unwrap()
+            .value.as_ref().unwrap().name().to_string();
+        let Some(record) = &change.record else {
+            results.insert(identifier, None);
+            continue;
+        };
+        if record.r#type.as_ref().unwrap().name() != CloudMessage::record_type() {
+            continue;
+        }
+        let pcskey = match pcs_keys_for_record(record, &key) {
+            Ok(k) => Some(k),
+            Err(rustpush::PushError::PCSRecordKeyMissing) if !refreshed => {
+                container.clear_cache_zone_encryption_config(&zone_id).await;
+                key = container.get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE).await?;
+                refreshed = true;
+                match pcs_keys_for_record(record, &key) {
+                    Ok(k) => Some(k),
+                    Err(rustpush::PushError::PCSRecordKeyMissing) => {
+                        warn!("Skipping record {}: PCS key missing (newest-first fetch)", identifier);
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) if matches!(e,
+                rustpush::PushError::PCSRecordKeyMissing
+                | rustpush::PushError::ShareKeyNotFound(_)
+                | rustpush::PushError::DecryptionKeyNotFound(_)
+                | rustpush::PushError::MasterKeyNotFound
+            ) => {
+                warn!("Skipping record {} due to PCS key error: {}", identifier, e);
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(pcskey) = pcskey else { continue };
+        let item = CloudMessage::from_record_encrypted(
+            &record.record_field,
+            Some((&pcskey, record.record_identifier.as_ref().unwrap())),
+        );
+        results.insert(identifier, Some(item));
+    }
+    Ok((response.sync_continuation_token().to_vec(), results, response.status()))
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         if let Ok(mut handle) = self.receive_handle.try_lock() {
@@ -4671,9 +4890,18 @@ async fn sync_messages_fallback(
             }
         };
 
+        let rec_id = match record.record_identifier.as_ref() {
+            Some(id) => id,
+            None => {
+                warn!("sync_messages_fallback: skipping record {}: missing record_identifier", identifier);
+                skipped += 1;
+                continue;
+            }
+        };
+
         // from_record_encrypted may panic on corrupt field data — catch it
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            CloudMessage::from_record_encrypted(&record.record_field, Some(&pcskey))
+            CloudMessage::from_record_encrypted(&record.record_field, Some((&pcskey, rec_id)))
         }));
 
         match result {

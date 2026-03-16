@@ -1,0 +1,70 @@
+[package]
+name = "rustpush"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+remote-anisette-v3 = ["omnisette/remote-anisette-v3", "icloud_auth/remote-anisette-v3"]
+remote-clearadi = ["omnisette/remote-clearadi", "icloud_auth/remote-clearadi"]
+macos-validation-data = ["dep:open-absinthe"]
+default = ["macos-validation-data"]
+
+[dependencies]
+plist = "1.7.0"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls", "gzip", "stream", "rustls-tls-webpki-roots", "native-tls-vendored"] }
+serde = { version = "1.0", features = ["derive"] }
+openssl = { version = "0.10.56", features = ["vendored"] }
+uuid = { version = "1.4.1", features = ["v4"] }
+base64 = "0.21.2"
+regex = "1.9.3"
+tokio-rustls = "0.24.1"
+rustls = "0.21.6"
+rustls-pemfile = "1.0.3"
+rand = { version = "0.8.5", features = ["min_const_gen"] }
+libflate = "2.0.0"
+thiserror = "1.0.47"
+async-recursion = "1.0.4"
+html-escape = "0.2.13"
+xml-rs = "0.8.17"
+prost = "0.12.0"
+log = "0.4.20"
+pretty_env_logger = "0.5.0"
+async-trait = "0.1.73"
+flume = "0.11.0"
+icloud_auth = { path = "./apple-private-apis/icloud-auth", default-features = false }
+srp = { path = "./apple-private-apis/icloud-auth/rustcrypto-srp" }
+omnisette = { path = "./apple-private-apis/omnisette" }
+open-absinthe = { path = "./open-absinthe", optional = true, features = ["serde"] }
+deku = "0.16.0"
+zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
+rasn = "0.16.0"
+backon = "0.4.4"
+futures = "0.3.30"
+serde_json = "1.0.133"
+notify = "7.0.0"
+num-bigint = "0.4.6"
+ctr = "0.9.2"
+aes = "0.8.4"
+sha2 = "0.10.8"
+hkdf = "0.12.4"
+aes-gcm = "0.10.3"
+cloudkit-proto = { path = "./cloudkit-proto" }
+cloudkit-derive = { path = "./cloudkit-derive" }
+keystore = { path = "./keystore" }
+aes-siv = "0.7.0"
+chrono = "0.4.41"
+bitflags = "2.9.1"
+x509-cert = "0.2.5"
+
+[build-dependencies]
+prost-build = { version = "0.12.0" }
+
+[[bin]]
+name = "rustpush-test"
+required-features = ["macos-validation-data"]
+path = "src/test.rs"
+
+[lib]
+name = "rustpush"
+path = "src/lib.rs"

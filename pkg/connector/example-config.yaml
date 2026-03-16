@@ -18,6 +18,13 @@ backfill_source: cloudkit
 # Requires ffmpeg to be installed on the system.
 video_transcoding: false
 
+# Enable automatic HEIC/HEIF to JPEG conversion for broad Matrix client
+# compatibility. Requires libheif to be installed on the system.
+heic_conversion: false
+
+# JPEG output quality for HEIC/HEIF conversion (1–100). Default is 95.
+heic_jpeg_quality: 95
+
 # Override the outgoing iMessage identity (what recipients see your messages "from").
 # Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
 # Leave empty to use the handle chosen during login.

@@ -193,6 +193,10 @@ func loadSessionState(log zerolog.Logger) PersistedSessionState {
 // session state is found. Intended for CLI use (list-handles subcommand).
 // Reads session.json directly to avoid any logger output.
 func ListHandles() []string {
+	// InitLogger must be called before any Rust FFI (NewWrappedIdsUsers).
+	// Without it the Rust side has no logger and may panic on Linux.
+	rustpushgo.InitLogger()
+
 	path, err := sessionFilePath()
 	if err != nil {
 		return nil

@@ -15,38 +15,32 @@
 # Built binaries
 /mautrix-imessage
 /mautrix-imessage-v2
-/mautrix-imessage.app/
-/mautrix-imessage-v2.app/
-/bbctl
+/mautrix-imessage.app
 /extract-key
 /extract-key-intel
 /start
+/data/
 
 # Rust build artifacts
 librustpushgo.a
 **/target/
-.build-commit
-
-# Data / state directories
-/data/
 state/
+rustpush/certs/fairplay/
 
-# Tool build outputs
+
+# Development/test prompt files
+ENDTOEND_TEST_PROMPT.md
+RUSTPUSH_INTEGRATION_PROMPT.md
+prompts/
+mautrix-imessage-v2.app/
+.build-commit
+.DS_Store
+.apl.history
 tools/apl/
 tools/extract-key-app/.build/
 tools/extract-key-app/ExtractKey.app/
 tools/nac-relay-app/.build/
 tools/nac-relay-app/NACRelay.app/
-
-# Upstream rustpush (fetched at build time)
-/third_party/
-
-# OS junk
-.DS_Store
-
-# Local dev / scratch
-.apl.history
-.rollback/
+!rustpush/open-absinthe/src/bin/
 _todo/
-prompts/
-/openbubbles-app-rustpush/
+.gocache/

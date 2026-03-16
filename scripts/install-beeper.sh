@@ -12,18 +12,22 @@ BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 
-# Where we build/cache bbctl (filtered full clone)
+# Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
 BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bbctl}"
-BBCTL_REPO="${BBCTL_REPO:-https://github.com/beeper/bridge-manager.git}"
-BBCTL_BRANCH="${BBCTL_BRANCH:-main}"
-BBCTL_FALLBACK_REPO="${BBCTL_FALLBACK_REPO:-https://github.com/lrhodin/imessage.git}"
-BBCTL_FALLBACK_BRANCH="${BBCTL_FALLBACK_BRANCH:-master}"
+BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
+BBCTL_BRANCH="${BBCTL_BRANCH:-master}"
 
 echo ""
 echo "═══════════════════════════════════════════════"
 echo "  iMessage Bridge Setup (Beeper)"
 echo "═══════════════════════════════════════════════"
 echo ""
+
+# ── Stop any running bridge instance immediately ──────────────
+# Do this before any setup work so the bridge isn't running while we ask
+# questions, patch config, or run init-db. On re-setup scenarios (bbctl delete),
+# systemd/LaunchAgent may have restarted the bridge — stop it now.
+launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
 
 # ── Permission repair helper ──────────────────────────────────
 # Detects and fixes broken permissions in config.yaml. Matches the same
@@ -68,19 +72,20 @@ if [ -d "$OLD_BBCTL_DIR/.git" ] && [ "$BBCTL_DIR" != "$OLD_BBCTL_DIR" ]; then
 fi
 
 build_bbctl() {
-	local repo="$1" branch="$2"
     echo "Building bbctl..."
     mkdir -p "$(dirname "$BBCTL_DIR")"
     if [ -d "$BBCTL_DIR/.git" ]; then
         cd "$BBCTL_DIR"
-        git remote set-url origin "$repo"
         git fetch --quiet origin
-        git reset --hard --quiet "origin/$branch"
+        git reset --hard --quiet "origin/$BBCTL_BRANCH"
     else
         rm -rf "$BBCTL_DIR"
-        git clone --filter=blob:none --quiet \
-            --branch "$branch" "$repo" "$BBCTL_DIR"
+        git clone --filter=blob:none --no-checkout --quiet \
+            --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
         cd "$BBCTL_DIR"
+        git sparse-checkout init --cone
+        git sparse-checkout set cmd/bbctl
+        git checkout --quiet "$BBCTL_BRANCH"
     fi
     go build -o bbctl ./cmd/bbctl/ 2>&1
     cd - >/dev/null
@@ -93,13 +98,7 @@ if [ -n "$PREBUILT_BBCTL" ] && [ -x "$PREBUILT_BBCTL" ]; then
     cp "$PREBUILT_BBCTL" "$BBCTL"
     echo "✓ Installed bbctl to $BBCTL_DIR/"
 elif [ ! -x "$BBCTL" ]; then
-    if ! build_bbctl "$BBCTL_REPO" "$BBCTL_BRANCH"; then
-        echo "⚠  Failed to build bbctl from $BBCTL_REPO ($BBCTL_BRANCH)"
-        echo "   Retrying with fallback source: $BBCTL_FALLBACK_REPO ($BBCTL_FALLBACK_BRANCH)"
-        BBCTL_REPO="$BBCTL_FALLBACK_REPO"
-        BBCTL_BRANCH="$BBCTL_FALLBACK_BRANCH"
-        build_bbctl "$BBCTL_FALLBACK_REPO" "$BBCTL_FALLBACK_BRANCH"
-    fi
+    build_bbctl
 else
     echo "✓ Found bbctl: $BBCTL"
     # Update if repo has changes
@@ -111,12 +110,7 @@ else
         cd - >/dev/null
         if [ "$LOCAL" != "$REMOTE" ]; then
             echo "  Updating bbctl..."
-            if ! build_bbctl "$BBCTL_REPO" "$BBCTL_BRANCH"; then
-                echo "⚠  Update from $BBCTL_REPO failed, using fallback source"
-                BBCTL_REPO="$BBCTL_FALLBACK_REPO"
-                BBCTL_BRANCH="$BBCTL_FALLBACK_BRANCH"
-                build_bbctl "$BBCTL_FALLBACK_REPO" "$BBCTL_FALLBACK_BRANCH"
-            fi
+            build_bbctl
         fi
     fi
 fi
@@ -217,6 +211,9 @@ else
 
     echo "✓ Config saved to $CONFIG"
 fi
+
+# No bridge-state override needed here — the bridge will post its own
+# state when it actually starts at the end of setup.
 
 # ── Belt-and-suspenders: fix broken permissions ───────────────
 if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
@@ -320,16 +317,6 @@ if [ -t 0 ]; then
                 sed -i '' "s/cloudkit_backfill: .*/cloudkit_backfill: true/" "$CONFIG"
                 sed -i '' "s/backfill_source: .*/backfill_source: cloudkit/" "$CONFIG"
                 echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
-                echo ""
-                echo "IMPORTANT: Before starting the bridge, sync your latest messages to iCloud"
-                echo "from an Apple device (iPhone, iPad, or Mac) to ensure all recent messages"
-                echo "are available for backfill."
-                echo ""
-                read -p "Have you synced your Apple device to iCloud? [y/N]: " ICLOUD_SYNCED
-                case "$ICLOUD_SYNCED" in
-                    [yY]*) echo "✓ Great — backfill will include your latest messages" ;;
-                    *)     echo "⚠ Please sync your Apple device to iCloud before starting the bridge" ;;
-                esac
                 ;;
         esac
     else
@@ -626,6 +613,29 @@ NEEDS_LOGIN=false
 
 SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
 SESSION_FILE="$SESSION_DIR/session.json"
+
+# ── Brief init start (fresh install only) ────────────────────
+# On a fresh install with no prior session, start the bridge briefly so it
+# creates the DB schema and appears in Beeper as "stopped" during setup.
+# We kill it immediately — all config questions (video, HEIC, handle) and
+# the iCloud sync gate are answered next, THEN Apple login (APNs) happens
+# at the very end so no messages are buffered before the bridge is ready.
+if [ "$IS_FRESH_DB" = "true" ]; then
+    echo ""
+    echo "Initializing bridge database..."
+    if ! (cd "$DATA_DIR" && "$BINARY" init-db -c "$CONFIG"); then
+        echo "✗ Bridge database initialization failed — check the output above for details"
+        exit 1
+    fi
+    echo "✓ Bridge database initialized — answering setup questions"
+fi
+
+# ── Ensure bridge is stopped during setup ─────────────────────
+# bbctl config posts StateStarting which makes Beeper show "Running".
+# Stopping the LaunchAgent disconnects the websocket, which makes
+# Beeper detect it as unreachable and overrides the stale state.
+launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
+
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
     # DB missing — check if session.json can auto-restore (has hardware_key for Linux, or macOS)
     if [ -f "$SESSION_FILE" ] && { grep -q '"hardware_key"' "$SESSION_FILE" 2>/dev/null || [ "$(uname -s)" = "Darwin" ]; }; then
@@ -675,120 +685,10 @@ if [ "$NEEDS_LOGIN" = "false" ] && [ "$CK_ENABLED" = "true" ] && [ "$BF_SOURCE" 
     fi
 fi
 
-# Check if backup session state can be restored — validates that session.json
-# and keystore.plist exist AND that the keystore has the referenced keys.
-if [ "$NEEDS_LOGIN" = "true" ] && [ "${FORCE_CLEAR_STATE:-false}" != "true" ] && "$BINARY" check-restore 2>/dev/null; then
-    echo "✓ Backup session state validated — bridge will auto-restore login"
-    NEEDS_LOGIN=false
-fi
-
-if [ "$NEEDS_LOGIN" = "true" ]; then
-    echo ""
-    echo "┌─────────────────────────────────────────────────┐"
-    echo "│  No valid iMessage login found — starting login │"
-    echo "└─────────────────────────────────────────────────┘"
-    echo ""
-    # Stop the bridge if running (otherwise it holds the DB lock)
-    GUI_DOMAIN_TMP="gui/$(id -u)"
-    launchctl bootout "$GUI_DOMAIN_TMP/$BUNDLE_ID" 2>/dev/null || true
-
-    if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
-        echo "Clearing stale local state before login..."
-        rm -f "$DB_URI" "$DB_URI-wal" "$DB_URI-shm"
-        rm -f "$SESSION_DIR/session.json" "$SESSION_DIR/identity.plist" "$SESSION_DIR/trustedpeers.plist"
-    fi
-
-    # Run login from the data directory so the keystore (state/keystore.plist)
-    # is written to the same location the launchd service will read from.
-    (cd "$DATA_DIR" && "$BINARY" login -n -c "$CONFIG")
-    echo ""
-
-    # Re-check permissions after login — the config upgrader may have
-    # corrupted them even with -n if repairPermissions couldn't determine
-    # the username.
-    if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
-        if fix_permissions "$CONFIG" "$WHOAMI"; then
-            echo "✓ Fixed permissions after login: @${WHOAMI}:beeper.com → admin"
-        fi
-    fi
-fi
-
-# ── Preferred handle (runs every time, can reconfigure) ────────
-HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
-CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" | tr -d ' ' || true)
-
-# Try to recover from backups if not set in config
-if [ -z "$CURRENT_HANDLE" ]; then
-    if command -v sqlite3 >/dev/null 2>&1 && [ -n "${DB_URI:-}" ] && [ -f "${DB_URI:-}" ]; then
-        CURRENT_HANDLE=$(sqlite3 "$DB_URI" "SELECT json_extract(metadata, '$.preferred_handle') FROM user_login LIMIT 1;" 2>/dev/null || true)
-    fi
-    if [ -z "$CURRENT_HANDLE" ] && [ -f "$SESSION_DIR/session.json" ] && command -v python3 >/dev/null 2>&1; then
-        CURRENT_HANDLE=$(python3 -c "import json; print(json.load(open('$SESSION_DIR/session.json')).get('preferred_handle',''))" 2>/dev/null || true)
-    fi
-    if [ -z "$CURRENT_HANDLE" ] && [ -f "$HANDLE_BACKUP" ]; then
-        CURRENT_HANDLE=$(cat "$HANDLE_BACKUP")
-    fi
-fi
-
-# Skip interactive prompt if login just ran (login flow already asked)
-if [ -t 0 ] && [ "$NEEDS_LOGIN" = "false" ]; then
-    # Get available handles from session state (available after login)
-    AVAILABLE_HANDLES=$("$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
-    if [ -n "$AVAILABLE_HANDLES" ]; then
-        echo ""
-        echo "Preferred handle (your iMessage sender address):"
-        i=1
-        declare -a HANDLE_LIST=()
-        while IFS= read -r h; do
-            MARKER=""
-            if [ "$h" = "$CURRENT_HANDLE" ]; then
-                MARKER=" (current)"
-            fi
-            echo "  $i) $h$MARKER"
-            HANDLE_LIST+=("$h")
-            i=$((i + 1))
-        done <<< "$AVAILABLE_HANDLES"
-
-        if [ -n "$CURRENT_HANDLE" ]; then
-            read -p "Choice [keep current]: " HANDLE_CHOICE
-        else
-            read -p "Choice [1]: " HANDLE_CHOICE
-        fi
-
-        if [ -n "$HANDLE_CHOICE" ]; then
-            if [ "$HANDLE_CHOICE" -ge 1 ] 2>/dev/null && [ "$HANDLE_CHOICE" -le "${#HANDLE_LIST[@]}" ] 2>/dev/null; then
-                CURRENT_HANDLE="${HANDLE_LIST[$((HANDLE_CHOICE - 1))]}"
-            fi
-        elif [ -z "$CURRENT_HANDLE" ] && [ ${#HANDLE_LIST[@]} -gt 0 ]; then
-            CURRENT_HANDLE="${HANDLE_LIST[0]}"
-        fi
-    elif [ -n "$CURRENT_HANDLE" ]; then
-        echo ""
-        echo "Preferred handle: $CURRENT_HANDLE"
-        read -p "New handle, or Enter to keep current: " NEW_HANDLE
-        if [ -n "$NEW_HANDLE" ]; then
-            CURRENT_HANDLE="$NEW_HANDLE"
-        fi
-    fi
-fi
-
-# Write preferred handle to config (add key if missing, patch if present)
-if [ -n "${CURRENT_HANDLE:-}" ]; then
-    if grep -q 'preferred_handle:' "$CONFIG" 2>/dev/null; then
-        sed -i '' "s|preferred_handle: .*|preferred_handle: '$CURRENT_HANDLE'|" "$CONFIG"
-    else
-        sed -i '' "/^network:/a\\
-\\    preferred_handle: '$CURRENT_HANDLE'
-" "$CONFIG"
-    fi
-    echo "✓ Preferred handle: $CURRENT_HANDLE"
-    echo "$CURRENT_HANDLE" > "$HANDLE_BACKUP"
-fi
-
 # ── Ensure video_transcoding key exists in config ──────────────
 if ! grep -q 'video_transcoding:' "$CONFIG" 2>/dev/null; then
     sed -i '' '/cloudkit_backfill:/i\
-\    video_transcoding: false' "$CONFIG"
+    video_transcoding: false' "$CONFIG"
 fi
 
 # ── Video transcoding (ffmpeg) ─────────────────────────────────
@@ -833,6 +733,230 @@ if [ -t 0 ]; then
     fi
 fi
 
+# ── Ensure heic_conversion key exists in config ──────────────
+if ! grep -q 'heic_conversion:' "$CONFIG" 2>/dev/null; then
+    sed -i '' '/video_transcoding:/a\
+    heic_conversion: false' "$CONFIG"
+fi
+
+# ── HEIC conversion (libheif) ─────────────────────────────────
+CURRENT_HEIC_CONVERSION=$(grep 'heic_conversion:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_conversion: *//' || true)
+if [ -t 0 ]; then
+    echo ""
+    echo "HEIC Conversion:"
+    echo "  When enabled, HEIC/HEIF images are automatically converted to JPEG"
+    echo "  for broad Matrix client compatibility."
+    echo "  Requires libheif."
+    echo ""
+    if [ "$CURRENT_HEIC_CONVERSION" = "true" ]; then
+        read -p "Enable HEIC to JPEG conversion? [Y/n]: " ENABLE_HC
+        case "$ENABLE_HC" in
+            [nN]*)
+                sed -i '' "s/heic_conversion: .*/heic_conversion: false/" "$CONFIG"
+                echo "✓ HEIC conversion disabled"
+                ;;
+            *)
+                if command -v brew >/dev/null 2>&1; then
+                    brew list libheif >/dev/null 2>&1 || brew install libheif
+                fi
+                echo "✓ HEIC conversion enabled"
+                ;;
+        esac
+    else
+        read -p "Enable HEIC to JPEG conversion? [y/N]: " ENABLE_HC
+        case "$ENABLE_HC" in
+            [yY]*)
+                sed -i '' "s/heic_conversion: .*/heic_conversion: true/" "$CONFIG"
+                if command -v brew >/dev/null 2>&1; then
+                    brew list libheif >/dev/null 2>&1 || brew install libheif
+                fi
+                echo "✓ HEIC conversion enabled"
+                ;;
+            *)
+                echo "✓ HEIC conversion disabled"
+                ;;
+        esac
+    fi
+fi
+
+# ── HEIC JPEG quality (only if HEIC conversion is enabled) ───
+HEIC_ENABLED=$(grep 'heic_conversion:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_conversion: *//' || true)
+if [ "$HEIC_ENABLED" = "true" ]; then
+    if ! grep -q 'heic_jpeg_quality:' "$CONFIG" 2>/dev/null; then
+        sed -i '' "$(printf '/heic_conversion:/a\\\n    heic_jpeg_quality: 95')" "$CONFIG"
+    fi
+else
+    sed -i '' '/heic_jpeg_quality:/d' "$CONFIG"
+fi
+if [ "$HEIC_ENABLED" = "true" ] && [ -t 0 ]; then
+    CURRENT_QUALITY=$(grep 'heic_jpeg_quality:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_jpeg_quality: *//' || echo "95")
+    [ -z "$CURRENT_QUALITY" ] && CURRENT_QUALITY=95
+    echo ""
+    read -p "JPEG quality for HEIC conversion (1–100) [$CURRENT_QUALITY]: " NEW_QUALITY
+    if [ -n "$NEW_QUALITY" ]; then
+        if [ "$NEW_QUALITY" -ge 1 ] 2>/dev/null && [ "$NEW_QUALITY" -le 100 ] 2>/dev/null; then
+            sed -i '' "s/heic_jpeg_quality: .*/heic_jpeg_quality: $NEW_QUALITY/" "$CONFIG"
+            echo "✓ JPEG quality set to $NEW_QUALITY"
+        else
+            echo "  ⚠ Invalid quality '$NEW_QUALITY' — keeping $CURRENT_QUALITY"
+        fi
+    else
+        echo "✓ JPEG quality: $CURRENT_QUALITY"
+    fi
+fi
+
+# ── iCloud sync gate (CloudKit + fresh DB) ───────────────────
+# Runs before Apple login so that iCloud is fully synced before APNs first
+# connects.  This ensures CloudKit backfill can deduplicate any messages that
+# Apple buffers and delivers the moment the bridge registers with APNs.
+_ck_backfill=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
+_ck_source=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*backfill_source: *//' || true)
+if [ "$IS_FRESH_DB" = "true" ] && [ "$_ck_backfill" = "true" ] && [ "$_ck_source" != "chatdb" ] && [ -t 0 ]; then
+    echo ""
+    echo "┌─────────────────────────────────────────────────────────────┐"
+    echo "│  Last step: sync iCloud Messages before starting            │"
+    echo "│                                                             │"
+    echo "│  On your iPhone, iPad, Mac, or OpenBubbles:                 │"
+    echo "│    Settings → [Your Name] → iCloud → Messages → Sync Now    │"
+    echo "│                                                             │"
+    echo "│  Wait for sync to complete, then press Y to start.          │"
+    echo "└─────────────────────────────────────────────────────────────┘"
+    echo ""
+    read -p "Have you synced iCloud Messages and are ready to start? [y/N]: " _sync_ready
+    case "$_sync_ready" in
+        [yY]*) echo "✓ Starting bridge" ;;
+        *)
+            echo ""
+            echo "Re-run 'make install-beeper' after syncing iCloud Messages."
+            exit 0
+            ;;
+    esac
+fi
+
+# ── Apple login (APNs connects here — after all questions) ───
+# check-restore runs first: if session.json + keystore are intact, no login needed.
+if [ "$NEEDS_LOGIN" = "true" ] && [ "${FORCE_CLEAR_STATE:-false}" != "true" ] && "$BINARY" check-restore 2>/dev/null; then
+    echo "✓ Backup session state validated — bridge will auto-restore login"
+    NEEDS_LOGIN=false
+fi
+
+LOGIN_RAN=false
+if [ "$NEEDS_LOGIN" = "true" ]; then
+    LOGIN_RAN=true
+    echo ""
+    echo "┌─────────────────────────────────────────────────┐"
+    echo "│  No valid iMessage login found — starting login │"
+    echo "└─────────────────────────────────────────────────┘"
+    echo ""
+    # Stop the bridge if running (otherwise it holds the DB lock)
+    GUI_DOMAIN_TMP="gui/$(id -u)"
+    launchctl bootout "$GUI_DOMAIN_TMP/$BUNDLE_ID" 2>/dev/null || true
+
+    if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
+        echo "Clearing stale local state before login..."
+        rm -f "$DB_URI" "$DB_URI-wal" "$DB_URI-shm"
+        rm -f "$SESSION_DIR/session.json" "$SESSION_DIR/identity.plist" "$SESSION_DIR/trustedpeers.plist"
+    fi
+
+    # Run login from the data directory so the keystore (state/keystore.plist)
+    # is written to the same location the launchd service will read from.
+    (cd "$DATA_DIR" && "$BINARY" login -n -c "$CONFIG")
+    echo ""
+
+    # Re-check permissions after login — the config upgrader may have
+    # corrupted them even with -n if repairPermissions couldn't determine
+    # the username.
+    if [ -n "$WHOAMI" ] && [ "$WHOAMI" != "null" ]; then
+        if fix_permissions "$CONFIG" "$WHOAMI"; then
+            echo "✓ Fixed permissions after login: @${WHOAMI}:beeper.com → admin"
+        fi
+    fi
+fi
+
+# ── Stop bridge before applying config changes ────────────────
+launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
+
+# ── Preferred handle (runs every time, can reconfigure) ────────
+HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
+CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" | tr -d ' ' || true)
+
+# Try to recover from backups if not set in config
+if [ -z "$CURRENT_HANDLE" ]; then
+    if command -v sqlite3 >/dev/null 2>&1 && [ -n "${DB_URI:-}" ] && [ -f "${DB_URI:-}" ]; then
+        CURRENT_HANDLE=$(sqlite3 "$DB_URI" "SELECT json_extract(metadata, '$.preferred_handle') FROM user_login LIMIT 1;" 2>/dev/null || true)
+    fi
+    if [ -z "$CURRENT_HANDLE" ] && [ -f "$SESSION_DIR/session.json" ] && command -v python3 >/dev/null 2>&1; then
+        CURRENT_HANDLE=$(python3 -c "import json; print(json.load(open('$SESSION_DIR/session.json')).get('preferred_handle',''))" 2>/dev/null || true)
+    fi
+    if [ -z "$CURRENT_HANDLE" ] && [ -f "$HANDLE_BACKUP" ]; then
+        CURRENT_HANDLE=$(cat "$HANDLE_BACKUP")
+    fi
+fi
+
+# Skip handle prompt if login just ran and already set a handle (the login
+# flow on macOS asks for handle during Apple ID auth — no need to ask twice).
+# On Linux (external-key flow), login doesn't ask, so CURRENT_HANDLE is empty
+# and the prompt still shows.
+if [ -t 0 ] && { [ "$LOGIN_RAN" != "true" ] || [ -z "$CURRENT_HANDLE" ]; }; then
+    # Get available handles from session state (available after login)
+    AVAILABLE_HANDLES=$("$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
+    if [ -n "$AVAILABLE_HANDLES" ]; then
+        echo ""
+        echo "Preferred handle (your iMessage sender address):"
+        i=1
+        declare -a HANDLE_LIST=()
+        while IFS= read -r h; do
+            MARKER=""
+            if [ "$h" = "$CURRENT_HANDLE" ]; then
+                MARKER=" (current)"
+            fi
+            echo "  $i) $h$MARKER"
+            HANDLE_LIST+=("$h")
+            i=$((i + 1))
+        done <<< "$AVAILABLE_HANDLES"
+
+        if [ -n "$CURRENT_HANDLE" ]; then
+            read -p "Choice [keep current]: " HANDLE_CHOICE
+        else
+            read -p "Choice [1]: " HANDLE_CHOICE
+        fi
+
+        if [ -n "$HANDLE_CHOICE" ]; then
+            if [ "$HANDLE_CHOICE" -ge 1 ] 2>/dev/null && [ "$HANDLE_CHOICE" -le "${#HANDLE_LIST[@]}" ] 2>/dev/null; then
+                CURRENT_HANDLE="${HANDLE_LIST[$((HANDLE_CHOICE - 1))]}"
+            fi
+        elif [ -z "$CURRENT_HANDLE" ] && [ ${#HANDLE_LIST[@]} -gt 0 ]; then
+            CURRENT_HANDLE="${HANDLE_LIST[0]}"
+        fi
+    elif [ -n "$CURRENT_HANDLE" ]; then
+        echo ""
+        echo "Preferred handle: $CURRENT_HANDLE"
+        read -p "New handle, or Enter to keep current: " NEW_HANDLE
+        if [ -n "$NEW_HANDLE" ]; then
+            CURRENT_HANDLE="$NEW_HANDLE"
+        fi
+    else
+        # list-handles returned empty (e.g. session not yet populated).
+        # Fall back to manual entry so the bridge doesn't start without a handle.
+        echo ""
+        echo "Could not detect handles automatically."
+        read -p "Enter your iMessage handle (e.g. tel:+12345678900 or mailto:you@icloud.com): " CURRENT_HANDLE
+    fi
+fi
+
+# Write preferred handle to config (add key if missing, patch if present)
+if [ -n "${CURRENT_HANDLE:-}" ]; then
+    if grep -q 'preferred_handle:' "$CONFIG" 2>/dev/null; then
+        sed -i '' "s|preferred_handle: .*|preferred_handle: '$CURRENT_HANDLE'|" "$CONFIG"
+    else
+        sed -i '' "/^network:/a\\
+\\    preferred_handle: '$CURRENT_HANDLE'
+" "$CONFIG"
+    fi
+    echo "✓ Preferred handle: $CURRENT_HANDLE"
+    echo "$CURRENT_HANDLE" > "$HANDLE_BACKUP"
+fi
+
 # ── Install LaunchAgent ───────────────────────────────────────
 CONFIG_ABS="$(cd "$DATA_DIR" && pwd)/config.yaml"
 DATA_ABS="$(cd "$DATA_DIR" && pwd)"
@@ -848,7 +972,7 @@ BINARY="$BINARY"
 CONFIG="$CONFIG_ABS"
 HEADER_EOF
 cat >> "$DATA_ABS/start.sh" << 'BODY_EOF'
-BBCTL_REPO="${BBCTL_REPO:-https://github.com/beeper/bridge-manager.git}"
+BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
 
 # ANSI helpers
 BOLD='\033[1m'
@@ -867,13 +991,16 @@ printf "\n  ${BOLD}iMessage Bridge${RESET}\n\n"
 
 # Bootstrap sparse clone if it doesn't exist yet
 if [ ! -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
-    step "Setting up bbctl checkout..."
+    step "Setting up bbctl sparse checkout..."
     EXISTING_BBCTL=""
     [ -x "$BBCTL_DIR/bbctl" ] && EXISTING_BBCTL=$(mktemp)  && cp "$BBCTL_DIR/bbctl" "$EXISTING_BBCTL"
     rm -rf "$BBCTL_DIR"
     mkdir -p "$(dirname "$BBCTL_DIR")"
-    git clone --filter=blob:none --quiet \
+    git clone --filter=blob:none --no-checkout --quiet \
         --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
+    git -C "$BBCTL_DIR" sparse-checkout init --cone
+    git -C "$BBCTL_DIR" sparse-checkout set cmd/bbctl
+    git -C "$BBCTL_DIR" checkout --quiet "$BBCTL_BRANCH"
     (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
     [ -n "$EXISTING_BBCTL" ] && rm -f "$EXISTING_BBCTL"
     ok "bbctl ready"

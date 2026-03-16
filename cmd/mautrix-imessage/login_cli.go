@@ -91,9 +91,7 @@ func runInteractiveLogin(br *mxmain.BridgeMain) {
 
 	// Initialize BackgroundCtx (normally set in StartConnectors).
 	// NewLogin needs this for LoadUserLogin.
-	bgCtx, bgCancel := context.WithCancel(context.Background())
-	defer bgCancel()
-	br.Bridge.BackgroundCtx = bgCtx
+	br.Bridge.BackgroundCtx, _ = context.WithCancel(context.Background())
 	br.Bridge.BackgroundCtx = br.Log.WithContext(br.Bridge.BackgroundCtx)
 
 	// Find the admin user from permissions config.

@@ -92,6 +92,16 @@ func main() {
 			// Discover CardDAV URL + encrypt password for install scripts.
 			runCardDAVSetup()
 			return
+		case "init-db":
+			// Initialize the database schema and exit without starting the
+			// bridge. Used by install scripts to create the DB before asking
+			// setup questions, without connecting to Matrix or APNs.
+			os.Args = append(os.Args[:1], os.Args[2:]...)
+			m.PreInit()
+			repairPermissions(&m)
+			m.Init()
+			fmt.Fprintln(os.Stderr, "Database initialized successfully")
+			os.Exit(0)
 		}
 	}
 

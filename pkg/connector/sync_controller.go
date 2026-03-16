@@ -16,6 +16,8 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/format"
 
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
@@ -29,6 +31,11 @@ import (
 // key handling that can now decrypt previously-skipped records).
 // Increment this to trigger a token clear on the next bootstrap.
 const cloudSyncVersion = 4
+
+// maxCloudSyncPages is the upper bound on CloudKit pagination loops.
+// Each CloudKit zone sync (messages, chats, attachments) breaks after this many
+// pages so a runaway response can never loop forever.
+const maxCloudSyncPages = 10000
 
 // cloudChatSyncVersion is bumped when chat-specific sync logic changes in a
 // way that requires a one-time full re-download of the chatManateeZone only
@@ -95,11 +102,8 @@ func (c *IMClient) setCloudSyncDone() {
 	// eventually force-flushing if nothing makes progress for 5 minutes
 	// (i.e. a portal is genuinely stuck and will never finish).
 	go func() {
-		noProgressTimeout := 5 * time.Minute
+		const noProgressTimeout = 5 * time.Minute
 		lastCount := atomic.LoadInt64(&c.pendingInitialBackfills)
-		if lastCount >= 50 {
-			noProgressTimeout = 15 * time.Minute
-		}
 		deadline := time.Now().Add(noProgressTimeout)
 		for time.Now().Before(deadline) {
 			if atomic.LoadInt64(&c.pendingInitialBackfills) <= 0 {
@@ -114,8 +118,8 @@ func (c *IMClient) setCloudSyncDone() {
 			}
 		}
 		remaining := atomic.LoadInt64(&c.pendingInitialBackfills)
-		log.Warn().Int64("remaining", remaining).Dur("timeout", noProgressTimeout).
-			Msg("APNs buffer flush timeout: no forward backfill progress, forcing flush")
+		log.Warn().Int64("remaining", remaining).
+			Msg("APNs buffer flush timeout: no forward backfill progress in 5 minutes, forcing flush")
 		// Mirror what onForwardBackfillDone does: stamp the flush time so the
 		// read-receipt grace window (handleReadReceipt) knows the burst is done.
 		atomic.StoreInt64(&c.apnsBufferFlushedAt, time.Now().UnixMilli())
@@ -137,6 +141,34 @@ func (c *IMClient) isCloudSyncDone() bool {
 // every CloudKit sync so short-lived entries are repopulated anyway.
 const recentlyDeletedPortalsTTL = 24 * time.Hour
 
+// trackDeletedChat adds a portal ID to the recently-deleted set so stale APNs
+// echoes and CloudKit sync don't recreate the portal.
+func (c *IMClient) trackDeletedChat(portalID string) {
+	c.recentlyDeletedPortalsMu.Lock()
+	if c.recentlyDeletedPortals == nil {
+		c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
+	}
+	entry := deletedPortalEntry{deletedAt: time.Now()}
+	c.recentlyDeletedPortals[portalID] = entry
+	// For gid: portals, also track all other portal IDs that share the same
+	// group UUID. CloudKit chat_id UUIDs can differ from group_id UUIDs,
+	// creating multiple portal_id variants for the same group. Without
+	// tracking all variants, createPortalsFromCloudSync recreates the
+	// portal under the alternate UUID on restart.
+	if strings.HasPrefix(portalID, "gid:") && c.cloudStore != nil {
+		uuid := strings.TrimPrefix(portalID, "gid:")
+		ctx := context.Background()
+		if aliases, err := c.cloudStore.findPortalIDsByGroupID(ctx, uuid); err == nil {
+			for _, alias := range aliases {
+				if alias != portalID {
+					c.recentlyDeletedPortals[alias] = entry
+				}
+			}
+		}
+	}
+	c.recentlyDeletedPortalsMu.Unlock()
+}
+
 // pruneRecentlyDeletedPortals removes entries older than the TTL.
 // Called after bootstrap sync to prevent unbounded memory growth.
 func (c *IMClient) pruneRecentlyDeletedPortals(log zerolog.Logger) {
@@ -156,6 +188,503 @@ func (c *IMClient) pruneRecentlyDeletedPortals(log zerolog.Logger) {
 	if pruned > 0 {
 		log.Info().Int("pruned", pruned).Int("remaining", len(c.recentlyDeletedPortals)).
 			Msg("Pruned stale entries from recentlyDeletedPortals")
+	}
+}
+
+// seedDeletedChatsFromRecycleBin reads recoverable chat/message data from
+// Apple's recycle-bin zones, classifies which portals still look deleted, and
+// also auto-recovers portals that were previously soft-deleted locally but
+// whose current CloudKit state now looks active again.
+func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
+	if c.client == nil || c.cloudStore == nil {
+		return
+	}
+
+	ctx := context.Background()
+	candidateMap := make(map[string]recycleBinCandidate)
+	seeded := 0
+	isRestoreOverridden := func(portalID string) bool {
+		overridden, err := c.cloudStore.hasRestoreOverride(ctx, portalID)
+		if err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).
+				Msg("DELETE-SEED: failed to check restore override")
+			return false
+		}
+		return overridden
+	}
+
+	log.Info().Msg("DELETE-SEED: reading recoverable chats from Apple's recycle bin")
+	recoverableChats, chatErr := c.client.ListRecoverableChats()
+	if chatErr != nil {
+		log.Warn().Err(chatErr).Msg("DELETE-SEED: failed to read recoverable chats")
+	} else {
+		log.Info().Int("recoverable_chats", len(recoverableChats)).
+			Msg("DELETE-SEED: read recoverable chats, matching against local portal IDs")
+		for _, chat := range recoverableChats {
+			portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
+			if portalID == "" {
+				log.Debug().
+					Str("record_name", chat.RecordName).
+					Str("cloud_chat_id", chat.CloudChatId).
+					Str("group_id", chat.GroupId).
+					Strs("participants", chat.Participants).
+					Msg("DELETE-SEED: skipping recoverable chat with unresolved portal ID")
+				continue
+			}
+			if isRestoreOverridden(portalID) {
+				if undeleted, err := c.cloudStore.undeleteCloudMessagesByPortalID(ctx, portalID); err != nil {
+					log.Warn().Err(err).Str("portal_id", portalID).
+						Msg("DELETE-SEED: failed to honor restore override for recoverable chat")
+				} else {
+					c.recentlyDeletedPortalsMu.Lock()
+					delete(c.recentlyDeletedPortals, portalID)
+					c.recentlyDeletedPortalsMu.Unlock()
+					log.Info().
+						Str("portal_id", portalID).
+						Int("undeleted_messages", undeleted).
+						Msg("DELETE-SEED: skipping recoverable chat tombstone because user restored it manually")
+				}
+				continue
+			}
+
+			if hasChat, err := c.cloudStore.portalHasChat(ctx, portalID); err == nil && hasChat {
+				c.recentlyDeletedPortalsMu.Lock()
+				delete(c.recentlyDeletedPortals, portalID)
+				c.recentlyDeletedPortalsMu.Unlock()
+				log.Info().
+					Str("portal_id", portalID).
+					Str("record_name", chat.RecordName).
+					Msg("DELETE-SEED: recoverable chat already has live CloudKit row, skipping tombstone seed")
+				continue
+			} else if err != nil {
+				log.Warn().Err(err).Str("portal_id", portalID).
+					Msg("DELETE-SEED: failed to check live chat state for recoverable chat")
+			}
+
+			// If this portal already has messages in the main CloudKit zone (stored
+			// during Phase 2 message sync), it is a recycle-bin-only chat whose
+			// messages appeared in messageManateeZone — not a true deletion. Seed a
+			// live cloud_chat row so createPortalsFromCloudSync picks it up, and skip
+			// the tombstone entirely. This fixes fresh-backfill for chats that were
+			// deleted before the bridge's first ever sync (they appear in the recycle
+			// bin zone but their messages are still in the main zone).
+			if hasMessages, msgErr := c.cloudStore.hasPortalMessages(ctx, portalID); msgErr == nil && hasMessages {
+				dn := ""
+				if chat.DisplayName != nil {
+					dn = *chat.DisplayName
+				}
+				c.cloudStore.seedChatFromRecycleBin(ctx, portalID, chat.CloudChatId, chat.GroupId, dn, "", chat.Participants)
+				log.Info().
+					Str("portal_id", portalID).
+					Str("record_name", chat.RecordName).
+					Msg("DELETE-SEED: recycle-bin chat has main-zone messages, seeding live chat row instead of tombstone")
+				continue
+			} else if msgErr != nil {
+				log.Warn().Err(msgErr).Str("portal_id", portalID).
+					Msg("DELETE-SEED: failed to check portal messages for recoverable chat")
+			}
+
+			participantsJSON, err := json.Marshal(chat.Participants)
+			if err != nil {
+				log.Warn().Err(err).Str("portal_id", portalID).
+					Msg("DELETE-SEED: failed to serialize recoverable chat participants")
+				continue
+			}
+			if err := c.cloudStore.insertDeletedChatTombstone(
+				ctx,
+				chat.CloudChatId,
+				portalID,
+				chat.RecordName,
+				chat.GroupId,
+				chat.Service,
+				chat.DisplayName,
+				string(participantsJSON),
+			); err != nil {
+				log.Warn().Err(err).Str("portal_id", portalID).
+					Msg("DELETE-SEED: failed to persist recoverable chat tombstone")
+				continue
+			}
+			if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+				log.Warn().Err(err).Str("portal_id", portalID).
+					Msg("DELETE-SEED: failed to soft-delete local data for recoverable chat")
+			}
+
+			c.recentlyDeletedPortalsMu.Lock()
+			if c.recentlyDeletedPortals == nil {
+				c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
+			}
+			if _, exists := c.recentlyDeletedPortals[portalID]; !exists {
+				c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
+					deletedAt:   time.Now(),
+					isTombstone: true,
+				}
+				seeded++
+			}
+			c.recentlyDeletedPortalsMu.Unlock()
+
+			portalKey := networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
+			name := friendlyPortalName(ctx, c.Main.Bridge, c, portalKey, portalID)
+			isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
+			if chat.DisplayName != nil && *chat.DisplayName != "" && (name == portalID || name == strings.TrimPrefix(strings.TrimPrefix(portalID, "mailto:"), "tel:") || (isGroup && strings.HasPrefix(name, "Group "))) {
+				name = *chat.DisplayName
+			}
+			if isGroup && strings.HasPrefix(name, "Group ") && len(chat.Participants) > 0 {
+				normalized := make([]string, 0, len(chat.Participants))
+				for _, p := range chat.Participants {
+					if n := normalizeIdentifierForPortalID(p); n != "" {
+						normalized = append(normalized, n)
+					}
+				}
+				if len(normalized) > 0 {
+					if built := c.buildGroupName(normalized); built != "" && built != "Group Chat" {
+						name = built
+					}
+				}
+			}
+			candidateKey := groupPortalDedupKey(portalID, chat.GroupId, chat.Participants)
+			candidateMap[candidateKey] = recycleBinCandidate{
+				portalID:    portalID,
+				displayName: name,
+			}
+			log.Info().
+				Str("portal_id", portalID).
+				Str("record_name", chat.RecordName).
+				Str("name", name).
+				Msg("DELETE-SEED: seeded deleted chat from recoverable chat identity")
+		}
+	}
+
+	log.Info().Msg("DELETE-SEED: reading recoverable message GUIDs from Apple's recycle bin")
+	guids, err := c.client.ListRecoverableMessageGuids()
+	if err != nil {
+		log.Warn().Err(err).Msg("DELETE-SEED: failed to read recoverable message GUIDs")
+	} else if len(guids) == 0 {
+		log.Info().Msg("DELETE-SEED: no recoverable messages found, nothing to seed")
+	} else {
+		log.Info().Int("recoverable_guids", len(guids)).
+			Msg("DELETE-SEED: read recoverable message GUIDs, matching against cloud_message")
+		portalHints := c.buildRecoverableMessagePortalHints(ctx, guids)
+		if len(portalHints) > 0 {
+			log.Info().Int("portal_hints", len(portalHints)).
+				Msg("DELETE-SEED: derived portal hints from recoverable message metadata")
+		}
+
+		states, err := c.cloudStore.classifyRecycleBinPortals(ctx, guids)
+		if err != nil {
+			log.Warn().Err(err).Msg("DELETE-SEED: failed to match GUIDs against cloud_message")
+		} else if len(states) == 0 {
+			log.Info().Int("recoverable_guids", len(guids)).
+				Msg("DELETE-SEED: no portals matched recoverable messages")
+		} else {
+			var deletedStates []recycleBinPortalState
+			autoRecovered := 0
+			for _, state := range states {
+				if state.NeedsUndelete() {
+					undeleted, err := c.cloudStore.undeleteCloudMessagesByPortalID(ctx, state.PortalID)
+					if err != nil {
+						log.Warn().Err(err).Str("portal_id", state.PortalID).
+							Msg("DELETE-SEED: failed to auto-undelete restored portal")
+					} else {
+						c.recentlyDeletedPortalsMu.Lock()
+						delete(c.recentlyDeletedPortals, state.PortalID)
+						c.recentlyDeletedPortalsMu.Unlock()
+						log.Info().
+							Str("portal_id", state.PortalID).
+							Int("undeleted_messages", undeleted).
+							Int("recoverable", state.Recoverable).
+							Int("recoverable_suffix", state.RecoverableSuffix).
+							Msg("DELETE-SEED: auto-recovered restored portal before backfill")
+						autoRecovered++
+					}
+				}
+				if state.LooksDeleted() {
+					if hasChat, err := c.cloudStore.portalHasChat(ctx, state.PortalID); err != nil {
+						log.Warn().Err(err).Str("portal_id", state.PortalID).
+							Msg("DELETE-SEED: failed to check live chat state for recycle-bin match")
+					} else if hasChat {
+						c.recentlyDeletedPortalsMu.Lock()
+						delete(c.recentlyDeletedPortals, state.PortalID)
+						c.recentlyDeletedPortalsMu.Unlock()
+						log.Info().
+							Str("portal_id", state.PortalID).
+							Int("recoverable", state.Recoverable).
+							Int("recoverable_suffix", state.RecoverableSuffix).
+							Msg("DELETE-SEED: live CloudKit chat row wins over recycle-bin message history")
+						continue
+					}
+					if isRestoreOverridden(state.PortalID) {
+						if undeleted, err := c.cloudStore.undeleteCloudMessagesByPortalID(ctx, state.PortalID); err != nil {
+							log.Warn().Err(err).Str("portal_id", state.PortalID).
+								Msg("DELETE-SEED: failed to honor restore override for recycle-bin match")
+						} else {
+							c.recentlyDeletedPortalsMu.Lock()
+							delete(c.recentlyDeletedPortals, state.PortalID)
+							c.recentlyDeletedPortalsMu.Unlock()
+							log.Info().
+								Str("portal_id", state.PortalID).
+								Int("undeleted_messages", undeleted).
+								Msg("DELETE-SEED: skipping recycle-bin delete block because user restored it manually")
+						}
+						continue
+					}
+					deletedStates = append(deletedStates, state)
+				}
+			}
+			if autoRecovered > 0 {
+				log.Info().Int("auto_recovered", autoRecovered).
+					Msg("DELETE-SEED: restored portals were undeleted locally before portal creation")
+			}
+			if len(deletedStates) == 0 {
+				log.Info().Int("recoverable_guids", len(guids)).
+					Msg("DELETE-SEED: no portals currently look deleted after reconciliation")
+			} else {
+				deletedPortalIDs := make([]string, 0, len(deletedStates))
+				for _, state := range deletedStates {
+					deletedPortalIDs = append(deletedPortalIDs, state.PortalID)
+				}
+				log.Info().Int("deleted_portals", len(deletedStates)).
+					Strs("portal_ids", deletedPortalIDs).
+					Msg("DELETE-SEED: found portals whose newest messages are still in Apple's recycle bin")
+
+				// Mark these portals as deleted in memory + DB, and store candidates
+				// for the post-backfill bridgebot notification.
+				c.recentlyDeletedPortalsMu.Lock()
+				if c.recentlyDeletedPortals == nil {
+					c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
+				}
+				for _, state := range deletedStates {
+					portalID := state.PortalID
+					if _, exists := c.recentlyDeletedPortals[portalID]; exists {
+						continue
+					}
+					if err := c.cloudStore.ensureDeletedChatTombstoneByPortalID(ctx, portalID); err != nil {
+						log.Warn().Err(err).Str("portal_id", portalID).
+							Msg("DELETE-SEED: failed to persist tombstone for blocked portal")
+					}
+					c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
+						deletedAt:   time.Now(),
+						isTombstone: true,
+					}
+					if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+						log.Warn().Err(err).Str("portal_id", portalID).
+							Msg("DELETE-SEED: failed to soft-delete local data for seeded portal")
+					}
+					portalKey := networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
+					name := friendlyPortalName(ctx, c.Main.Bridge, c, portalKey, portalID)
+					stateGroupID := ""
+					if strings.HasPrefix(portalID, "gid:") {
+						stateGroupID = c.cloudStore.getGroupIDForPortalID(ctx, portalID)
+					}
+					candidateKey := groupPortalDedupKey(portalID, stateGroupID, nil)
+					candidateMap[candidateKey] = recycleBinCandidate{
+						portalID:    portalID,
+						displayName: name,
+						recoverable: state.Recoverable,
+						total:       state.Total,
+					}
+					log.Info().
+						Str("portal_id", portalID).
+						Str("name", name).
+						Int("recoverable", state.Recoverable).
+						Int("recoverable_suffix", state.RecoverableSuffix).
+						Int("total", state.Total).
+						Msg("DELETE-SEED: blocked portal — latest messages are still in Apple's recycle bin")
+					seeded++
+				}
+				c.recentlyDeletedPortalsMu.Unlock()
+			}
+		}
+
+		hintedSeeded := 0
+		for _, hint := range portalHints {
+			hintGroupID := ""
+			if strings.HasPrefix(hint.PortalID, "gid:") {
+				// Cross-reference cloud_chat to find the real group_id.
+				// The portal ID's UUID might be a chat_id, not the group_id.
+				if resolved := c.cloudStore.getGroupIDForPortalID(ctx, hint.PortalID); resolved != "" {
+					hintGroupID = resolved
+				} else {
+					hintGroupID = strings.TrimPrefix(hint.PortalID, "gid:")
+				}
+			}
+			candidateKey := groupPortalDedupKey(hint.PortalID, hintGroupID, hint.Participants)
+			if _, exists := candidateMap[candidateKey]; exists {
+				continue
+			}
+			if isRestoreOverridden(hint.PortalID) {
+				if undeleted, err := c.cloudStore.undeleteCloudMessagesByPortalID(ctx, hint.PortalID); err != nil {
+					log.Warn().Err(err).Str("portal_id", hint.PortalID).
+						Msg("DELETE-SEED: failed to honor restore override for recoverable message hint")
+				} else {
+					c.recentlyDeletedPortalsMu.Lock()
+					delete(c.recentlyDeletedPortals, hint.PortalID)
+					c.recentlyDeletedPortalsMu.Unlock()
+					log.Info().
+						Str("portal_id", hint.PortalID).
+						Int("undeleted_messages", undeleted).
+						Msg("DELETE-SEED: skipping recoverable message hint because user restored it manually")
+				}
+				continue
+			}
+
+			hasChat, err := c.cloudStore.portalHasChat(ctx, hint.PortalID)
+			if err != nil {
+				log.Warn().Err(err).Str("portal_id", hint.PortalID).
+					Msg("DELETE-SEED: failed to check live chat state for recoverable message hint")
+				continue
+			}
+			if hasChat {
+				c.recentlyDeletedPortalsMu.Lock()
+				delete(c.recentlyDeletedPortals, hint.PortalID)
+				c.recentlyDeletedPortalsMu.Unlock()
+				log.Debug().
+					Str("portal_id", hint.PortalID).
+					Int("recoverable", hint.Count).
+					Msg("DELETE-SEED: recoverable message hint already has live CloudKit row, skipping tombstone seed")
+				continue
+			}
+
+			softDeletedInfo, infoErr := c.cloudStore.getSoftDeletedPortalInfo(ctx, hint.PortalID)
+			if infoErr != nil {
+				log.Warn().Err(infoErr).Str("portal_id", hint.PortalID).
+					Msg("DELETE-SEED: failed to inspect local deleted state for recoverable message hint")
+				continue
+			}
+			if !softDeletedInfo.Deleted && hint.Count < 2 {
+				log.Debug().
+					Str("portal_id", hint.PortalID).
+					Int("recoverable", hint.Count).
+					Msg("DELETE-SEED: skipping weak recoverable message hint without local deleted state")
+				continue
+			}
+
+			participantsJSON, marshalErr := json.Marshal(hint.Participants)
+			if marshalErr != nil {
+				log.Warn().Err(marshalErr).Str("portal_id", hint.PortalID).
+					Msg("DELETE-SEED: failed to serialize recoverable message participants")
+				continue
+			}
+
+			cloudChatID := hint.CloudChatID
+			if cloudChatID == "" {
+				cloudChatID = "synthetic:recoverable:" + hint.PortalID
+			}
+			groupID := ""
+			if strings.HasPrefix(hint.PortalID, "gid:") {
+				groupID = strings.TrimPrefix(hint.PortalID, "gid:")
+			}
+			if err = c.cloudStore.insertDeletedChatTombstone(
+				ctx,
+				cloudChatID,
+				hint.PortalID,
+				"",
+				groupID,
+				hint.Service,
+				nil,
+				string(participantsJSON),
+			); err != nil {
+				log.Warn().Err(err).Str("portal_id", hint.PortalID).
+					Msg("DELETE-SEED: failed to persist recoverable message tombstone")
+				continue
+			}
+			if err = c.cloudStore.deleteLocalChatByPortalID(ctx, hint.PortalID); err != nil {
+				log.Warn().Err(err).Str("portal_id", hint.PortalID).
+					Msg("DELETE-SEED: failed to soft-delete local data for recoverable message hint")
+			}
+
+			added := false
+			c.recentlyDeletedPortalsMu.Lock()
+			if c.recentlyDeletedPortals == nil {
+				c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
+			}
+			if _, exists := c.recentlyDeletedPortals[hint.PortalID]; !exists {
+				c.recentlyDeletedPortals[hint.PortalID] = deletedPortalEntry{
+					deletedAt:   time.Now(),
+					isTombstone: true,
+				}
+				added = true
+			}
+			c.recentlyDeletedPortalsMu.Unlock()
+			if added {
+				seeded++
+				hintedSeeded++
+			}
+
+			portalKey := networkid.PortalKey{ID: networkid.PortalID(hint.PortalID), Receiver: c.UserLogin.ID}
+			name := friendlyPortalName(ctx, c.Main.Bridge, c, portalKey, hint.PortalID)
+			candidateMap[candidateKey] = recycleBinCandidate{
+				portalID:    hint.PortalID,
+				displayName: name,
+				recoverable: hint.Count,
+				total:       hint.Count,
+			}
+			log.Info().
+				Str("portal_id", hint.PortalID).
+				Str("name", name).
+				Int("recoverable", hint.Count).
+				Str("cloud_chat_id", hint.CloudChatID).
+				Msg("DELETE-SEED: seeded deleted chat from recoverable message metadata")
+		}
+		if hintedSeeded > 0 {
+			log.Info().Int("seeded", hintedSeeded).
+				Msg("DELETE-SEED: seeded deleted chats from recoverable message metadata")
+		}
+	}
+
+	// Store candidates for post-backfill notification.
+	candidates := make([]recycleBinCandidate, 0, len(candidateMap))
+	for _, candidate := range candidateMap {
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) > 0 {
+		c.recycleBinCandidatesMu.Lock()
+		c.recycleBinCandidates = candidates
+		c.recycleBinCandidatesMu.Unlock()
+	}
+
+	log.Info().Int("seeded", seeded).Int("total_recoverable_guids", len(guids)).
+		Msg("DELETE-SEED: finished — blocked portals will be shown to user via bridgebot")
+}
+
+// notifyRecycleBinCandidates sends a bridgebot message listing chats that were
+// blocked because their messages appear in Apple's recycle bin. The user can
+// restore false positives with !restore-chat.
+func (c *IMClient) notifyRecycleBinCandidates(log zerolog.Logger) {
+	c.recycleBinCandidatesMu.Lock()
+	candidates := c.recycleBinCandidates
+	c.recycleBinCandidates = nil
+	c.recycleBinCandidatesMu.Unlock()
+
+	if len(candidates) == 0 {
+		return
+	}
+
+	ctx := context.Background()
+	user := c.UserLogin.User
+	mgmtRoom, err := user.GetManagementRoom(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get management room for recycle bin notification")
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("**Chats blocked from Apple's recycle bin:**\n\n")
+	sb.WriteString("These chats have messages in Apple's \"Recently Deleted\" and were not created during backfill. ")
+	sb.WriteString("If any were restored on your iPhone and should appear here, use `!restore-chat` to bring them back.\n\n")
+	for i, c := range candidates {
+		sb.WriteString(fmt.Sprintf("%d. **%s**\n", i+1, c.displayName))
+	}
+	sb.WriteString(fmt.Sprintf("\nUse `!restore-chat` to restore any of these chats."))
+
+	content := format.RenderMarkdown(sb.String(), true, false)
+	content.MsgType = event.MsgNotice
+	_, err = c.Main.Bridge.Bot.SendMessage(ctx, mgmtRoom, event.EventMessage, &event.Content{
+		Parsed: content,
+	}, nil)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to send recycle bin notification to management room")
+	} else {
+		log.Info().Int("count", len(candidates)).Msg("Sent recycle bin notification to user")
 	}
 }
 
@@ -184,7 +713,6 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	}
 	go c.refreshGhostNamesFromContacts(log)
 	go c.refreshGroupPortalNamesFromContacts(log)
-	go c.subscribeToContactPresence(log)
 }
 
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
@@ -193,23 +721,40 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	}
 	ctx := context.Background()
 
-	// Get all ghost IDs from the database via the raw DB handle
-	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id, name FROM ghost")
+	// Use bridge_id-scoped query and fetch the current name for diff-gating.
+	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
+		"SELECT id, COALESCE(name, '') FROM ghost WHERE bridge_id=$1",
+		c.Main.Bridge.ID,
+	)
 	if err != nil {
 		log.Err(err).Msg("Failed to query ghosts for contact name refresh")
 		return
 	}
 	defer rows.Close()
 
-	updated := 0
-	total := 0
+	type ghostEntry struct {
+		id   networkid.UserID
+		name string
+	}
+	var ghosts []ghostEntry
 	for rows.Next() {
-		var ghostID, ghostName string
-		if err := rows.Scan(&ghostID, &ghostName); err != nil {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
+			log.Err(err).Msg("Failed to scan ghost ID")
 			continue
 		}
-		total++
-		localID := stripIdentifierPrefix(ghostID)
+		ghosts = append(ghosts, ghostEntry{networkid.UserID(id), name})
+	}
+	if err := rows.Err(); err != nil {
+		log.Err(err).Msg("Ghost ID row iteration error")
+	}
+	rows.Close()
+
+	updated := 0
+	for _, g := range ghosts {
+		// Skip ghosts with no matching contact (efficiency: avoids loading
+		// the full ghost object for participants who aren't in the address book).
+		localID := stripIdentifierPrefix(string(g.id))
 		if localID == "" {
 			continue
 		}
@@ -217,55 +762,34 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		if contact == nil || !contact.HasName() {
 			continue
 		}
-		name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+		// Diff-gate: compute the expected displayname and skip if it matches
+		// the stored name. This prevents unnecessary Matrix profile update API
+		// calls on every contact refresh cycle (AggressiveUpdateInfo=true means
+		// UpdateInfo always makes an API call; diffing here is our only guard).
+		expectedName := c.Main.Config.FormatDisplayname(DisplaynameParams{
 			FirstName: contact.FirstName,
 			LastName:  contact.LastName,
 			Nickname:  contact.Nickname,
 			ID:        localID,
 		})
-		if ghostName != name {
-			ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(ghostID))
-			if err != nil || ghost == nil {
-				continue
-			}
-			ghost.UpdateInfo(ctx, &bridgev2.UserInfo{Name: &name})
-			updated++
-		}
-	}
-	log.Info().Int("updated", updated).Int("total", total).Msg("Refreshed ghost names from contacts")
-}
-
-// subscribeToContactPresence subscribes to iMessage presence updates for all
-// known ghosts via StatusKit.  Presence updates are delivered via
-// OnStatusUpdate and mapped to Matrix ghost presence.
-func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
-	if c.client == nil {
-		return
-	}
-	ctx := context.Background()
-	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost")
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to query ghosts for presence subscription")
-		return
-	}
-	defer rows.Close()
-
-	var handles []string
-	for rows.Next() {
-		var ghostID string
-		if err := rows.Scan(&ghostID); err != nil {
+		if g.name == expectedName {
 			continue
 		}
-		handles = append(handles, ghostID)
+		ghost, err := c.Main.Bridge.GetGhostByID(ctx, g.id)
+		if err != nil || ghost == nil {
+			log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("Failed to load ghost for name refresh")
+			continue
+		}
+		// Use the full GetUserInfo → UpdateInfo cycle (same as refreshAllGhosts)
+		// to ensure name, avatar, and identifiers are all propagated to Matrix.
+		info, err := c.GetUserInfo(ctx, ghost)
+		if err != nil || info == nil {
+			continue
+		}
+		ghost.UpdateInfo(ctx, info)
+		updated++
 	}
-	if len(handles) == 0 {
-		return
-	}
-	if err := c.client.SubscribeToStatus(handles); err != nil {
-		log.Warn().Err(err).Int("count", len(handles)).Msg("Failed to subscribe to presence")
-	} else {
-		log.Info().Int("count", len(handles)).Msg("Subscribed to iMessage presence for known ghosts")
-	}
+	log.Info().Int("updated", updated).Int("total", len(ghosts)).Msg("Refreshed ghost names from contacts")
 }
 
 // refreshGroupPortalNamesFromContacts re-resolves group portal names using
@@ -396,6 +920,30 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	}
 	log.Info().Dur("contacts_wait", time.Since(controllerStart)).Msg("Contacts ready, proceeding with CloudKit sync")
 
+	// Repopulate recentlyDeletedPortals from DB before CloudKit sync.
+	// This ensures tombstones from prior sessions survive bridge restarts
+	// even if CloudKit's incremental sync (with a saved continuation token)
+	// doesn't re-deliver the tombstone records.
+	if c.cloudStore != nil {
+		if deletedPortals, err := c.cloudStore.listDeletedPortalIDs(ctx); err != nil {
+			log.Warn().Err(err).Msg("Failed to load deleted portals from DB")
+		} else if len(deletedPortals) > 0 {
+			c.recentlyDeletedPortalsMu.Lock()
+			if c.recentlyDeletedPortals == nil {
+				c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
+			}
+			for _, portalID := range deletedPortals {
+				c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
+					deletedAt:   time.Now(),
+					isTombstone: true,
+				}
+			}
+			c.recentlyDeletedPortalsMu.Unlock()
+			log.Info().Int("count", len(deletedPortals)).
+				Msg("Repopulated recentlyDeletedPortals from DB (restart safety)")
+		}
+	}
+
 	// Bootstrap: download CloudKit data with retries until successful.
 	// IMPORTANT: Do NOT set cloudSyncDone on failure. The APNs gate must
 	// stay closed until sync succeeds — otherwise APNs echoes can create
@@ -403,8 +951,18 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// and recentlyDeletedPortals has no tombstone entries.
 	// Messages for EXISTING portals are still delivered during this time
 	// (handleMessage only checks cloudSyncDone for NEW portal creation).
+	c.cloudSyncRunningLock.Lock()
+	c.cloudSyncRunning = true
+	c.cloudSyncRunningLock.Unlock()
+	// Ensure cloudSyncRunning is cleared on all exit paths (early return,
+	// panic, stopChan) so handleChatRecover doesn't defer forever.
+	defer func() {
+		c.cloudSyncRunningLock.Lock()
+		c.cloudSyncRunning = false
+		c.cloudSyncRunningLock.Unlock()
+	}()
 	for {
-		err := c.runCloudSyncOnce(ctx, log, true)
+		err := c.runCloudSyncOnceSerialized(ctx, log, true)
 		if err != nil {
 			log.Error().Err(err).
 				Dur("retry_in", cloudSyncRetryInterval).
@@ -446,6 +1004,40 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// hits instead of blocking on CloudKit for 30+ minutes.
 	c.preUploadCloudAttachments(ctx)
 
+	// Seed delete knowledge from Apple's recycle bin BEFORE creating portals.
+	// Must run after runCloudSyncOnce (PCS keys needed) but before
+	// createPortalsFromCloudSync so deleted chats don't get portals.
+	// IMPORTANT: Must also run BEFORE normalizeGroupChatPortalIDs, because
+	// normalization unifies portal_ids (gid:<chat_id> → gid:<group_id>),
+	// which would make portalHasChat match live CloudKit rows for chats
+	// that are actually in the recycle bin.
+	c.seedDeletedChatsFromRecycleBin(log)
+
+	// Normalize inconsistent group portal IDs in cloud_chat: unify all
+	// rows for the same group to use gid:<group_id> as the canonical portal_id.
+	// This must run after seedDeletedChatsFromRecycleBin (which needs the
+	// pre-normalization mismatch to correctly detect deleted chats) but
+	// before createPortalsFromCloudSync (which needs unified portal_ids).
+	if normalized, err := c.cloudStore.normalizeGroupChatPortalIDs(ctx); err != nil {
+		log.Warn().Err(err).Msg("Failed to normalize group chat portal IDs")
+	} else if normalized > 0 {
+		log.Info().Int64("normalized", normalized).
+			Msg("Normalized inconsistent group chat portal IDs (cloud_chat)")
+	}
+
+	// Normalize inconsistent group portal IDs in cloud_message.
+	// resolveConversationID historically used CloudKit chat_id UUIDs before
+	// the getChatPortalID-first fix (2eace9a), creating gid:<chat_id> rows
+	// that differ from the canonical gid:<group_id>. This fixes those rows
+	// using cloud_chat as the authoritative mapping, preventing duplicate
+	// portal creation on startup and restore.
+	if normalized, err := c.cloudStore.normalizeGroupMessagePortalIDs(ctx); err != nil {
+		log.Warn().Err(err).Msg("Failed to normalize group message portal IDs")
+	} else if normalized > 0 {
+		log.Info().Int64("normalized", normalized).
+			Msg("Normalized inconsistent group message portal IDs using cloud_chat mappings")
+	}
+
 	// Create portals and queue forward backfill for all of them.
 	// Skip portals that are tombstoned or recently deleted this session.
 	portalStart := time.Now()
@@ -456,6 +1048,9 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		Dur("portal_creation_elapsed", time.Since(portalStart)).
 		Dur("total_elapsed", time.Since(controllerStart)).
 		Msg("CloudKit bootstrap complete — all portals queued, APNs portal creation enabled")
+
+	// Notify the user about chats blocked from Apple's recycle bin.
+	c.notifyRecycleBinCandidates(log)
 
 	// Clean up stale entries in recentlyDeletedPortals to prevent unbounded
 	// memory growth over long-running sessions.
@@ -490,7 +1085,13 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			Int("total_passes", len(delays)).
 			Logger()
 		resyncLog.Info().Msg("Running delayed incremental CloudKit re-sync")
-		if err := c.runCloudSyncOnce(ctx, resyncLog, false); err != nil {
+		c.cloudSyncRunningLock.Lock()
+		c.cloudSyncRunning = true
+		c.cloudSyncRunningLock.Unlock()
+		if err := c.runCloudSyncOnceSerialized(ctx, resyncLog, false); err != nil {
+			c.cloudSyncRunningLock.Lock()
+			c.cloudSyncRunning = false
+			c.cloudSyncRunningLock.Unlock()
 			resyncLog.Warn().Err(err).Msg("Delayed incremental re-sync failed")
 			continue
 		}
@@ -516,6 +1117,9 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		// already-cached record_names are skipped instantly.
 		c.preUploadCloudAttachments(ctx)
 		c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
+		c.cloudSyncRunningLock.Lock()
+		c.cloudSyncRunning = false
+		c.cloudSyncRunningLock.Unlock()
 	}
 }
 
@@ -541,6 +1145,12 @@ func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logg
 	} else if deleted > 0 {
 		log.Info().Int64("deleted", deleted).Msg("Deleted orphaned cloud_message rows (no matching cloud_chat)")
 	}
+}
+
+func (c *IMClient) runCloudSyncOnceSerialized(ctx context.Context, log zerolog.Logger, isBootstrap bool) error {
+	c.cloudSyncRunMu.Lock()
+	defer c.cloudSyncRunMu.Unlock()
+	return c.runCloudSyncOnce(ctx, log, isBootstrap)
 }
 
 // runCloudSyncOnce performs a single CloudKit sync pass. On the first run
@@ -799,7 +1409,7 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 	consecutiveErrors := 0
 	const maxConsecutiveAttErrors = 3
-	for page := 0; page < 10000; page++ {
+	for page := 0; page < maxCloudSyncPages; page++ {
 		resp, syncErr := safeCloudSyncAttachments(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
@@ -833,14 +1443,13 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 				filename = *att.Filename
 			}
 			attMap[att.Guid] = cloudAttachmentRow{
-				GUID:           att.Guid,
-				MimeType:       mime,
-				UTIType:        uti,
-				Filename:       filename,
-				FileSize:       att.FileSize,
-				RecordName:     att.RecordName,
-				HideAttachment: att.HideAttachment,
-				HasAvid:        att.HasAvid,
+				GUID:       att.Guid,
+				MimeType:   mime,
+				UTIType:    uti,
+				Filename:   filename,
+				FileSize:   att.FileSize,
+				RecordName: att.RecordName,
+				HasAvid:    att.HasAvid,
 			}
 		}
 
@@ -873,7 +1482,7 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 	totalPages := 0
 	consecutiveErrors := 0
 	const maxConsecutiveChatErrors = 3
-	for page := 0; page < 10000; page++ {
+	for page := 0; page < maxCloudSyncPages; page++ {
 		resp, syncErr := safeCloudSyncChats(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
@@ -932,41 +1541,34 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 	return counts, token, nil
 }
 
-// safeCloudSyncMessages wraps the FFI call with panic recovery.
+// safeFFICall wraps an FFI call with panic recovery.
 // UniFFI deserialization panics on malformed buffers; this prevents bridge crashes.
-func safeCloudSyncMessages(client *rustpushgo.Client, token *string) (resp rustpushgo.WrappedCloudSyncMessagesPage, err error) {
+func safeFFICall[T any](name string, fn func() (T, error)) (result T, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			stack := string(debug.Stack())
-			log.Error().Str("ffi_method", "CloudSyncMessages").Str("stack", stack).Msgf("FFI panic recovered: %v", r)
-			err = fmt.Errorf("FFI panic in CloudSyncMessages: %v", r)
+			log.Error().Str("ffi_method", name).Str("stack", string(debug.Stack())).Msgf("FFI panic recovered: %v", r)
+			err = fmt.Errorf("FFI panic in %s: %v", name, r)
 		}
 	}()
-	return client.CloudSyncMessages(token)
+	return fn()
 }
 
-// safeCloudSyncChats wraps the FFI call with panic recovery.
-func safeCloudSyncChats(client *rustpushgo.Client, token *string) (resp rustpushgo.WrappedCloudSyncChatsPage, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			stack := string(debug.Stack())
-			log.Error().Str("ffi_method", "CloudSyncChats").Str("stack", stack).Msgf("FFI panic recovered: %v", r)
-			err = fmt.Errorf("FFI panic in CloudSyncChats: %v", r)
-		}
-	}()
-	return client.CloudSyncChats(token)
+func safeCloudSyncMessages(client *rustpushgo.Client, token *string) (rustpushgo.WrappedCloudSyncMessagesPage, error) {
+	return safeFFICall("CloudSyncMessages", func() (rustpushgo.WrappedCloudSyncMessagesPage, error) {
+		return client.CloudSyncMessages(token)
+	})
 }
 
-// safeCloudSyncAttachments wraps the FFI call with panic recovery.
-func safeCloudSyncAttachments(client *rustpushgo.Client, token *string) (resp rustpushgo.WrappedCloudSyncAttachmentsPage, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			stack := string(debug.Stack())
-			log.Error().Str("ffi_method", "CloudSyncAttachments").Str("stack", stack).Msgf("FFI panic recovered: %v", r)
-			err = fmt.Errorf("FFI panic in CloudSyncAttachments: %v", r)
-		}
-	}()
-	return client.CloudSyncAttachments(token)
+func safeCloudSyncChats(client *rustpushgo.Client, token *string) (rustpushgo.WrappedCloudSyncChatsPage, error) {
+	return safeFFICall("CloudSyncChats", func() (rustpushgo.WrappedCloudSyncChatsPage, error) {
+		return client.CloudSyncChats(token)
+	})
+}
+
+func safeCloudSyncAttachments(client *rustpushgo.Client, token *string) (rustpushgo.WrappedCloudSyncAttachmentsPage, error) {
+	return safeFFICall("CloudSyncAttachments", func() (rustpushgo.WrappedCloudSyncAttachmentsPage, error) {
+		return client.CloudSyncAttachments(token)
+	})
 }
 
 func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]cloudAttachmentRow) (cloudSyncCounters, *string, error) {
@@ -984,7 +1586,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 	consecutiveErrors := 0
 	const maxConsecutiveErrors = 3
 	totalPages := 0
-	for page := 0; page < 10000; page++ {
+	for page := 0; page < maxCloudSyncPages; page++ {
 		resp, syncErr := safeCloudSyncMessages(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
@@ -1076,6 +1678,10 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 	// the real chat identifier). We must look up by record_name.
 	var deletedRecordNames []string
 
+	// Collect portal IDs for chats that have a group photo GUID so we can
+	// warm the photo cache after upserting the batch.
+	var photoPortalIDs []string
+
 	// Build batch of rows.
 	batch := make([]cloudChatUpsertRow, 0, len(chats))
 	for _, chat := range chats {
@@ -1102,6 +1708,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 				Str("record_name", chat.RecordName).
 				Str("group_photo_guid", *chat.GroupPhotoGuid).
 				Msg("CloudKit chat sync: group photo GUID found")
+			photoPortalIDs = append(photoPortalIDs, portalID)
 		}
 
 		batch = append(batch, cloudChatUpsertRow{
@@ -1131,39 +1738,108 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 		}
 	}
 
-	// Batch insert all non-deleted chats.
+	// Batch insert all non-deleted chats. The upsert's ON CONFLICT clause
+	// preserves the existing deleted flag, so soft-deleted (Beeper-deleted)
+	// chats stay deleted through CloudKit re-sync. Only explicit recovery
+	// (RecoverChat, !restore-chat) un-deletes via undeleteCloudChatByPortalID.
 	if err := c.cloudStore.upsertChatBatch(ctx, batch); err != nil {
 		return counts, err
+	}
+
+	// Remove un-tombstoned portals from recentlyDeletedPortals — but only
+	// tombstone entries (seeded from recycle bin). Beeper-initiated deletes
+	// (isTombstone=false) must NOT be cleared here: the CloudKit record may
+	// still exist because the async CloudKit deletion hasn't completed yet.
+	// Clearing the in-memory block prematurely lets createPortalsFromCloudSync
+	// resurrect the portal as a zombie.
+	var tombstonesCleared []string
+	c.recentlyDeletedPortalsMu.Lock()
+	for _, row := range batch {
+		if entry, ok := c.recentlyDeletedPortals[row.PortalID]; ok && entry.isTombstone {
+			delete(c.recentlyDeletedPortals, row.PortalID)
+			tombstonesCleared = append(tombstonesCleared, row.PortalID)
+		}
+	}
+	c.recentlyDeletedPortalsMu.Unlock()
+
+	// For each tombstone portal that CloudKit just confirmed is live, also
+	// clear the deleted=TRUE flag in the DB. upsertChatBatch preserves
+	// cloud_chat.deleted intentionally for Beeper-initiated deletes, but
+	// tombstone portals that re-appear as live should be fully undeleted so
+	// ingestCloudMessages/portalHasChat doesn't silently filter their messages.
+	for _, portalID := range tombstonesCleared {
+		if err := c.cloudStore.undeleteCloudChatByPortalID(ctx, portalID); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).
+				Msg("Failed to undelete tombstone portal DB row after live CloudKit record received")
+		} else {
+			log.Info().Str("portal_id", portalID).
+				Msg("Tombstone portal confirmed live by CloudKit — undeleted in DB")
+		}
+	}
+
+	// Proactively warm the group_photo_cache for chats that have a photo GUID
+	// but no cached bytes yet. This ensures GetChatInfo can serve the avatar
+	// immediately on first portal open without waiting for an APNs IconChange.
+	// Runs in a background goroutine so it doesn't block the sync sweep.
+	// Each download attempt is best-effort: failures are logged at debug level
+	// since the CloudKit "gp" asset field is often unpopulated by Apple clients.
+	if len(photoPortalIDs) > 0 {
+		bgCtx, cancelBg := context.WithCancel(context.Background())
+		// Wire bgCtx to the client lifecycle: cancel it when the client
+		// disconnects. The warmup goroutine also cancels on exit via defer,
+		// so this watcher exits promptly in either case.
+		go func() {
+			select {
+			case <-c.stopChan:
+				cancelBg()
+			case <-bgCtx.Done():
+			}
+		}()
+		portalIDs := photoPortalIDs
+		go func() {
+			defer cancelBg()
+			photoLog := log.With().Str("component", "cloud_photo_warmup").Logger()
+			for _, portalID := range portalIDs {
+				_, existing, cacheErr := c.cloudStore.getGroupPhoto(bgCtx, portalID)
+				if cacheErr == nil && len(existing) > 0 {
+					continue // already cached
+				}
+				c.fetchAndCacheGroupPhoto(bgCtx,
+					photoLog.With().Str("portal_id", portalID).Logger(),
+					portalID)
+			}
+		}()
 	}
 
 	// Handle tombstoned (deleted) chats. Tombstones only carry the
 	// record_name, so we look up portal_ids from the local cloud_chat
 	// table, then:
-	// 1. Hard-delete cloud_chat and cloud_message rows for the portal
-	// 2. Queue bridge portal deletion for any existing portal
-	// 3. Mark in recentlyDeletedPortals to block APNs echo resurrection
-	//    and to ensure ingestCloudMessages marks any re-imported messages
-	//    as deleted=TRUE (cloudSyncDone gate ensures tombstones are always
-	//    processed before APNs can create portals — no DB table needed)
+	// 1. Soft-delete cloud_chat rows (deleted=TRUE) — preserves data for
+	//    portalHasChat checks and potential restore-chat
+	// 2. Soft-delete cloud_message rows (deleted=TRUE) — preserves UUIDs
+	//    for echo detection via hasMessageUUID
+	// 3. Queue bridge portal deletion for any existing portal
+	// 4. Mark in recentlyDeletedPortals to block APNs echo resurrection
 	if len(deletedRecordNames) > 0 {
-		// Resolve record_names → portal_ids before deleting the rows.
+		// Resolve record_names → portal_ids before soft-deleting.
 		portalMap, lookupErr := c.cloudStore.lookupPortalIDsByRecordNames(ctx, deletedRecordNames)
 		if lookupErr != nil {
 			log.Warn().Err(lookupErr).Msg("Failed to look up portal IDs for tombstoned chats")
 		}
 
-		// Delete cloud_chat entries by record_name (correct for tombstones).
+		// Soft-delete cloud_chat entries by record_name (correct for tombstones).
 		if err := c.cloudStore.deleteChatsByRecordNames(ctx, deletedRecordNames); err != nil {
-			return counts, fmt.Errorf("failed to delete tombstoned chats by record_name: %w", err)
+			return counts, fmt.Errorf("failed to soft-delete tombstoned chats by record_name: %w", err)
 		}
 
-		// Hard-delete cloud_chat and cloud_message rows for resolved portal_ids.
-		// Echo detection is handled by recentlyDeletedPortals (set below) and by
-		// ingestCloudMessages marking re-imported messages as deleted=TRUE for
-		// portals in recentlyDeletedPortals.
+		// Soft-delete cloud_message rows for resolved portal_ids.
+		// The cloud_chat rows were already soft-deleted above by record_name.
+		// deleteLocalChatByPortalID sets deleted=TRUE on both tables (idempotent
+		// for cloud_chat, but catches cloud_message rows too). UUIDs are preserved
+		// so hasMessageUUID can still detect stale APNs echoes.
 		for recordName, portalID := range portalMap {
 			if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
-				log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to hard-delete messages for tombstoned chat")
+				log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete messages for tombstoned chat")
 			}
 
 			// Mark as deleted in memory so createPortalsFromCloudSync skips
@@ -1210,23 +1886,51 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 // uuidPattern matches a UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
 var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
+// isNumericSuffix returns true if s is non-empty and contains only ASCII digits.
+// Used to identify CloudKit self-chat identifiers of the form "chat<digits>".
+func isNumericSuffix(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // resolveConversationID determines the canonical portal ID for a cloud message.
 //
 // Rule 1: If chat_id is a UUID → it's a group conversation → "gid:<lowercase-uuid>"
 // Rule 2: Otherwise derive from sender (DM) → "tel:+..." or "mailto:..."
 // Rule 3: Messages create conversations. Never discard a message because
-//         we haven't seen the chat record yet.
+//
+//	we haven't seen the chat record yet.
 func (c *IMClient) resolveConversationID(ctx context.Context, msg rustpushgo.WrappedCloudSyncMessage) string {
-	// Check if chat_id is a UUID (= group conversation)
+	// Try to look up the chat record first. This is authoritative because
+	// getChatPortalID matches on cloud_chat_id, record_name, AND group_id,
+	// so it returns the correct gid:<group_id> even when the message's
+	// chat_id UUID differs from the chat's group_id UUID.
+	if msg.CloudChatId != "" {
+		if portalID, err := c.cloudStore.getChatPortalID(ctx, msg.CloudChatId); err == nil && portalID != "" {
+			return portalID
+		}
+	}
+
+	// Fallback: if no chat record exists yet, a UUID chat_id means group.
 	if msg.CloudChatId != "" && uuidPattern.MatchString(msg.CloudChatId) {
 		return "gid:" + strings.ToLower(msg.CloudChatId)
 	}
 
-	// Try to look up the chat record for non-UUID chat_ids
-	// (e.g., "iMessage;-;+16692858317" or "chat12345...")
-	if msg.CloudChatId != "" {
-		if portalID, err := c.cloudStore.getChatPortalID(ctx, msg.CloudChatId); err == nil && portalID != "" {
-			return portalID
+	// Group chat with non-UUID hex suffix format: "any;+;5851dc712a4b..." or
+	// "iMessage;+;chat<hex>". The ";+;" separator marks a group (vs ";-;" for
+	// DMs). Extract the suffix and use it as the gid: portal ID so group
+	// messages (including is_from_me=true) don't leak to the self-chat portal.
+	if msg.CloudChatId != "" && strings.Contains(msg.CloudChatId, ";+;") {
+		parts := strings.SplitN(msg.CloudChatId, ";+;", 2)
+		if len(parts) == 2 && parts[1] != "" {
+			return "gid:" + strings.ToLower(parts[1])
 		}
 	}
 
@@ -1242,15 +1946,55 @@ func (c *IMClient) resolveConversationID(ctx context.Context, msg rustpushgo.Wra
 
 	// is_from_me DMs: derive from destination
 	if msg.IsFromMe && msg.CloudChatId != "" {
-		// chat_id for DMs is like "iMessage;-;+16692858317"
+		// chat_id for DMs is like "iMessage;-;+16692858317" or bare "email@example.com".
+		var recipient string
 		parts := strings.Split(msg.CloudChatId, ";")
 		if len(parts) == 3 {
-			normalized := normalizeIdentifierForPortalID(parts[2])
-			if normalized != "" {
+			// Standard service-prefixed format: "iMessage;-;recipient"
+			recipient = parts[2]
+		} else if !strings.Contains(msg.CloudChatId, ";") {
+			// Bare chatId (no service prefix) — legacy format or recycle-bin
+			// restored messages. Treat the whole CloudChatId as the recipient.
+			recipient = msg.CloudChatId
+		}
+		if recipient != "" {
+			normalized := normalizeIdentifierForPortalID(recipient)
+			// Only use recipient if it's a real phone/email.
+			// CloudKit uses "chat<numeric>" identifiers for self-chat, which
+			// normalizeIdentifierForPortalID returns unchanged (no tel:/mailto:
+			// prefix). Using those raw creates junk portals.
+			if normalized != "" && (strings.HasPrefix(normalized, "tel:") || strings.HasPrefix(normalized, "mailto:")) {
 				resolved := c.resolveContactPortalID(normalized)
 				resolved = c.resolveExistingDMPortalID(string(resolved))
 				return string(resolved)
 			}
+		}
+	}
+
+	// Self-chat fallback: is_from_me messages where the recipient couldn't be
+	// determined. CloudKit uses unique "chat<numeric>" identifiers for self-chat
+	// instead of the user's phone number, so the handler above can't extract a
+	// valid recipient. Route to the user's own handle (Notes to Self portal).
+	//
+	// Guard: only fall back to self-chat when the CloudChatId looks like an
+	// actual self-chat identifier (empty, or starts with "chat" + digits).
+	// If it contains "@", ";", or matches UUID/phone patterns it belongs to a
+	// remote DM or group — return "" so the message is skipped rather than
+	// misrouted to self-chat. This prevents deleted/splintered remote-chat
+	// messages from polluting the Notes to Self portal.
+	if msg.IsFromMe {
+		chatID := msg.CloudChatId
+		// Require an explicit "chat<digits>" identifier to route to self-chat.
+		// Empty chat_id is too broad — from-me messages from any conversation can
+		// arrive with no chat_id and must be skipped rather than dumped into Notes
+		// to Self. Genuine Notes-to-Self messages use Apple's "chat<digits>" format.
+		isSelfChatID := strings.HasPrefix(strings.ToLower(chatID), "chat") && isNumericSuffix(chatID[4:])
+		if !isSelfChatID {
+			return ""
+		}
+		normalized := normalizeIdentifierForPortalID(c.handle)
+		if normalized != "" {
+			return normalized
 		}
 	}
 
@@ -1324,18 +2068,11 @@ func (c *IMClient) ingestCloudMessages(
 			continue
 		}
 
-		// Skip system/service records (group renames, participant changes, etc.)
-		// that slipped past the Rust-side IS_SYSTEM_MESSAGE / IS_SERVICE_MESSAGE
-		// flag filter. In CloudKit, regular user messages have msgType=1;
-		// msgType=0 indicates non-user-content system records.
-		if msg.MsgType == 0 {
-			log.Debug().
-				Str("guid", msg.Guid).
-				Str("cloud_chat_id", msg.CloudChatId).
-				Msg("Skipping system/service message (msgType=0)")
-			counts.Skipped++
-			continue
-		}
+		// NOTE: msgType=0 is a REGULAR user message in CloudKit — do NOT filter
+		// it. System/service messages are already filtered on the Rust side using
+		// IS_SYSTEM_MESSAGE / IS_SERVICE_MESSAGE flags. A previous version of this
+		// code incorrectly assumed msgType=0 was a system record and filtered all
+		// regular messages, causing cloud_message to remain empty.
 
 		portalID := c.resolveConversationID(ctx, msg)
 		if portalID == "" {
@@ -1354,10 +2091,37 @@ func (c *IMClient) ingestCloudMessages(
 			continue
 		}
 
-		// Skip orphaned messages: no chat_id AND no cloud_chat record for the
+		// Skip messages for portals that have been explicitly deleted/tombstoned.
+		// A cloud_chat row with deleted=TRUE means the user or Apple deleted this
+		// conversation. CloudKit re-sync always re-delivers stale messages for
+		// deleted chats; we must NOT revive them here — only explicit recovery
+		// (RecoverChat APNs, !restore-chat) should un-delete a portal.
+		//
+		// Portals with NO cloud_chat row at all are allowed through when the
+		// message has a non-empty CloudChatId. This covers recycle-bin-only chats
+		// on fresh backfill: the chat was deleted before the bridge's first sync
+		// so it never appeared in the main chat zone, but its messages are still
+		// in the main message zone. seedDeletedChatsFromRecycleBin (runs after
+		// this sync) seeds live cloud_chat rows for them.
+		if c.cloudStore != nil {
+			if isTombstoned, err := c.cloudStore.portalIsExplicitlyDeleted(ctx, portalID); err == nil && isTombstoned {
+				log.Debug().
+					Str("guid", msg.Guid).
+					Str("portal_id", portalID).
+					Str("sender", msg.Sender).
+					Str("cloud_chat_id", msg.CloudChatId).
+					Msg("Skipping message for tombstoned/explicitly-deleted chat")
+				counts.Filtered++
+				continue
+			}
+		}
+
+		// Skip orphaned messages: no CloudChatId AND no cloud_chat record for the
 		// resolved portal. Apple omits filtered/junk chats from the chat zone
-		// entirely, so these messages have no chat association and represent
-		// spam or unknown-sender conversations the user never sees in iMessage.
+		// entirely; messages from those chats have no chat_id and represent spam
+		// or unknown-sender conversations the user never sees in iMessage.
+		// Messages with a non-empty CloudChatId are allowed through even without
+		// a cloud_chat row — they may belong to recycle-bin-only chats.
 		if msg.CloudChatId == "" && c.cloudStore != nil {
 			if hasChat, err := c.cloudStore.portalHasChat(ctx, portalID); err == nil && !hasChat {
 				log.Debug().
@@ -1407,13 +2171,6 @@ func (c *IMClient) ingestCloudMessages(
 						Msg("Attachment GUID not found in attachment zone")
 				}
 			}
-			// Live Photo companion discovery: if a message has an HEIC still,
-			// search the attachment zone for a MOV video with the same base
-			// filename (e.g., IMG_5551.HEIC → IMG_5551.MOV). CloudKit doesn't
-			// reference the MOV GUID from the message, but the record exists
-			// in the attachment zone. We inject it with HideAttachment=true so
-			// cloudAttachmentsToBackfill skips the HEIC and bridges the video.
-			attRows = injectLivePhotoCompanion(attRows, attMap, log, msg.Guid)
 			if len(attRows) > 0 {
 				if attJSON, jsonErr := json.Marshal(attRows); jsonErr == nil {
 					attachmentsJSON = string(attJSON)
@@ -1548,15 +2305,10 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// during ingestCloudChats, so they won't appear in portalInfos. No separate
 	// deleted_portal filter needed — CloudKit tombstones are the authoritative signal.
 
-	// Snapshot recentlyDeletedPortals so we filter portals deleted in-session
-	// even if they were deleted after the static pendingDeletePortals map was built
-	// (e.g. deleted between bootstrap sync and a delayed 15s/60s/3min re-sync).
-	c.recentlyDeletedPortalsMu.RLock()
-	recentlyDeletedSnapshot := make(map[string]bool, len(c.recentlyDeletedPortals))
-	for id := range c.recentlyDeletedPortals {
-		recentlyDeletedSnapshot[id] = true
-	}
-	c.recentlyDeletedPortalsMu.RUnlock()
+	// Check recentlyDeletedPortals live (not a snapshot) so that recoveries
+	// that arrive during CloudKit paging are respected. If a portal is removed
+	// from the map by handleChatRecover between now and when we check it below,
+	// the portal won't be skipped.
 
 	// Count how many portals have messages vs chat-only (diagnostic).
 	chatOnlyPortals := 0
@@ -1580,20 +2332,66 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	newestTSByPortal := make(map[string]int64, len(portalInfos))
 	alreadyQueued := 0
 	pendingDeleteSkipped := 0
+	groupDedupSkipped := 0
+	seenGroupKeys := make(map[string]string) // dedup key → chosen portal_id
 	for _, p := range portalInfos {
 		newestTSByPortal[p.PortalID] = p.NewestTS
-		// Skip portals with no messages — these are cloud_chat records whose
-		// messages were all deleted. Creating empty portals is pointless; if
-		// new messages arrive later, APNs will create the portal on demand.
-		if p.MessageCount == 0 {
-			continue
-		}
-		// Skip portals that are tombstoned or recently deleted this session.
-		// pendingDeletePortals is the skip map passed by the caller;
-		// recentlyDeletedSnapshot catches portals deleted after that point.
-		if pendingDeletePortals[p.PortalID] || recentlyDeletedSnapshot[p.PortalID] {
+		// Skip portals that are recently deleted this session.
+		// Checked live (not from a static snapshot) so that mid-sync
+		// recoveries via handleChatRecover are respected immediately.
+		c.recentlyDeletedPortalsMu.RLock()
+		_, isDeleted := c.recentlyDeletedPortals[p.PortalID]
+		c.recentlyDeletedPortalsMu.RUnlock()
+		if isDeleted {
 			pendingDeleteSkipped++
 			continue
+		}
+		// Dedup group portals: the same group can appear under multiple
+		// portal_ids (gid:<chat_id> vs gid:<group_id>). Use the group
+		// dedup key to detect duplicates and keep only the portal_id
+		// that already has a bridge portal, or the first one (most
+		// recent messages since list is sorted by newest_ts DESC).
+		if isGroupPortalID(p.PortalID) {
+			groupID := ""
+			if strings.HasPrefix(p.PortalID, "gid:") {
+				groupID = c.cloudStore.getGroupIDForPortalID(ctx, p.PortalID)
+			}
+			key := groupPortalDedupKey(p.PortalID, groupID, nil)
+			if existingPortalID, seen := seenGroupKeys[key]; seen {
+				// Already have a candidate for this group. Prefer
+				// whichever has an existing bridge portal.
+				existingKey := networkid.PortalKey{ID: networkid.PortalID(existingPortalID), Receiver: c.UserLogin.ID}
+				newKey := networkid.PortalKey{ID: networkid.PortalID(p.PortalID), Receiver: c.UserLogin.ID}
+				existingPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, existingKey)
+				newPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, newKey)
+				existingHasRoom := existingPortal != nil && existingPortal.MXID != ""
+				newHasRoom := newPortal != nil && newPortal.MXID != ""
+				if newHasRoom && !existingHasRoom {
+					// Swap: the new one has the bridge portal, use it instead
+					log.Info().
+						Str("kept_portal_id", p.PortalID).
+						Str("skipped_portal_id", existingPortalID).
+						Str("dedup_key", key).
+						Msg("Group dedup: swapping to portal with existing bridge room")
+					seenGroupKeys[key] = p.PortalID
+					// Replace in ordered list
+					for j, id := range ordered {
+						if id == existingPortalID {
+							ordered[j] = p.PortalID
+							break
+						}
+					}
+				} else {
+					log.Info().
+						Str("kept_portal_id", existingPortalID).
+						Str("skipped_portal_id", p.PortalID).
+						Str("dedup_key", key).
+						Msg("Group dedup: skipping duplicate group portal")
+				}
+				groupDedupSkipped++
+				continue
+			}
+			seenGroupKeys[key] = p.PortalID
 		}
 		if lastTS, ok := c.queuedPortals[p.PortalID]; ok && lastTS >= p.NewestTS {
 			alreadyQueued++
@@ -1604,11 +2402,15 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	if pendingDeleteSkipped > 0 {
 		log.Info().Int("skipped", pendingDeleteSkipped).Msg("Skipped tombstoned or recently deleted portals")
 	}
+	if groupDedupSkipped > 0 {
+		log.Info().Int("skipped", groupDedupSkipped).Msg("Skipped duplicate group portal IDs (same group, different UUID)")
+	}
 
 	portalStart := time.Now()
 	log.Info().
 		Int("total_candidates", len(portalInfos)).
 		Int("already_queued", alreadyQueued).
+		Int("group_dedup_skipped", groupDedupSkipped).
 		Int("to_process", len(ordered)).
 		Msg("Creating portals from cloud sync")
 
@@ -1740,66 +2542,6 @@ func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {
 		return fmt.Errorf("cloud store not initialized")
 	}
 	return c.cloudStore.ensureSchema(ctx)
-}
-
-// injectLivePhotoCompanion searches the attachment zone for a Live Photo MOV
-// companion when a message has an HEIC still image. Apple Live Photos store
-// two files: a still HEIC and a short MOV video with matching base filename
-// (e.g., IMG_5551.HEIC + IMG_5551.MOV). In CloudKit, only the HEIC GUID is
-// referenced by the message; the MOV exists in the attachment zone but is
-// orphaned. This function finds the MOV by filename match and injects it into
-// the attachment list with HideAttachment=true so downstream filtering
-// (cloudAttachmentsToBackfill) drops the HEIC and bridges only the video.
-func injectLivePhotoCompanion(attRows []cloudAttachmentRow, attMap map[string]cloudAttachmentRow, log zerolog.Logger, msgGUID string) []cloudAttachmentRow {
-	// Find HEIC/image attachments with filenames we can match.
-	var heicBases []string
-	heicGUIDs := make(map[string]bool)
-	for _, att := range attRows {
-		if strings.HasPrefix(att.MimeType, "image/") && att.Filename != "" {
-			base := filenameBase(att.Filename)
-			if base != "" {
-				heicBases = append(heicBases, base)
-				heicGUIDs[att.GUID] = true
-			}
-		}
-	}
-	if len(heicBases) == 0 {
-		return attRows
-	}
-
-	// Build a set of base names for quick lookup.
-	baseSet := make(map[string]bool, len(heicBases))
-	for _, b := range heicBases {
-		baseSet[strings.ToLower(b)] = true
-	}
-
-	// Search the entire attachment zone for videos with matching base filenames.
-	// Existing attachment GUIDs are skipped to avoid duplicates.
-	existingGUIDs := make(map[string]bool, len(attRows))
-	for _, att := range attRows {
-		existingGUIDs[att.GUID] = true
-	}
-
-	for _, att := range attMap {
-		if existingGUIDs[att.GUID] {
-			continue
-		}
-		if !strings.HasPrefix(att.MimeType, "video/") || att.Filename == "" {
-			continue
-		}
-		base := filenameBase(att.Filename)
-		if base != "" && baseSet[strings.ToLower(base)] {
-			// Found a Live Photo MOV companion. Mark it as hidden so
-			// cloudAttachmentsToBackfill will drop the HEIC still.
-			att.HideAttachment = true
-			attRows = append(attRows, att)
-			log.Info().Str("msg_guid", msgGUID).Str("mov_guid", att.GUID).
-				Str("filename", att.Filename).
-				Msg("Live Photo: injected MOV companion from attachment zone")
-		}
-	}
-
-	return attRows
 }
 
 // filenameBase returns the filename without its extension.

@@ -15,7 +15,7 @@ cd "$(dirname "$0")"
 
 # 1. Assemble the XNU encrypt function for x86_64 macOS
 echo "Assembling XNU encrypt function..."
-ENCRYPT_S="../../third_party/rustpush-upstream/open-absinthe/src/asm/encrypt.s"
+ENCRYPT_S="../../rustpush/open-absinthe/src/asm/encrypt.s"
 mkdir -p .build/lib
 
 # Patch the assembly for Mach-O:

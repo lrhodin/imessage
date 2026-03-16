@@ -1,0 +1,11 @@
+/target
+*/target
+*/Cargo.lock
+Cargo.lock
+ignore_this_test.js
+
+# IDE generated files
+.idea
+*.iml
+
+anisette_test/

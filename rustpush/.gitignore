@@ -1,0 +1,14 @@
+.idea
+/target
+/cloudkit-derive/target
+/cloudkit-proto/target
+/open-absinthe/target
+/config.json
+/config.plist
+/out
+/jniLibs
+/id_cache.plist
+/hwconfig.plist
+/anisette_test
+/certs/fairplay/*
+/keystore/target

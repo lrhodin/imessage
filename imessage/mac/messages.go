@@ -316,10 +316,15 @@ func (mac *macOSDatabase) scanMessages(res *sql.Rows) (messages []*imessage.Mess
 			message.NewGroupName = newGroupTitle.String
 		}
 		if len(threadOriginatorPart) > 0 {
-			// The thread_originator_part field seems to have three parts separated by colons.
-			// The first two parts look like the part index, the third one is something else.
-			// TODO this might not be reliable
-			message.ReplyToPart, _ = strconv.Atoi(strings.Split(threadOriginatorPart, ":")[0])
+			// The thread_originator_part field has colon-separated parts; the first
+			// segment is the part index. Log a warning if parsing fails so format
+			// changes can be diagnosed.
+			part, err := strconv.Atoi(strings.Split(threadOriginatorPart, ":")[0])
+			if err != nil {
+				mac.log.Warnfln("Failed to parse thread_originator_part %q in message %s: %v", threadOriginatorPart, message.GUID, err)
+			} else {
+				message.ReplyToPart = part
+			}
 		}
 		if message.IsFromMe {
 			message.Sender.LocalID = ""

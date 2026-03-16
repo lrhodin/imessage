@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"html"
 	"io"
@@ -14,21 +15,28 @@ import (
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
 
-// ogMetaRegex matches <meta property="og:..." content="..."> in either attribute order,
-// supporting both single and double quoted attribute values.
-var ogMetaRegex = regexp.MustCompile(
-	`(?i)<meta\s+[^>]*(?:property|name)=["']og:([^"']+)["'][^>]*content=["']([^"']*)["'][^>]*/?>` +
+// metaTagRegex generically matches all <meta> tags with property/name and content
+// attributes, in either attribute order. Captures the full attribute name (including
+// any namespace prefix like og:, twitter:, etc.) and the content value.
+// Double-quoted values only to avoid apostrophe truncation.
+var metaTagRegex = regexp.MustCompile(
+	`(?i)<meta\s+[^>]*(?:property|name)="([^"]+)"[^>]*content="([^"]*)"[^>]*/?\s*>` +
 		`|` +
-		`(?i)<meta\s+[^>]*content=["']([^"']*)["'][^>]*(?:property|name)=["']og:([^"']+)["'][^>]*/?>`,
+		`(?i)<meta\s+[^>]*content="([^"]*)"[^>]*(?:property|name)="([^"]+)"[^>]*/?\s*>`,
 )
 
-// fetchURLPreview builds a BeeperLinkPreview by fetching the target URL's Open Graph
-// metadata. It tries the homeserver's /preview_url first, then falls back to fetching
-// the HTML and parsing og: meta tags directly. If an og:image is found, it is downloaded
-// and uploaded via the provided intent.
-func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridgev2.MatrixAPI, targetURL string) *event.BeeperLinkPreview {
+// titleRegex extracts the <title> tag content as a last-resort fallback.
+var titleRegex = regexp.MustCompile(`(?i)<title[^>]*>([^<]+)</title>`)
+
+// fetchURLPreview builds a BeeperLinkPreview by fetching the target URL's
+// metadata. It tries the homeserver's /preview_url first, then falls back to
+// fetching the HTML and parsing meta tags directly (og:, twitter:, standard
+// HTML meta, <title>). If an image is found, it is downloaded and uploaded
+// via the provided intent.
+func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridgev2.MatrixAPI, roomID id.RoomID, targetURL string) *event.BeeperLinkPreview {
 	log := zerolog.Ctx(ctx)
 
 	fetchURL := normalizeURL(targetURL)
@@ -43,7 +51,11 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 
 	// Try homeserver preview first
 	if mc, ok := bridge.Matrix.(bridgev2.MatrixConnectorWithURLPreviews); ok {
-		if lp, err := mc.GetURLPreview(ctx, fetchURL); err == nil && lp != nil {
+		lp, err := mc.GetURLPreview(ctx, fetchURL)
+		if err != nil {
+			log.Debug().Err(err).Str("url", fetchURL).Msg("Homeserver URL preview failed, falling back to meta scraping")
+		}
+		if err == nil && lp != nil {
 			preview.LinkPreview = *lp
 			if preview.CanonicalURL == "" {
 				preview.CanonicalURL = targetURL
@@ -58,19 +70,19 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 		}
 	}
 
-	// Fetch the page ourselves and parse og: metadata
-	ogData := fetchOGMetadata(ctx, fetchURL)
-	if ogData["title"] != "" && preview.Title == targetURL {
-		preview.Title = ogData["title"]
+	// Fetch the page ourselves and parse metadata from all meta tag formats
+	meta := fetchPageMetadata(ctx, fetchURL)
+	if meta["title"] != "" && preview.Title == targetURL {
+		preview.Title = meta["title"]
 	}
-	if ogData["description"] != "" && preview.Description == "" {
-		preview.Description = ogData["description"]
+	if meta["description"] != "" && preview.Description == "" {
+		preview.Description = meta["description"]
 	}
 
-	// Download and upload og:image
-	imageURL := ogData["image"]
+	// Download and upload image
+	imageURL := meta["image"]
 	if imageURL == "" {
-		imageURL = ogData["image:secure_url"]
+		imageURL = meta["image:secure_url"]
 	}
 	if imageURL != "" && intent != nil {
 		// Resolve relative URLs against the normalized (https://) URL
@@ -83,7 +95,7 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 		}
 		data, mime, err := downloadURL(ctx, imageURL)
 		if err == nil && len(data) > 0 {
-			mxcURL, encFile, err := intent.UploadMedia(ctx, "", data, "preview", mime)
+			mxcURL, encFile, err := intent.UploadMedia(ctx, roomID, data, "preview", mime)
 			if err == nil {
 				if encFile != nil {
 					preview.ImageEncryption = encFile
@@ -93,57 +105,192 @@ func fetchURLPreview(ctx context.Context, bridge *bridgev2.Bridge, intent bridge
 				}
 				preview.ImageType = mime
 				preview.ImageSize = event.IntOrString(len(data))
-				log.Debug().Str("og_image", imageURL).Msg("Uploaded URL preview image")
+				log.Debug().Str("image_url", imageURL).Msg("Uploaded URL preview image")
 			} else {
 				log.Debug().Err(err).Msg("Failed to upload URL preview image")
 			}
 		} else if err != nil {
-			log.Debug().Err(err).Str("og_image", imageURL).Msg("Failed to download URL preview image")
+			log.Debug().Err(err).Str("image_url", imageURL).Msg("Failed to download URL preview image")
 		}
 	}
 
 	return preview
 }
 
-// fetchOGMetadata fetches a URL and extracts Open Graph meta tags from the HTML.
-func fetchOGMetadata(ctx context.Context, targetURL string) map[string]string {
-	result := make(map[string]string)
+// userAgents lists User-Agent strings to try when fetching page metadata.
+// Many modern sites (JS SPAs) only serve meta tags to recognized social media
+// crawlers — regular browser UAs get a JS shell with no metadata. We lead
+// with crawler UAs that are universally whitelisted for link unfurling, then
+// fall back to browser UAs for traditional sites.
+//
+//  1. facebookexternalhit — most widely whitelisted crawler; virtually every
+//     site serves og: tags to Facebook's crawler for link unfurling.
+//  2. WhatsApp — also very widely whitelisted for the same reason.
+//  3. iPhone Safari — for sites that serve metadata to real mobile browsers.
+//  4. Googlebot — last resort; some sites verify by reverse DNS but many don't.
+var userAgents = []string{
+	"facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatype.html)",
+	"WhatsApp/2.23.2 A",
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+	"Googlebot/2.1 (+http://www.google.com/bot.html)",
+}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+// fetchPageMetadata fetches a URL and extracts preview metadata from the HTML.
+// It tries multiple User-Agent strings and returns a unified map with keys
+// "title", "description", "image", "image:secure_url" resolved from all meta
+// tag formats (og:, twitter:, standard HTML meta, <title> fallback).
+func fetchPageMetadata(ctx context.Context, targetURL string) map[string]string {
+	log := zerolog.Ctx(ctx)
+
+	for _, ua := range userAgents {
+		result := fetchPageMetadataWithUA(ctx, targetURL, ua)
+		if result["image"] != "" || result["title"] != "" {
+			log.Debug().Str("ua", ua).Str("url", targetURL).Str("title", result["title"]).
+				Bool("has_image", result["image"] != "").Msg("Found page metadata")
+			return result
+		}
+		log.Debug().Str("ua", ua).Str("url", targetURL).Msg("No metadata found with this UA, trying next")
+	}
+
+	return make(map[string]string)
+}
+
+// ogHTTPClient uses TLS 1.3 to avoid bot detection via TLS fingerprinting.
+// Sites like Reddit reject Go's default TLS 1.2 handshake with HTTP 403.
+var ogHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS13,
+			MaxVersion: tls.VersionTLS13,
+		},
+	},
+}
+
+// fetchPageMetadataWithUA fetches a URL with a specific User-Agent and extracts
+// metadata from ALL meta tag formats. It parses every <meta> tag generically,
+// then resolves the best title/description/image using a priority cascade:
+//
+//	og: > twitter: > standard HTML meta (name="description") > <title> tag
+//
+// This ensures we get metadata from any site regardless of which meta tag
+// convention it uses.
+func fetchPageMetadataWithUA(ctx context.Context, targetURL string, ua string) map[string]string {
+	result := make(map[string]string)
+	log := zerolog.Ctx(ctx)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return result
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	// Note: Do NOT set Accept-Encoding manually. Go's Transport automatically
+	// handles gzip and transparently decompresses. Setting it explicitly
+	// disables auto-decompression, causing us to read raw gzip bytes.
 
-	resp, err := client.Do(req)
+	resp, err := ogHTTPClient.Do(req)
 	if err != nil {
+		log.Debug().Err(err).Str("url", targetURL).Str("ua", ua).Msg("HTTP request failed for meta scraping")
 		return result
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
+		log.Debug().Int("status", resp.StatusCode).Str("url", targetURL).Str("ua", ua).Msg("HTTP error for meta scraping")
 		return result
 	}
 
-	// Read first 50KB — og: meta tags are in <head>
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 50*1024))
+	// Read first 512KB — meta tags should be in <head> but some sites
+	// inline hundreds of KB of CSS/JS before their meta tags.
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	if len(data) == 0 {
 		return result
 	}
+	log.Debug().Int("status", resp.StatusCode).Int("body_bytes", len(data)).Str("url", targetURL).Str("ua", ua).Msg("Fetched page for meta scraping")
 	htmlStr := string(data)
 
-	for _, match := range ogMetaRegex.FindAllStringSubmatch(htmlStr, -1) {
-		var prop, content string
+	// Parse ALL <meta> tags generically into namespaced buckets.
+	// e.g. "og:title" -> ogTags["title"], "twitter:image" -> twitterTags["image"],
+	//       "description" -> stdTags["description"]
+	ogTags := make(map[string]string)
+	twitterTags := make(map[string]string)
+	stdTags := make(map[string]string)
+
+	for _, match := range metaTagRegex.FindAllStringSubmatch(htmlStr, -1) {
+		var name, content string
 		if match[1] != "" {
-			prop, content = match[1], match[2]
+			name, content = match[1], match[2]
 		} else {
-			prop, content = match[4], match[3]
+			name, content = match[4], match[3]
 		}
-		prop = strings.ToLower(prop)
-		if _, exists := result[prop]; !exists {
-			result[prop] = html.UnescapeString(content)
+		name = strings.ToLower(name)
+		content = html.UnescapeString(content)
+
+		switch {
+		case strings.HasPrefix(name, "og:"):
+			key := name[3:] // strip "og:" prefix
+			if _, exists := ogTags[key]; !exists {
+				ogTags[key] = content
+			}
+		case strings.HasPrefix(name, "twitter:"):
+			key := name[8:] // strip "twitter:" prefix
+			if _, exists := twitterTags[key]; !exists {
+				twitterTags[key] = content
+			}
+		default:
+			if _, exists := stdTags[name]; !exists {
+				stdTags[name] = content
+			}
+		}
+	}
+
+	// Resolve with priority cascade: og: > twitter: > standard meta
+	// Title
+	switch {
+	case ogTags["title"] != "":
+		result["title"] = ogTags["title"]
+	case twitterTags["title"] != "":
+		result["title"] = twitterTags["title"]
+	case stdTags["title"] != "":
+		result["title"] = stdTags["title"]
+	}
+
+	// Description
+	switch {
+	case ogTags["description"] != "":
+		result["description"] = ogTags["description"]
+	case twitterTags["description"] != "":
+		result["description"] = twitterTags["description"]
+	case stdTags["description"] != "":
+		result["description"] = stdTags["description"]
+	}
+
+	// Image
+	switch {
+	case ogTags["image"] != "":
+		result["image"] = ogTags["image"]
+	case ogTags["image:secure_url"] != "":
+		result["image"] = ogTags["image:secure_url"]
+	case twitterTags["image"] != "":
+		result["image"] = twitterTags["image"]
+	case twitterTags["image:src"] != "":
+		result["image"] = twitterTags["image:src"]
+	}
+
+	// Also expose image:secure_url if present (used by fetchURLPreview)
+	if ogTags["image:secure_url"] != "" {
+		result["image:secure_url"] = ogTags["image:secure_url"]
+	}
+
+	// Fall back to <title> tag if no title was found from any meta tags
+	if result["title"] == "" {
+		if m := titleRegex.FindStringSubmatch(htmlStr); m != nil {
+			title := strings.TrimSpace(html.UnescapeString(m[1]))
+			if title != "" {
+				result["title"] = title
+			}
 		}
 	}
 
@@ -151,15 +298,15 @@ func fetchOGMetadata(ctx context.Context, targetURL string) map[string]string {
 }
 
 // downloadURL fetches a URL and returns the body bytes and content type.
+// Uses the shared TLS 1.3 client to avoid bot detection.
 func downloadURL(ctx context.Context, targetURL string) ([]byte, string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return nil, "", err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
-	resp, err := client.Do(req)
+	resp, err := ogHTTPClient.Do(req)
 	if err != nil {
 		return nil, "", err
 	}

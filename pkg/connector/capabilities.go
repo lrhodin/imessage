@@ -22,15 +22,14 @@ func supportedIfFFmpeg() event.CapabilitySupportLevel {
 }
 
 const iMessageMaxFileSize = 2000 * 1024 * 1024 // 2 GB
+const capabilityID = "fi.mau.imessage.capabilities.2025_03"
 
 var caps = &event.RoomFeatures{
-	ID: "fi.mau.imessage.capabilities.2025_03",
+	ID: capabilityID,
 
 	Formatting: map[event.FormattingFeature]event.CapabilitySupportLevel{
-		event.FmtBold:          event.CapLevelFullySupported,
-		event.FmtItalic:        event.CapLevelFullySupported,
-		event.FmtUnderline:     event.CapLevelFullySupported,
-		event.FmtStrikethrough: event.CapLevelFullySupported,
+		event.FmtBold:   event.CapLevelDropped,
+		event.FmtItalic: event.CapLevelDropped,
 	},
 	File: map[event.CapabilityMsgType]*event.FileFeatures{
 		event.MsgImage: {
@@ -39,6 +38,7 @@ var caps = &event.RoomFeatures{
 				"image/png":  event.CapLevelFullySupported,
 				"image/gif":  event.CapLevelFullySupported,
 				"image/heic": event.CapLevelFullySupported,
+				"image/heif": event.CapLevelFullySupported,
 				"image/webp": event.CapLevelFullySupported,
 			},
 			Caption: event.CapLevelFullySupported,
@@ -79,19 +79,10 @@ var caps = &event.RoomFeatures{
 			MaxSize: iMessageMaxFileSize,
 		},
 	},
-	Reply:      event.CapLevelFullySupported,
-	Edit:       event.CapLevelFullySupported,
-	Delete:     event.CapLevelFullySupported,
-	DeleteChat: true,
-	State: map[string]*event.StateFeatures{
-		event.StateRoomName.Type:   {Level: event.CapLevelFullySupported},
-		event.StateRoomAvatar.Type: {Level: event.CapLevelFullySupported},
-	},
-	MemberActions: map[event.MemberAction]event.CapabilitySupportLevel{
-		event.MemberActionInvite: event.CapLevelFullySupported,
-		event.MemberActionKick:   event.CapLevelFullySupported,
-		event.MemberActionLeave:  event.CapLevelFullySupported,
-	},
+	Reply:               event.CapLevelFullySupported,
+	Edit:                event.CapLevelFullySupported,
+	Delete:              event.CapLevelFullySupported,
+	DeleteChat:          true,
 	Reaction:            event.CapLevelFullySupported,
 	ReactionCount:       1,
 	ReadReceipts:        true,
@@ -101,12 +92,9 @@ var caps = &event.RoomFeatures{
 var capsDM *event.RoomFeatures
 
 func init() {
-	capsDM = caps.Clone()
-	capsDM.ID = "fi.mau.imessage.capabilities.2025_03+dm"
-	delete(capsDM.State, event.StateRoomName.Type)
-	delete(capsDM.State, event.StateRoomAvatar.Type)
-	delete(capsDM.MemberActions, event.MemberActionInvite)
-	delete(capsDM.MemberActions, event.MemberActionKick)
+	c := *caps
+	capsDM = &c
+	capsDM.ID = capabilityID + "+dm"
 }
 
 var generalCaps = &bridgev2.NetworkGeneralCapabilities{

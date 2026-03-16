@@ -193,10 +193,13 @@ func (mac *macOSDatabase) SendFile(chatID, text, filename string, pathOnDisk str
 
 func (mac *macOSDatabase) SendFileCleanup(sendFileDir string) {
 	go func() {
-		// TODO maybe log when the file gets removed
 		// Random sleep to make sure the message has time to get sent
 		time.Sleep(60 * time.Second)
-		_ = os.RemoveAll(sendFileDir)
+		if err := os.RemoveAll(sendFileDir); err != nil {
+			mac.log.Warnfln("Failed to remove send file directory %s: %v", sendFileDir, err)
+		} else {
+			mac.log.Debugln("Removed send file directory", sendFileDir)
+		}
 	}()
 }
 

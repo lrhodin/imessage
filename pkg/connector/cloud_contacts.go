@@ -10,7 +10,6 @@ package connector
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -52,7 +51,7 @@ type cloudContactsClient struct {
 // newCloudContactsClient creates a CardDAV contacts client using the rust Client's
 // TokenProvider for authentication. Returns nil if the token provider is unavailable
 // or the contacts URL can't be retrieved.
-func newCloudContactsClient(rustClient *rustpushgo.Client, persistedMmeDelegateJSON string, log zerolog.Logger) *cloudContactsClient {
+func newCloudContactsClient(rustClient *rustpushgo.Client, log zerolog.Logger) *cloudContactsClient {
 	if rustClient == nil {
 		return nil
 	}
@@ -63,14 +62,8 @@ func newCloudContactsClient(rustClient *rustpushgo.Client, persistedMmeDelegateJ
 		return nil
 	}
 	if contactsURL == nil || *contactsURL == "" {
-		fallbackURL := contactsURLFromMmeDelegateJSON(persistedMmeDelegateJSON)
-		if fallbackURL != "" {
-			log.Info().Msg("Using contacts URL from persisted MobileMe delegate fallback")
-			contactsURL = &fallbackURL
-		} else {
-			log.Warn().Msg("No contacts CardDAV URL available from TokenProvider")
-			return nil
-		}
+		log.Warn().Msg("No contacts CardDAV URL available from TokenProvider")
+		return nil
 	}
 
 	dsidPtr, err := rustClient.GetDsid()
@@ -89,60 +82,6 @@ func newCloudContactsClient(rustClient *rustpushgo.Client, persistedMmeDelegateJ
 		byPhone: make(map[string]*imessage.Contact),
 		byEmail: make(map[string]*imessage.Contact),
 	}
-}
-
-func contactsURLFromMmeDelegateJSON(delegateJSON string) string {
-	if strings.TrimSpace(delegateJSON) == "" {
-		return ""
-	}
-
-	var root map[string]any
-	if err := json.Unmarshal([]byte(delegateJSON), &root); err != nil {
-		return ""
-	}
-
-	getString := func(v any, key string) string {
-		m, ok := v.(map[string]any)
-		if !ok {
-			return ""
-		}
-		s, _ := m[key].(string)
-		return strings.TrimSpace(s)
-	}
-
-	// Current persisted shape from rustpush serialization.
-	if mme, ok := root["com.apple.mobileme"]; ok {
-		if contactsRaw := getMapValue(mme, "com.apple.Dataclass.Contacts"); contactsRaw != nil {
-			if u := getString(contactsRaw, "contactsURL"); u != "" {
-				return strings.TrimRight(u, "/")
-			}
-			if u := getString(contactsRaw, "url"); u != "" {
-				return strings.TrimRight(u, "/")
-			}
-		}
-	}
-
-	// Legacy/alternate shape where config map is nested under "config".
-	if cfg, ok := root["config"]; ok {
-		if contactsRaw := getMapValue(cfg, "com.apple.Dataclass.Contacts"); contactsRaw != nil {
-			if u := getString(contactsRaw, "contactsURL"); u != "" {
-				return strings.TrimRight(u, "/")
-			}
-			if u := getString(contactsRaw, "url"); u != "" {
-				return strings.TrimRight(u, "/")
-			}
-		}
-	}
-
-	return ""
-}
-
-func getMapValue(container any, key string) any {
-	m, ok := container.(map[string]any)
-	if !ok {
-		return nil
-	}
-	return m[key]
 }
 
 // doRequest performs an authenticated request to the CardDAV server.

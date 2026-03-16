@@ -19,11 +19,11 @@ import (
 // It sets iMessage-specific defaults without requiring a separate template file.
 const imessageNetworkConfig = `network:
     displayname_template: '{{if .FirstName}}{{.FirstName}}{{if .LastName}} {{.LastName}}{{end}}{{else if .Nickname}}{{.Nickname}}{{else if .Phone}}{{.Phone}}{{else if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}'
-    disable_sms_portals: false
-    caption_in_message: true
-    convert_heif: false
-    convert_tiff: true
-    initial_sync_days: 365
+    cloudkit_backfill: false
+    backfill_source: cloudkit
+    video_transcoding: false
+    heic_conversion: false
+    heic_jpeg_quality: 95
 `
 
 var configCommand = &cli.Command{

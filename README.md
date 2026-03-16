@@ -105,7 +105,7 @@ This reads hardware identifiers (serial, MLB, ROM, etc.) and outputs a base64 ke
 **Enriching keys from older Macs**: Keys extracted from older Intel Macs may be missing encrypted IOKit properties (`_enc` fields). The GUI app (Option A) can compute these automatically with the **Enrich Key** button. If using the CLI instead, you can enrich on your Linux bridge server:
 
 ```bash
-cd third_party/rustpush-upstream/open-absinthe
+cd rustpush/open-absinthe
 cargo run --bin enrich_hw_key -- --file ~/hwkey.b64 > ~/hwkey-enriched.b64
 ```
 
@@ -320,22 +320,8 @@ Key options:
 make build      # Build .app bundle (macOS) or binary (Linux)
 make rust       # Build Rust library only
 make bindings   # Regenerate Go FFI bindings (needs uniffi-bindgen-go)
-make mutation   # Run local mutation testing (ooze) for imessage/
 make clean      # Remove build artifacts
 ```
-
-Mutation testing is intentionally local-only and is not part of GitHub Actions CI/CD.
-Use it on demand when improving test quality:
-
-```bash
-make mutation
-```
-
-Notes:
-
-- This installs `ooze` locally via `go install github.com/gtramontina/ooze@latest`.
-- The mutation run targets `imessage/` with `go test -tags=mutation`.
-- Current mutation threshold is `0.70` in [imessage/mutation_test.go](imessage/mutation_test.go).
 
 ### Source layout
 
@@ -350,7 +336,7 @@ pkg/connector/               # bridgev2 connector
   ├── capabilities.go        #   supported features
   └── config.go              #   bridge config schema
 pkg/rustpushgo/              # Rust FFI wrapper (uniffi)
-third_party/rustpush-upstream/  # OpenBubbles/rustpush checkout (default source)
+rustpush/                    # OpenBubbles/rustpush (vendored)
   └── open-absinthe/         #   NAC emulator (unicorn-engine, cross-platform)
 nac-validation/              # Local NAC via AppleAccount.framework (macOS)
 tools/
@@ -358,7 +344,7 @@ tools/
   ├── extract-key-app/       # Hardware key extraction GUI (SwiftUI, x86_64, run on Mac)
   ├── nac-relay/             # NAC validation relay CLI (Go, run on Mac)
   └── nac-relay-app/         # NAC relay menubar app (SwiftUI, arm64, wraps nac-relay)
-third_party/rustpush-upstream/open-absinthe/
+rustpush/open-absinthe/
   └── src/bin/enrich_hw_key  # Enrich keys missing _enc fields (x86_64 Linux CLI)
 imessage/                    # macOS chat.db + Contacts reader
 ```
