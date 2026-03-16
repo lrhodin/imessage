@@ -13,6 +13,12 @@ RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' 2>/dev/null)
 # Override at invocation time, e.g.:
 #   make RUSTPUSH_DIR=rustpush-master build
 RUSTPUSH_DIR ?= third_party/rustpush-upstream
+# rustpush source strategy:
+#   upstream (default): clone OpenBubbles and apply local compatibility patches
+#   fork: fresh-sync from your fork branch/ref
+RUSTPUSH_SOURCE ?= upstream
+RUSTPUSH_FORK_URL ?= https://github.com/cameronaaron/rustpush.git
+RUSTPUSH_FORK_REF ?= master
 RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(RUSTPUSH_DIR)/apple-private-apis $(RUSTPUSH_DIR)/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(RUSTPUSH_DIR)/open-absinthe/build.rs)
 CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
 GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
@@ -149,9 +155,24 @@ ensure-rustpush-source:
 		fi; \
 	elif [ "$(RUSTPUSH_DIR)" = "third_party/rustpush-upstream" ]; then \
 		if [ ! -d third_party/rustpush-upstream/.git ]; then \
-			echo "Cloning upstream rustpush..."; \
+			echo "Cloning rustpush source..."; \
 			mkdir -p third_party; \
-			git clone --recurse-submodules $(UPSTREAM_REPO) third_party/rustpush-upstream; \
+			if [ "$(RUSTPUSH_SOURCE)" = "fork" ]; then \
+				git clone $(RUSTPUSH_FORK_URL) third_party/rustpush-upstream; \
+			else \
+				git clone $(UPSTREAM_REPO) third_party/rustpush-upstream; \
+			fi; \
+			git -C third_party/rustpush-upstream submodule sync --recursive; \
+			git -C third_party/rustpush-upstream submodule update --init --recursive; \
+		fi; \
+		if [ "$(RUSTPUSH_SOURCE)" = "fork" ]; then \
+			echo "Refreshing rustpush from fork $(RUSTPUSH_FORK_URL) ($(RUSTPUSH_FORK_REF))..."; \
+			git -C third_party/rustpush-upstream remote set-url origin $(RUSTPUSH_FORK_URL); \
+			git -C third_party/rustpush-upstream fetch --all --tags --prune; \
+			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_FORK_REF); \
+			git -C third_party/rustpush-upstream pull --ff-only origin $(RUSTPUSH_FORK_REF); \
+			git -C third_party/rustpush-upstream submodule sync --recursive; \
+			git -C third_party/rustpush-upstream submodule update --init --recursive; \
 		fi; \
 		if [ ! -d third_party/rustpush-upstream/certs/fairplay ]; then \
 			echo "Generating FairPlay cert stubs..."; \
@@ -163,21 +184,23 @@ ensure-rustpush-source:
 				   third_party/rustpush-upstream/certs/fairplay/$$name.pem; \
 			done; \
 		fi; \
-		echo "Applying upstream compatibility overlays..."; \
-		for patch in rustpush-core.patch icloud-auth.patch; do \
-			case $$patch in \
-				icloud-auth.patch) repo_dir=third_party/rustpush-upstream/apple-private-apis/icloud-auth ;; \
-				*) repo_dir=third_party/rustpush-upstream ;; \
-			esac; \
-			if git -C $$repo_dir apply --check $(CURDIR)/$(PATCH_DIR)/$$patch >/dev/null 2>&1; then \
-				git -C $$repo_dir apply $(CURDIR)/$(PATCH_DIR)/$$patch; \
-				echo "  applied $$patch"; \
-			elif git -C $$repo_dir apply --reverse --check $(CURDIR)/$(PATCH_DIR)/$$patch >/dev/null 2>&1; then \
-				echo "  already applied $$patch"; \
-			else \
-				echo "  skipped $$patch (local upstream checkout has custom edits)"; \
-			fi; \
-		done; \
+		if [ "$(RUSTPUSH_SOURCE)" != "fork" ]; then \
+			echo "Applying upstream compatibility overlays..."; \
+			for patch in rustpush-core.patch icloud-auth.patch; do \
+				case $$patch in \
+					icloud-auth.patch) repo_dir=third_party/rustpush-upstream/apple-private-apis/icloud-auth ;; \
+					*) repo_dir=third_party/rustpush-upstream ;; \
+				esac; \
+				if git -C $$repo_dir apply --check $(CURDIR)/$(PATCH_DIR)/$$patch >/dev/null 2>&1; then \
+					git -C $$repo_dir apply $(CURDIR)/$(PATCH_DIR)/$$patch; \
+					echo "  applied $$patch"; \
+				elif git -C $$repo_dir apply --reverse --check $(CURDIR)/$(PATCH_DIR)/$$patch >/dev/null 2>&1; then \
+					echo "  already applied $$patch"; \
+				else \
+					echo "  skipped $$patch (local upstream checkout has custom edits)"; \
+				fi; \
+			done; \
+		fi; \
 	fi
 
 $(RUST_LIB): ensure-rustpush-source $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES)
