@@ -17,11 +17,11 @@ use rustpush::{
     MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
     OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
     ChangeParticipantMessage, IconChangeMessage, UnsendMessage, TypingApp,
-    IndexedMessagePart, LinkMeta, LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL,
+    IndexedMessagePart, LinkMeta, LPLinkMetadata, NSURL,
     TextFlags, TextFormat, TextEffect,
     ShareProfileMessage, SharedPoster, PartExtension, UpdateExtensionMessage, UpdateProfileMessage,
     UpdateProfileSharingMessage, SetTranscriptBackgroundMessage,
-    TokenProvider, MobileMeDelegateResponse,
+    TokenProvider,
     ScheduleMode,
     cloudkit::{ZoneDeleteOperation, CloudKitSession},
     base64_decode, encode_hex, ResourceState,
@@ -650,22 +650,18 @@ impl WrappedTokenProvider {
         Ok(self.inner.get_dsid().await?)
     }
 
-    /// Get the serialized MobileMe delegate as JSON (for persistence).
+    /// Get the serialized MobileMe delegate as a plist string (for persistence).
     /// Returns None if no delegate is cached.
     pub async fn get_mme_delegate_json(&self) -> Result<Option<String>, WrappedError> {
         match self.inner.get_mme_delegate().await {
-            Ok(delegate) => {
-                let json = serde_json::to_string(&delegate)
-                    .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize MobileMe delegate: {}", e) })?;
-                Ok(Some(json))
-            }
+            Ok(delegate) => Ok(Some(plist_to_string(&delegate).unwrap_or_default())),
             Err(_) => Ok(None),
         }
     }
 
-    /// Seed the MobileMe delegate from persisted JSON.
+    /// Seed the MobileMe delegate from persisted plist string.
     pub async fn seed_mme_delegate_json(&self, json: String) -> Result<(), WrappedError> {
-        let delegate: rustpush::MobileMeDelegateResponse = serde_json::from_str(&json)
+        let delegate: rustpush::MobileMeDelegateResponse = plist_from_string(&json)
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to deserialize MobileMe delegate: {}", e) })?;
         self.inner.seed_mme_delegate(delegate).await;
         Ok(())
@@ -799,14 +795,9 @@ pub async fn restore_token_provider(
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD plist: {}", e) })?;
     account.spd = Some(spd);
 
-    // Inject the PET token with an already-expired expiration.
-    // This forces get_token() to call login_email_pass() on first use,
-    // which will obtain a fresh PET via SRP (no 2FA needed if the machine
-    // is trusted via consistent anisette state).
-    account.tokens.insert(
-        "com.apple.gs.idms.pet".to_string(),
-        icloud_auth::FetchedToken::new(pet, std::time::UNIX_EPOCH), // expired — forces auto-refresh on first use
-    );
+    // PET is persisted for diagnostics and continuity, but we avoid injecting it
+    // directly into icloud_auth internals here to keep compatibility with forks.
+    let _ = pet;
 
     let account = Arc::new(rustpush::DebugMutex::new(account));
     let token_provider = TokenProvider::new(account, os_config);
@@ -1707,7 +1698,12 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
 
             // Encode rich link as special attachments for the Go side
             if let Some(ref lm) = normal.link_meta {
-                let original_url: String = lm.data.original_url.clone().map(|u| u.into()).unwrap_or_default();
+                let original_url: String = lm
+                    .data
+                    .original_url
+                    .clone()
+                    .map(|u| -> String { u.into() })
+                    .unwrap_or_default();
                 let url: String = lm.data.url.clone().map(|u| u.into()).unwrap_or_default();
                 let title = lm.data.title.clone().unwrap_or_default();
                 let summary = lm.data.summary.clone().unwrap_or_default();
@@ -2402,11 +2398,8 @@ impl LoginSession {
 
         // Request both IDS (for messaging) and MobileMe (for contacts CardDAV URL)
         let delegates = login_apple_delegates(
-            &self.username,
-            &pet,
-            &adsid,
+            &*account,
             None,
-            &mut *account.anisette.lock().await,
             &*os_config,
             &[LoginDelegate::IDS, LoginDelegate::MobileMe],
         ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to get delegates: {}", e) })?;
@@ -3424,12 +3417,8 @@ impl Client {
             cloudkit, keychain.clone(),
         ));
 
-        // Step 3: Pre-fetch and cache zone encryption configs for all Manatee zones.
-        // This ensures the PCS zone keys derived from the keychain are cached
-        // before sync_records tries to decrypt individual records.
-        if let Err(e) = cloud_messages.warm_zone_keys().await {
-            warn!("Cloud client init: zone key warm-up failed (non-fatal): {}", e);
-        }
+        // Step 3: The current fork API doesn't expose an explicit warm_zone_keys()
+        // helper. sync/count calls below will populate container caches lazily.
 
         // Step 4: Log server-side record counts for diagnostics.
         match cloud_messages.count_records().await {
@@ -4331,11 +4320,6 @@ impl Client {
                         }
                     };
 
-                    let rec_id = match record.record_identifier.as_ref() {
-                        Some(id) => id,
-                        None => continue,
-                    };
-
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         CloudChat::from_record_encrypted(&record.record_field, Some(&pcskey))
                     }));
@@ -4490,11 +4474,6 @@ impl Client {
                         Ok(k) => k,
                         Err(_) => continue,
                     };
-                    let rec_id = match record.record_identifier.as_ref() {
-                        Some(id) => id,
-                        None => continue,
-                    };
-
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         CloudMessage::from_record_encrypted(&record.record_field, Some(&pcskey))
                     }));
@@ -4693,7 +4672,7 @@ impl Client {
                     using_number: handle.clone(),
                     from_handle: None,
                 };
-                let mut sms_parts = vec![IndexedMessagePart {
+                let sms_parts = vec![IndexedMessagePart {
                     part: MessagePart::Attachment(attachment),
                     idx: None,
                     ext: None,
@@ -5531,7 +5510,7 @@ impl Client {
         let mut normalized = Vec::with_capacity(attachments.len());
         for (record_name, att_opt) in attachments {
             if let Some(att) = att_opt {
-                let has_avid = att.avid.size.unwrap_or(0) > 0;
+                let has_avid = false;
                 normalized.push(WrappedCloudAttachmentInfo {
                     guid: att.cm.guid.clone(),
                     mime_type: att.cm.mime_type.clone(),
@@ -5575,21 +5554,17 @@ impl Client {
     }
 
     /// Download the Live Photo video (avid asset) from a CloudKit attachment record.
-    /// Returns the raw MOV file bytes. Use this when has_avid is true.
+    /// The current fork API doesn't expose a dedicated avid asset downloader.
     pub async fn cloud_download_attachment_avid(
         &self,
         record_name: String,
     ) -> Result<Vec<u8>, WrappedError> {
-        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-
-        let shared = SharedWriter::new();
-        let mut files = HashMap::new();
-        files.insert(record_name.clone(), shared.clone());
-        cloud_messages.download_attachment_avid(files).await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to download CloudKit attachment avid {}: {}", record_name, e),
-            })?;
-        Ok(shared.into_bytes())
+        Err(WrappedError::GenericError {
+            msg: format!(
+                "Avid download is not available in the current rustpush fork API for record {}",
+                record_name
+            ),
+        })
     }
 
     /// Download a group photo from CloudKit by the chat's record name.
@@ -5622,7 +5597,6 @@ impl Client {
         let mut token: Option<Vec<u8>> = None;
         let mut total_records: usize = 0;
         let mut total_deleted: usize = 0;
-        let mut total_skipped: usize = 0;
         let mut chat_id_counts: HashMap<String, usize> = HashMap::new();
         let mut newest_ts: i64 = 0;
         let mut newest_guid = String::new();
@@ -5633,11 +5607,8 @@ impl Client {
                 .map_err(|e| WrappedError::GenericError { msg: format!("diag sync page {} failed: {}", page, e) })?;
             
             let page_total = messages.len();
-            let mut page_present = 0usize;
-            let mut page_deleted = 0usize;
             for (_record_name, msg_opt) in &messages {
                 if let Some(msg) = msg_opt {
-                    page_present += 1;
                     total_records += 1;
                     let ts = apple_timestamp_ns_to_unix_ms(msg.time);
                     let chat = &msg.chat_id;
@@ -5648,13 +5619,9 @@ impl Client {
                         newest_chat = chat.clone();
                     }
                 } else {
-                    page_deleted += 1;
                     total_deleted += 1;
                 }
             }
-            // Records that are neither present nor deleted were skipped by PCS errors in sync_records
-            total_skipped += page_total.saturating_sub(page_present + page_deleted);
-            
             info!("diag page {} => {} records (status={})", page, page_total, status);
             
             if status == 3 {
@@ -6122,15 +6089,6 @@ async fn sync_messages_fallback(
             Ok(k) => k,
             Err(e) => {
                 warn!("sync_messages_fallback: skipping record {}: PCS key error: {}", identifier, e);
-                skipped += 1;
-                continue;
-            }
-        };
-
-        let rec_id = match record.record_identifier.as_ref() {
-            Some(id) => id,
-            None => {
-                warn!("sync_messages_fallback: skipping record {}: missing record_identifier", identifier);
                 skipped += 1;
                 continue;
             }
