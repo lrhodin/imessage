@@ -45,7 +45,6 @@ func TestPortalMetadata_JSON(t *testing.T) {
 		ThreadID:     "thread-123",
 		SenderGuid:   "sender-456",
 		GroupName:    "My Group",
-		GroupVersion: 42,
 	}
 	data, err := json.Marshal(pm)
 	if err != nil {

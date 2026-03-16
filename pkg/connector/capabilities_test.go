@@ -66,15 +66,22 @@ func TestCaps_FileTypes(t *testing.T) {
 }
 
 func TestCaps_Formatting(t *testing.T) {
-	for _, fmt := range []event.FormattingFeature{event.FmtBold, event.FmtItalic, event.FmtUnderline, event.FmtStrikethrough} {
-		if caps.Formatting[fmt] != event.CapLevelFullySupported {
-			t.Errorf("caps.Formatting[%v] = %v, want FullySupported", fmt, caps.Formatting[fmt])
-		}
+	if caps.Formatting[event.FmtBold] != event.CapLevelDropped {
+		t.Errorf("caps.Formatting[bold] = %v, want Dropped", caps.Formatting[event.FmtBold])
+	}
+	if caps.Formatting[event.FmtItalic] != event.CapLevelDropped {
+		t.Errorf("caps.Formatting[italic] = %v, want Dropped", caps.Formatting[event.FmtItalic])
+	}
+	if _, ok := caps.Formatting[event.FmtUnderline]; ok {
+		t.Error("caps.Formatting should not include underline")
+	}
+	if _, ok := caps.Formatting[event.FmtStrikethrough]; ok {
+		t.Error("caps.Formatting should not include strikethrough")
 	}
 }
 
 func TestCapsDM_NoGroupFeatures(t *testing.T) {
-	// DM caps should not have room state or invite/kick
+	// DM caps should not have room state or invite/kick.
 	if _, ok := capsDM.State[event.StateRoomName.Type]; ok {
 		t.Error("capsDM should not have StateRoomName")
 	}
@@ -87,18 +94,18 @@ func TestCapsDM_NoGroupFeatures(t *testing.T) {
 	if _, ok := capsDM.MemberActions[event.MemberActionKick]; ok {
 		t.Error("capsDM should not have MemberActionKick")
 	}
-	// But group caps should have them
-	if _, ok := caps.State[event.StateRoomName.Type]; !ok {
-		t.Error("caps should have StateRoomName")
+	// Current bridge capabilities also do not expose room state or member actions for group chats.
+	if _, ok := caps.State[event.StateRoomName.Type]; ok {
+		t.Error("caps should not have StateRoomName")
 	}
-	if _, ok := caps.MemberActions[event.MemberActionInvite]; !ok {
-		t.Error("caps should have MemberActionInvite")
+	if _, ok := caps.MemberActions[event.MemberActionInvite]; ok {
+		t.Error("caps should not have MemberActionInvite")
 	}
 }
 
 func TestCapsDM_StillHasLeave(t *testing.T) {
-	if _, ok := capsDM.MemberActions[event.MemberActionLeave]; !ok {
-		t.Error("capsDM should still have MemberActionLeave")
+	if _, ok := capsDM.MemberActions[event.MemberActionLeave]; ok {
+		t.Error("capsDM should not have MemberActionLeave")
 	}
 }
 

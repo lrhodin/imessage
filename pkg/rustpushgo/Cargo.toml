@@ -13,6 +13,9 @@ name = "rustpushgo"
 # The Makefile passes --features hardware-key on Linux only.
 default = []
 hardware-key = ["rustpush/macos-validation-data"]
+# Enables CloudKit avid (Live Photo MOV) download paths when the linked
+# rustpush fork exposes the required API and record fields.
+rustpush-avid-download = []
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

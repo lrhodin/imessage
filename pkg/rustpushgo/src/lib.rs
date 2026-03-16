@@ -782,12 +782,12 @@ pub async fn restore_token_provider(
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
         .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
 
-    account.username = Some(username);
+    account.username = Some(username.clone());
 
     // Restore hashed password
     let hashed_password = rustpush::decode_hex(&hashed_password_hex)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hashed_password hex: {}", e) })?;
-    account.hashed_password = Some(hashed_password);
+    account.hashed_password = Some(hashed_password.clone());
 
     // Restore SPD from base64-encoded plist
     let spd_bytes = base64_decode(&spd_base64);
@@ -795,8 +795,27 @@ pub async fn restore_token_provider(
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD plist: {}", e) })?;
     account.spd = Some(spd);
 
-    // PET is persisted for diagnostics and continuity, but we avoid injecting it
-    // directly into icloud_auth internals here to keep compatibility with forks.
+    // Best-effort PET refresh on restore using persisted credentials.
+    // This avoids private token constructor hacks while still warming auth state.
+    match account.login_email_pass(&username, &hashed_password).await {
+        Ok(icloud_auth::LoginState::LoggedIn) => {
+            info!("restore_token_provider: proactive PET refresh succeeded");
+        }
+        Ok(state) => {
+            warn!(
+                "restore_token_provider: proactive PET refresh returned non-logged-in state: {:?}",
+                state
+            );
+        }
+        Err(err) => {
+            warn!(
+                "restore_token_provider: proactive PET refresh failed (non-fatal): {}",
+                err
+            );
+        }
+    }
+
+    // PET remains part of persisted payload for compatibility/telemetry.
     let _ = pet;
 
     let account = Arc::new(rustpush::DebugMutex::new(account));
@@ -3417,6 +3436,28 @@ impl Client {
             cloudkit, keychain.clone(),
         ));
 
+        let prewarm_enabled = std::env::var("RUSTPUSHGO_CLOUD_PREWARM")
+            .map(|v| {
+                let v = v.to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes" || v == "on"
+            })
+            .unwrap_or(false);
+
+        // Optional best-effort prewarm for CloudKit record/key caches.
+        // Useful when running against forks that don't expose warm_zone_keys().
+        if prewarm_enabled {
+            info!("Cloud client init: running optional prewarm shim");
+            if let Err(e) = cloud_messages.sync_chats(None).await {
+                warn!("Cloud client init: chat zone prewarm failed (non-fatal): {}", e);
+            }
+            if let Err(e) = cloud_messages.sync_messages(None).await {
+                warn!("Cloud client init: message zone prewarm failed (non-fatal): {}", e);
+            }
+            if let Err(e) = cloud_messages.sync_attachments(None).await {
+                warn!("Cloud client init: attachment zone prewarm failed (non-fatal): {}", e);
+            }
+        }
+
         // Step 3: The current fork API doesn't expose an explicit warm_zone_keys()
         // helper. sync/count calls below will populate container caches lazily.
 
@@ -5510,6 +5551,9 @@ impl Client {
         let mut normalized = Vec::with_capacity(attachments.len());
         for (record_name, att_opt) in attachments {
             if let Some(att) = att_opt {
+                #[cfg(feature = "rustpush-avid-download")]
+                let has_avid = att.avid.size.unwrap_or(0) > 0;
+                #[cfg(not(feature = "rustpush-avid-download"))]
                 let has_avid = false;
                 normalized.push(WrappedCloudAttachmentInfo {
                     guid: att.cm.guid.clone(),
@@ -5553,15 +5597,36 @@ impl Client {
         Ok(shared.into_bytes())
     }
 
+    /// Whether this build supports CloudKit avid (Live Photo MOV) downloads.
+    /// This is explicit so callers can branch behavior instead of probing by error text.
+    pub fn cloud_supports_avid_download(&self) -> bool {
+        cfg!(feature = "rustpush-avid-download")
+    }
+
     /// Download the Live Photo video (avid asset) from a CloudKit attachment record.
-    /// The current fork API doesn't expose a dedicated avid asset downloader.
+    /// Uses guarded compilation so wrappers can stay compatible across fork API drift.
     pub async fn cloud_download_attachment_avid(
         &self,
         record_name: String,
     ) -> Result<Vec<u8>, WrappedError> {
+        #[cfg(feature = "rustpush-avid-download")]
+        {
+            let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+            let shared = SharedWriter::new();
+            let mut files = HashMap::new();
+            files.insert(record_name.clone(), shared.clone());
+            cloud_messages.download_attachment_avid(files).await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to download CloudKit attachment avid {}: {}", record_name, e),
+                })?;
+            return Ok(shared.into_bytes());
+        }
+
+        #[cfg(not(feature = "rustpush-avid-download"))]
         Err(WrappedError::GenericError {
             msg: format!(
-                "Avid download is not available in the current rustpush fork API for record {}",
+                "Avid download is not available in this build (feature rustpush-avid-download is disabled) for record {}",
                 record_name
             ),
         })
