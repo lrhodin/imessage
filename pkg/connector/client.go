@@ -1339,11 +1339,17 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		})
 	}
 
-	// Live Photo handling: bridge both the still image and the video.
+	// Live Photo handling: skip iris=true MOV companions; bridge only the HEIC still.
 	attIndex := 0
 	for _, att := range msg.Attachments {
 		// Skip rich link sideband attachments (handled in convertMessage)
 		if att.MimeType == "x-richlink/meta" || att.MimeType == "x-richlink/image" {
+			continue
+		}
+		// Skip Live Photo MOV companions — only the HEIC still is bridged (mirrors
+		// CloudKit's avid-skip logic). For sent Live Photos the APNs echo delivers
+		// the MOV (iris=true); the HEIC arrives via CloudKit backfill.
+		if att.Iris {
 			continue
 		}
 		attID := msg.Uuid
@@ -4700,6 +4706,16 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			// Beeper clients display as "Read at [now]". Instead, rely on
 			// the synthetic receipts below for correct timestamps.
 			CompleteCallback: func() {
+				// Skip read-state evaluation for portals that already completed
+				// their initial forward backfill. Delayed re-syncs (15s/60s/3min)
+				// and version-bump re-syncs should not send a read receipt that
+				// overrides the authoritative Matrix read state set by real-time
+				// APNs messages after initial backfill.
+				if cloudStoreDone.isForwardBackfillDone(context.Background(), portalID) {
+					cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
+					c.onForwardBackfillDone()
+					return
+				}
 				// Compute read state BEFORE markForwardBackfillDone, which may
 				// insert a synthetic cloud_chat row with is_filtered=0 default
 				// that would defeat the "no chat row → unread" safeguard.
@@ -5167,9 +5183,8 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 		}
 	}
 
-	// Live Photo handling: when HasAvid is true on an attachment, the download
-	// step will fetch both the lqa (HEIC still) and avid (video) from the same
-	// CloudKit record and return two BackfillMessages.
+	// Live Photo handling: when HasAvid is true on an attachment, only the lqa
+	// (HEIC still) is bridged. The avid (MOV video) is intentionally skipped.
 	if len(downloadable) == 0 {
 		return nil
 	}
@@ -5262,41 +5277,6 @@ func safeCloudDownloadAttachment(client *rustpushgo.Client, recordName string) (
 	}
 }
 
-// safeCloudDownloadAttachmentAvid wraps the avid FFI call with the same
-// panic recovery and timeout as safeCloudDownloadAttachment.
-func safeCloudDownloadAttachmentAvid(client *rustpushgo.Client, recordName string) ([]byte, error) {
-	type dlResult struct {
-		data []byte
-		err  error
-	}
-	ch := make(chan dlResult, 1)
-	go func() {
-		var res dlResult
-		defer func() {
-			if r := recover(); r != nil {
-				stack := string(debug.Stack())
-				log.Error().Str("ffi_method", "CloudDownloadAttachmentAvid").
-					Str("record_name", recordName).
-					Str("stack", stack).
-					Msgf("FFI panic recovered: %v", r)
-				res = dlResult{err: fmt.Errorf("FFI panic in CloudDownloadAttachmentAvid: %v", r)}
-			}
-			ch <- res
-		}()
-		d, e := client.CloudDownloadAttachmentAvid(recordName)
-		res = dlResult{data: d, err: e}
-	}()
-	select {
-	case res := <-ch:
-		return res.data, res.err
-	case <-time.After(90 * time.Second):
-		log.Error().Str("ffi_method", "CloudDownloadAttachmentAvid").
-			Str("record_name", recordName).
-			Msg("CloudDownloadAttachmentAvid timed out after 90s")
-		return nil, fmt.Errorf("CloudDownloadAttachmentAvid timed out after 90s")
-	}
-}
-
 // downloadAndUploadAttachment handles a single attachment: download from CloudKit,
 // upload to Matrix, return as a backfill message.
 func (c *IMClient) downloadAndUploadAttachment(
@@ -5319,12 +5299,8 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// Cache hit: preUploadCloudAttachments already downloaded and uploaded this
 	// attachment in the cloud sync goroutine. Return immediately without touching
 	// CloudKit, keeping the portal event loop unblocked.
-	// NOTE: Skip cache for non-MP4 videos that need transcoding, and for
-	// Live Photo HasAvid records (old cache entries only have one part, not
-	// both still+video). Regular videos with HasAvid use the cache normally
-	// since we only bridge the lqa (the video itself), not the avid duplicate.
-	isLivePhoto := att.HasAvid && !strings.HasPrefix(att.MimeType, "video/")
-	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok && !isLivePhoto {
+	// NOTE: Skip cache for non-MP4 videos that need transcoding.
+	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok {
 		cachedContent := cached.(*event.MessageEventContent)
 		if cachedContent.Info != nil && cachedContent.Info.MimeType == "video/quicktime" {
 			// Stale cache entry — video needs transcoding. Fall through to re-download.
@@ -5529,92 +5505,6 @@ func (c *IMClient) downloadAndUploadAttachment(
 			}},
 		},
 	}}
-
-	// Live Photo: if this attachment has an avid (video) asset, also download
-	// and bridge the video so recipients see both the still and the motion.
-	// Skip when the lqa itself is already a video — that means this is a regular
-	// video attachment (not a Live Photo), and CloudKit stores the same video in
-	// both lqa and avid fields. Bridging both would produce duplicates.
-	if att.HasAvid && !strings.HasPrefix(mimeType, "video/") {
-		avidData, avidErr := safeCloudDownloadAttachmentAvid(c.client, att.RecordName)
-		if avidErr != nil || len(avidData) == 0 {
-			log.Warn().Err(avidErr).Str("guid", row.GUID).Str("record_name", att.RecordName).
-				Msg("Live Photo avid download failed, bridging still only")
-			return messages
-		}
-		avidMime := "video/quicktime"
-		avidFileName := "livephoto.MOV"
-		if fileName != "" {
-			base := filenameBase(fileName)
-			if base != "" {
-				avidFileName = base + ".MOV"
-			}
-		}
-
-		// Remux/transcode the avid video if enabled.
-		if c.Main.Config.VideoTranscoding && ffmpeg.Supported() {
-			origSize := len(avidData)
-			method := "remux"
-			converted, convertErr := ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
-				[]string{"-c", "copy", "-movflags", "+faststart"},
-				avidMime)
-			if convertErr != nil {
-				method = "re-encode"
-				converted, convertErr = ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
-					[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
-						"-c:a", "aac", "-movflags", "+faststart"},
-					avidMime)
-			}
-			if convertErr != nil {
-				log.Warn().Err(convertErr).Str("guid", row.GUID).
-					Msg("Live Photo avid ffmpeg conversion failed, uploading original")
-			} else {
-				log.Info().Str("guid", row.GUID).
-					Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).
-					Msg("Live Photo avid transcoded to MP4")
-				avidData = converted
-				avidMime = "video/mp4"
-				avidFileName = strings.TrimSuffix(avidFileName, filepath.Ext(avidFileName)) + ".mp4"
-			}
-		}
-
-		avidMsgType := mimeToMsgType(avidMime)
-		avidContent := &event.MessageEventContent{
-			MsgType: avidMsgType,
-			Body:    avidFileName,
-			Info: &event.FileInfo{
-				MimeType: avidMime,
-				Size:     len(avidData),
-			},
-		}
-		avidURL, avidEnc, avidUploadErr := intent.UploadMedia(ctx, "", avidData, avidFileName, avidMime)
-		if avidUploadErr != nil {
-			log.Warn().Err(avidUploadErr).Str("guid", row.GUID).
-				Msg("Live Photo avid upload failed, bridging still only")
-			return messages
-		}
-		if avidEnc != nil {
-			avidContent.File = avidEnc
-		} else {
-			avidContent.URL = avidURL
-		}
-
-		log.Info().Str("guid", row.GUID).Str("record_name", att.RecordName).
-			Int("bytes", len(avidData)).
-			Msg("Live Photo: bridging both HEIC still and avid video")
-
-		messages = append(messages, &bridgev2.BackfillMessage{
-			Sender:    sender,
-			ID:        makeMessageID(attID + "_avid"),
-			Timestamp: ts,
-			ConvertedMessage: &bridgev2.ConvertedMessage{
-				Parts: []*bridgev2.ConvertedMessagePart{{
-					Type:    event.EventMessage,
-					Content: avidContent,
-				}},
-			},
-		})
-	}
 
 	return messages
 }
@@ -6038,7 +5928,10 @@ func (c *IMClient) refreshAllGhosts(log zerolog.Logger) {
 
 	// Query all ghost IDs from the bridge database.
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
-		"SELECT id FROM ghost WHERE bridge_id=$1",
+		`SELECT id FROM ghost
+		 WHERE bridge_id=$1
+		    OR (bridge_id IS NULL AND COALESCE(name, '') = ''
+		        AND (id LIKE 'tel:%' OR id LIKE 'mailto:%'))`,
 		c.Main.Bridge.ID,
 	)
 	if err != nil {

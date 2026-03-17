@@ -722,8 +722,15 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	ctx := context.Background()
 
 	// Use bridge_id-scoped query and fetch the current name for diff-gating.
+	// Also include legacy ghosts with bridge_id IS NULL that are nameless and
+	// have an iMessage-style identifier — these were created before bridge_id
+	// tracking was added (or by certain bridgev2 edge cases) and are silently
+	// excluded by the bridge_id=$1 equality check in SQL.
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
-		"SELECT id, COALESCE(name, '') FROM ghost WHERE bridge_id=$1",
+		`SELECT id, COALESCE(name, '') FROM ghost
+		 WHERE bridge_id=$1
+		    OR (bridge_id IS NULL AND COALESCE(name, '') = ''
+		        AND (id LIKE 'tel:%' OR id LIKE 'mailto:%'))`,
 		c.Main.Bridge.ID,
 	)
 	if err != nil {
@@ -748,7 +755,6 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	if err := rows.Err(); err != nil {
 		log.Err(err).Msg("Ghost ID row iteration error")
 	}
-	rows.Close()
 
 	updated := 0
 	for _, g := range ghosts {
@@ -760,6 +766,22 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		}
 		contact, _ := c.contacts.GetContactInfo(localID)
 		if contact == nil || !contact.HasName() {
+			// No contact found (or contact has no name). If the ghost also has
+			// no display name, still set an identifier-based fallback so clients
+			// show "+13124048025" or "user@example.com" rather than the raw MXID.
+			if g.name == "" {
+				ghost, err := c.Main.Bridge.GetGhostByID(ctx, g.id)
+				if err != nil || ghost == nil {
+					log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("Failed to load nameless ghost for fallback name")
+					continue
+				}
+				info, err := c.GetUserInfo(ctx, ghost)
+				if err != nil || info == nil {
+					continue
+				}
+				ghost.UpdateInfo(ctx, info)
+				updated++
+			}
 			continue
 		}
 		// Diff-gate: compute the expected displayname and skip if it matches

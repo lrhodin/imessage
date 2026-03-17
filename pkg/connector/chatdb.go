@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -231,25 +230,6 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 				Timestamp:        msg.Time.Add(time.Duration(i+1) * time.Millisecond),
 				StreamOrder:      msg.Time.UnixMilli() + int64(i+1),
 			})
-
-			// If there's a Live Photo MOV companion on disk, bridge it too.
-			movAtt := chatDBResolveLivePhoto(att, log)
-			if movAtt.PathOnDisk != att.PathOnDisk {
-				movCm, movErr := convertChatDBAttachment(ctx, params.Portal, intent, msg, movAtt, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
-				if movErr != nil {
-					log.Warn().Err(movErr).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert Live Photo MOV companion, skipping")
-				} else {
-					movID := fmt.Sprintf("%s_att%d_mov", msg.GUID, i)
-					backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
-						ConvertedMessage: movCm,
-						Sender:           sender,
-						ID:               makeMessageID(movID),
-						TxnID:            networkid.TransactionID(movID),
-						Timestamp:        msg.Time.Add(time.Duration(i+1)*time.Millisecond + 500*time.Microsecond),
-						StreamOrder:      msg.Time.UnixMilli() + int64(i+1),
-					})
-				}
-			}
 		}
 	}
 
@@ -492,46 +472,4 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 	}, nil
 }
 
-// chatDBResolveLivePhoto checks if a HEIC/JPG attachment has a companion .MOV
-// file on disk (Apple stores Live Photo videos as sibling files but doesn't
-// list them in the attachment table). If found, returns a new Attachment
-// pointing to the MOV. Returns the original attachment unchanged if no
-// companion is found.
-func chatDBResolveLivePhoto(att *imessage.Attachment, log *zerolog.Logger) *imessage.Attachment {
-	path := att.PathOnDisk
-	if strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return att
-		}
-		path = filepath.Join(home, path[2:])
-	}
 
-	lower := strings.ToLower(filepath.Base(path))
-	if !strings.HasSuffix(lower, ".heic") && !strings.HasSuffix(lower, ".jpg") && !strings.HasSuffix(lower, ".jpeg") {
-		return att
-	}
-
-	// Check for sibling .MOV in the same directory
-	dir := filepath.Dir(path)
-	base := filenameBase(filepath.Base(path))
-	movPath := filepath.Join(dir, base+".MOV")
-
-	if _, err := os.Stat(movPath); err != nil {
-		// Try lowercase extension
-		movPath = filepath.Join(dir, base+".mov")
-		if _, err := os.Stat(movPath); err != nil {
-			return att // No companion MOV found — keep the HEIC
-		}
-	}
-
-	log.Info().Str("heic", filepath.Base(path)).Str("mov", filepath.Base(movPath)).
-		Msg("Live Photo: swapping HEIC for MOV companion")
-
-	return &imessage.Attachment{
-		GUID:       att.GUID,
-		PathOnDisk: movPath,
-		FileName:   base + ".MOV",
-		MimeType:   "video/quicktime",
-	}
-}

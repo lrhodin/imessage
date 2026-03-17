@@ -2981,6 +2981,9 @@ func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid 
 // Filtered (junk) chats and portals with no cloud_chat metadata are left unread.
 //
 // Must be called BEFORE markForwardBackfillDone (inserts synthetic rows).
+// Must NOT be called when isForwardBackfillDone returns true — the caller
+// (FetchMessages CompleteCallback) guards this to avoid spurious read receipts
+// on delayed re-syncs and version-bump re-syncs.
 func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portalID string) (bool, error) {
 	// Primary check: direction of the most recent non-tapback message.
 	// Reactions (tapback_type IS NOT NULL) are excluded: an incoming reaction
