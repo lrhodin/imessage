@@ -1747,6 +1747,7 @@ impl Message {
             Self::PeerCacheInvalidate => Some(true),
             Self::MoveToRecycleBin(_) => Some(true),
             Self::PermanentDelete(_) => Some(true),
+            Self::RecoverChat(_) => Some(true),
             Self::UpdateProfile(_) => Some(true),
             Self::ShareProfile(_) => Some(true),
             Self::UpdateProfileSharing(_) => Some(true),
@@ -1979,10 +1980,10 @@ impl MessageInst {
         if self.message.is_sms() {
             target_participants = vec![self.sender.as_ref().unwrap().clone()];
         }
-        if let Message::MoveToRecycleBin(_) | Message::PermanentDelete(_) = self.message {
-            // Delete messages are self-addressed — they sync the deletion to the
-            // user's own Apple devices, not to the other party. Only target our
-            // own handles so IDS lookup doesn't fail for contacts without Apple IDs.
+        if let Message::MoveToRecycleBin(_) | Message::PermanentDelete(_) | Message::RecoverChat(_) = self.message {
+            // Delete/recover messages are self-addressed — they sync the state
+            // to the user's own Apple devices, not to the other party. Only target
+            // our own handles so IDS lookup doesn't fail for contacts without Apple IDs.
             target_participants = my_handles.to_vec();
         }
         if let Message::Read = self.message {
@@ -2809,22 +2810,12 @@ impl MessageInst {
             // Override sender: the APS wrapper's sender is our own number (iPhone
             // relaying the SMS), but the actual SMS sender is in the `h` field.
             msg.sender = Some(format!("tel:{}", loaded.sender));
-            // Use the stable SMS plist UUID (constant_uuid / cs field) as the
-            // message ID instead of the outer APNs envelope UUID.
-            //
-            // The APNs envelope UUID (set by to_message() above from IDSRecvMessage.U)
-            // can change when the iPhone re-relays the same SMS after reconnecting,
-            // causing the bridge to re-process old SMS messages as duplicates.
-            // The constant_uuid is assigned by the relay infrastructure and remains
-            // stable across iPhone reconnects and APNs re-deliveries.
-            //
-            // Using constant_uuid also ensures outbound tapback reply_to_guid values
-            // match the iPhone's stored message identifier, so the iPhone can route
-            // the reaction to the correct existing SMS thread rather than opening a
-            // new one.
-            if !loaded.constant_uuid.is_empty() {
-                msg.id = loaded.constant_uuid.to_uppercase();
-            }
+            // NOTE: constant_uuid (cs field) was previously used here as the
+            // message ID, but Apple reuses the same cs value across ALL SMS
+            // messages (not per-message as assumed). This caused every SMS to
+            // share one UUID, and dedup dropped all but the first.
+            // The APNs envelope UUID (from IDSRecvMessage.U) is unique per
+            // delivery and is the correct identifier.
             return Ok(msg);
         }
         if let Ok(loaded) = plist::from_value::<RawSmsOutgoingMessage>(&value) {

@@ -15,9 +15,13 @@ use rustpush::{
     APSState, Attachment, AttachmentType, ConversationData, DeleteTarget, EditMessage,
     IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message,
     MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
-    OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, UnsendMessage,
+    OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
+    ChangeParticipantMessage, IconChangeMessage, UnsendMessage,
     IndexedMessagePart, LinkMeta, LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL,
-    TokenProvider,
+    TextFlags, TextFormat, TextEffect,
+    ShareProfileMessage, SharedPoster,
+    TokenProvider, MobileMeDelegateResponse,
+    ScheduleMode,
     cloudkit::{ZoneDeleteOperation, CloudKitSession},
     util::{base64_decode, encode_hex, ResourceState},
 };
@@ -884,9 +888,10 @@ pub struct WrappedMessage {
     // Group chat UUID (persistent identifier for the group conversation)
     pub sender_guid: Option<String>,
 
-    // Delete (MoveToRecycleBin / PermanentDelete)
+    // Delete (MoveToRecycleBin / PermanentDelete) and Recover
     pub is_move_to_recycle_bin: bool,
     pub is_permanent_delete: bool,
+    pub is_recover_chat: bool,
     pub delete_chat_participants: Vec<String>,
     pub delete_chat_group_id: Option<String>,
     pub delete_chat_guid: Option<String>,
@@ -910,6 +915,57 @@ pub struct WrappedMessage {
     // Pre-downloaded photo bytes for IconChange messages.
     // Some(bytes) only when is_icon_change=true, group_photo_cleared=false, and download succeeded.
     pub icon_change_photo_data: Option<Vec<u8>>,
+
+    // HTML-formatted text body. Some(...) when the message contains any non-plain
+    // formatting (bold, italic, underline, strikethrough, text effects, mentions).
+    pub html: Option<String>,
+
+    // Voice message flag. True for voice memo / audio message attachments.
+    pub is_voice: bool,
+
+    // Screen/bubble effect identifier (e.g., "com.apple.MobileSMS.expressivesend.impact").
+    pub effect: Option<String>,
+
+    // Scheduled send timestamp in milliseconds. Some(ms) when message is scheduled.
+    pub scheduled_ms: Option<u64>,
+
+    // SMS activation: true = activation request, false = deactivation.
+    pub is_sms_activation: Option<bool>,
+
+    // SMS confirmed sent status.
+    pub is_sms_confirm_sent: Option<bool>,
+
+    // Mark unread flag.
+    pub is_mark_unread: bool,
+
+    // Message-read-on-device acknowledgment.
+    pub is_message_read_on_device: bool,
+
+    // Unschedule marker for scheduled-message cancellation updates.
+    pub is_unschedule: bool,
+
+    // Update extension (sticker/balloon metadata update) targeting a message UUID.
+    pub is_update_extension: bool,
+    pub update_extension_for_uuid: Option<String>,
+
+    // Profile sharing state sync update.
+    pub is_update_profile_sharing: bool,
+
+    // "Notify anyway" control message.
+    pub is_notify_anyways: bool,
+
+    // Transcript background (conversation wallpaper) update.
+    pub is_set_transcript_background: bool,
+
+    // Sticker data for sticker tapback reactions (tapback_type=7).
+    pub sticker_data: Option<Vec<u8>>,
+    pub sticker_mime: Option<String>,
+
+    // Profile sharing: set when a contact shares their name/photo with us.
+    pub is_share_profile: bool,
+    pub share_profile_record_key: Option<String>,
+    pub share_profile_decryption_key: Option<Vec<u8>>,
+    pub share_profile_has_poster: bool,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -970,6 +1026,91 @@ pub struct WrappedCloudSyncChat {
     pub group_photo_guid: Option<String>,
     /// CloudKit `filt` field: 0 = normal, 1 = filtered (spam/junk/unknown sender)
     pub is_filtered: i64,
+}
+
+fn recoverable_record_field_names(fields: &[rustpush::cloudkit_proto::record::Field]) -> Vec<String> {
+    fields
+        .iter()
+        .filter_map(|field| field.identifier.as_ref()?.name.clone())
+        .collect()
+}
+
+fn record_looks_chat_like(fields: &[rustpush::cloudkit_proto::record::Field]) -> bool {
+    let names = recoverable_record_field_names(fields);
+    names.iter().any(|name| matches!(name.as_str(), "stl" | "cid" | "gid" | "ptcpts" | "name" | "lah"))
+}
+
+fn wrap_recoverable_chat(record_name: String, mut chat: rustpush::cloud_messages::CloudChat) -> Option<WrappedCloudSyncChat> {
+    if chat.participants.is_empty() && chat.style == 45 && !chat.last_addressed_handle.is_empty() {
+        chat.participants.push(rustpush::cloud_messages::CloudParticipant {
+            uri: chat.last_addressed_handle.clone(),
+        });
+    }
+
+    let has_identity = !chat.chat_identifier.is_empty()
+        || !chat.group_id.is_empty()
+        || !chat.participants.is_empty()
+        || chat.display_name.as_ref().is_some_and(|name| !name.is_empty());
+    if !has_identity || !matches!(chat.style, 43 | 45) {
+        return None;
+    }
+
+    let cloud_chat_id = if chat.chat_identifier.is_empty() {
+        record_name.clone()
+    } else {
+        chat.chat_identifier.clone()
+    };
+    Some(WrappedCloudSyncChat {
+        record_name,
+        cloud_chat_id,
+        group_id: chat.group_id,
+        style: chat.style,
+        service: chat.service_name,
+        display_name: chat.display_name,
+        participants: chat.participants.into_iter().map(|p| p.uri).collect(),
+        deleted: false,
+        updated_timestamp_ms: 0,
+        group_photo_guid: chat.group_photo_guid,
+        is_filtered: chat.is_filtered,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct RecoverableMessageMetadata {
+    v: u8,
+    record_name: String,
+    cloud_chat_id: String,
+    sender: String,
+    is_from_me: bool,
+    service: String,
+    timestamp_ms: i64,
+}
+
+fn encode_recoverable_message_entry(
+    guid: &str,
+    record_name: &str,
+    msg: &rustpush::cloud_messages::CloudMessage,
+) -> String {
+    if guid.is_empty() {
+        return String::new();
+    }
+
+    let metadata = RecoverableMessageMetadata {
+        v: 1,
+        record_name: record_name.to_string(),
+        cloud_chat_id: msg.chat_id.clone(),
+        sender: msg.sender.clone(),
+        is_from_me: msg.flags.contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
+        service: msg.service.clone(),
+        timestamp_ms: apple_timestamp_ns_to_unix_ms(msg.time),
+    };
+    match serde_json::to_vec(&metadata) {
+        Ok(payload) => format!("{}|{}", guid, BASE64_STANDARD.encode(payload)),
+        Err(err) => {
+            debug!("list_recoverable_message_guids: failed to encode metadata for {}: {}", guid, err);
+            guid.to_string()
+        }
+    }
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -1218,6 +1359,164 @@ fn populate_delete_target(w: &mut WrappedMessage, target: &DeleteTarget) {
     }
 }
 
+/// Convert message parts into HTML. Returns Some(html) only if there is any
+/// non-plain formatting (bold/italic/underline/strikethrough, text effects,
+/// or mentions). Returns None for plain-text-only messages so the Go side can
+/// skip HTML encoding.
+fn parts_to_html(parts: &MessageParts) -> Option<String> {
+    let has_formatting = parts.0.iter().any(|p| match &p.part {
+        MessagePart::Text(_, fmt) => !matches!(fmt, TextFormat::Flags(TextFlags { bold: false, italic: false, underline: false, strikethrough: false })),
+        MessagePart::Mention(_, _) => true,
+        _ => false,
+    });
+    if !has_formatting {
+        return None;
+    }
+
+    let mut html = String::new();
+    for indexed_part in &parts.0 {
+        match &indexed_part.part {
+            MessagePart::Text(text, format) => {
+                let escaped = html_escape(text);
+                match format {
+                    TextFormat::Flags(flags) => {
+                        let mut open = String::new();
+                        let mut close = String::new();
+                        if flags.bold { open.push_str("<strong>"); close.insert_str(0, "</strong>"); }
+                        if flags.italic { open.push_str("<em>"); close.insert_str(0, "</em>"); }
+                        if flags.underline { open.push_str("<u>"); close.insert_str(0, "</u>"); }
+                        if flags.strikethrough { open.push_str("<del>"); close.insert_str(0, "</del>"); }
+                        html.push_str(&open);
+                        html.push_str(&escaped);
+                        html.push_str(&close);
+                    }
+                    TextFormat::Effect(effect) => {
+                        let effect_name = match effect {
+                            TextEffect::Big => "big",
+                            TextEffect::Small => "small",
+                            TextEffect::Shake => "shake",
+                            TextEffect::Nod => "nod",
+                            TextEffect::Explode => "explode",
+                            TextEffect::Ripple => "ripple",
+                            TextEffect::Bloom => "bloom",
+                            TextEffect::Jitter => "jitter",
+                        };
+                        html.push_str(&format!(
+                            "<span data-mx-imessage-effect=\"{}\">",
+                            effect_name
+                        ));
+                        html.push_str(&escaped);
+                        html.push_str("</span>");
+                    }
+                }
+            }
+            MessagePart::Mention(uri, display) => {
+                let escaped_display = html_escape(display);
+                let escaped_uri = html_escape(uri);
+                html.push_str(&format!(
+                    "<a href=\"{}\">@{}</a>",
+                    escaped_uri, escaped_display
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if html.is_empty() {
+        None
+    } else {
+        Some(html)
+    }
+}
+
+/// Minimal HTML escaping for user-provided text.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+}
+
+/// Parse Matrix HTML into iMessage MessageParts with formatting.
+/// Returns None if no formatting tags are found (plain text fallback).
+fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
+    if !html.contains('<') {
+        return None;
+    }
+
+    let mut parts: Vec<IndexedMessagePart> = Vec::new();
+    let mut pos = 0;
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+    let mut bold = false;
+    let mut italic = false;
+    let mut underline = false;
+    let mut strikethrough = false;
+
+    while pos < len {
+        if bytes[pos] == b'<' {
+            let tag_end = match html[pos..].find('>') {
+                Some(e) => pos + e + 1,
+                None => break,
+            };
+            let tag_content = &html[pos + 1..tag_end - 1].trim().to_lowercase();
+            match tag_content.as_str() {
+                "strong" | "b" => bold = true,
+                "/strong" | "/b" => bold = false,
+                "em" | "i" => italic = true,
+                "/em" | "/i" => italic = false,
+                "u" => underline = true,
+                "/u" => underline = false,
+                "del" | "s" | "strike" => strikethrough = true,
+                "/del" | "/s" | "/strike" => strikethrough = false,
+                "br" | "br/" | "br /" => {
+                    let flags = TextFlags { bold, italic, underline, strikethrough };
+                    parts.push(IndexedMessagePart {
+                        part: MessagePart::Text("\n".to_string(), TextFormat::Flags(flags)),
+                        idx: None,
+                        ext: None,
+                    });
+                }
+                _ => {
+                    // Skip unknown tags (p, div, span without effect, etc.)
+                }
+            }
+            pos = tag_end;
+        } else {
+            let next_tag = html[pos..].find('<').map(|i| pos + i).unwrap_or(len);
+            let chunk = &html[pos..next_tag];
+            let decoded = chunk
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"");
+            if !decoded.is_empty() {
+                let flags = TextFlags { bold, italic, underline, strikethrough };
+                parts.push(IndexedMessagePart {
+                    part: MessagePart::Text(decoded, TextFormat::Flags(flags)),
+                    idx: None,
+                    ext: None,
+                });
+            }
+            pos = next_tag;
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let reconstructed: String = parts.iter().map(|p| match &p.part {
+        MessagePart::Text(t, _) => t.as_str(),
+        _ => "",
+    }).collect();
+    if reconstructed == plain_text && !parts.iter().any(|p| matches!(&p.part, MessagePart::Text(_, TextFormat::Flags(f)) if f.bold || f.italic || f.underline || f.strikethrough)) {
+        return None;
+    }
+
+    Some(MessageParts(parts))
+}
+
 fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
     let conv = msg.conversation.as_ref();
 
@@ -1262,6 +1561,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         sender_guid: conv.and_then(|c| c.sender_guid.clone()),
         is_move_to_recycle_bin: false,
         is_permanent_delete: false,
+        is_recover_chat: false,
         delete_chat_participants: vec![],
         delete_chat_group_id: None,
         delete_chat_guid: None,
@@ -1270,6 +1570,26 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         is_icon_change: false,
         group_photo_cleared: false,
         icon_change_photo_data: None,
+        html: None,
+        is_voice: false,
+        effect: None,
+        scheduled_ms: None,
+        is_sms_activation: None,
+        is_sms_confirm_sent: None,
+        is_mark_unread: false,
+        is_message_read_on_device: false,
+        is_unschedule: false,
+        is_update_extension: false,
+        update_extension_for_uuid: None,
+        is_update_profile_sharing: false,
+        is_notify_anyways: false,
+        is_set_transcript_background: false,
+        sticker_data: None,
+        sticker_mime: None,
+        is_share_profile: false,
+        share_profile_record_key: None,
+        share_profile_decryption_key: None,
+        share_profile_has_poster: false,
     };
 
     match &msg.message {
@@ -1353,6 +1673,32 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                     });
                 }
             }
+
+            // HTML formatting
+            w.html = parts_to_html(&normal.parts);
+
+            // Voice message flag
+            w.is_voice = normal.voice;
+
+            // Screen/bubble effects
+            w.effect = normal.effect.as_ref().map(|e| e.to_string());
+
+            // Scheduled send
+            if let Some(ref sched) = normal.scheduled {
+                w.scheduled_ms = Some(sched.ms);
+            }
+
+            // Sticker data from extension balloons (icon field)
+            if let Some(ref app) = normal.app {
+                if let Some(ref balloon) = app.balloon {
+                    if let Some(ref icon_data) = balloon.icon {
+                        if !icon_data.is_empty() {
+                            w.sticker_data = Some(icon_data.clone());
+                            w.sticker_mime = Some("image/png".to_string());
+                        }
+                    }
+                }
+            }
         }
         Message::React(react) => {
             w.is_tapback = true;
@@ -1416,9 +1762,57 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.is_permanent_delete = true;
             populate_delete_target(&mut w, &del.target);
         }
+        Message::RecoverChat(chat) => {
+            w.is_recover_chat = true;
+            w.delete_chat_participants = chat.participants.clone();
+            w.delete_chat_group_id = Some(chat.group_id.clone()).filter(|s| !s.is_empty());
+            w.delete_chat_guid = Some(chat.guid.clone()).filter(|s| !s.is_empty());
+        }
         Message::IconChange(change) => {
             w.is_icon_change = true;
             w.group_photo_cleared = change.file.is_none();
+        }
+        Message::EnableSmsActivation(enable) => {
+            w.is_sms_activation = Some(*enable);
+        }
+        Message::SmsConfirmSent(status) => {
+            w.is_sms_confirm_sent = Some(*status);
+        }
+        Message::MarkUnread => {
+            w.is_mark_unread = true;
+        }
+        Message::MessageReadOnDevice => {
+            w.is_message_read_on_device = true;
+        }
+        Message::Unschedule => {
+            w.is_unschedule = true;
+        }
+        Message::UpdateExtension(update) => {
+            w.is_update_extension = true;
+            w.update_extension_for_uuid = Some(update.for_uuid.clone());
+        }
+        Message::UpdateProfileSharing(_) => {
+            w.is_update_profile_sharing = true;
+        }
+        Message::NotifyAnyways => {
+            w.is_notify_anyways = true;
+        }
+        Message::SetTranscriptBackground(_) => {
+            w.is_set_transcript_background = true;
+        }
+        Message::ShareProfile(profile) => {
+            w.is_share_profile = true;
+            w.share_profile_record_key = Some(profile.cloud_kit_record_key.clone());
+            w.share_profile_decryption_key = Some(profile.cloud_kit_decryption_record_key.clone());
+            w.share_profile_has_poster = profile.poster.is_some();
+        }
+        Message::UpdateProfile(update) => {
+            if let Some(profile) = &update.profile {
+                w.is_share_profile = true;
+                w.share_profile_record_key = Some(profile.cloud_kit_record_key.clone());
+                w.share_profile_decryption_key = Some(profile.cloud_kit_decryption_record_key.clone());
+                w.share_profile_has_poster = profile.poster.is_some();
+            }
         }
         _ => {}
     }
@@ -2472,9 +2866,11 @@ impl Client {
         &self,
         conversation: WrappedConversation,
         text: String,
+        html: Option<String>,
         handle: String,
         reply_guid: Option<String>,
         reply_part: Option<String>,
+        scheduled_ms: Option<u64>,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let service = if conversation.is_sms {
@@ -2540,10 +2936,36 @@ impl Client {
             (text, None)
         };
 
-        let mut normal = NormalMessage::new(actual_text.clone(), service);
-        normal.link_meta = link_meta;
-        normal.reply_guid = reply_guid.clone();
-        normal.reply_part = reply_part.clone();
+        let parts = if let Some(ref html_str) = html {
+            parse_html_to_parts(html_str, &actual_text)
+        } else {
+            None
+        };
+
+        let schedule = scheduled_ms.map(|ms| ScheduleMode { ms, schedule: true });
+
+        let normal = if let Some(parts) = parts {
+            NormalMessage {
+                parts,
+                effect: None,
+                reply_guid: reply_guid.clone(),
+                reply_part: reply_part.clone(),
+                service: service.clone(),
+                subject: None,
+                app: None,
+                link_meta,
+                voice: false,
+                scheduled: schedule,
+                embedded_profile: None,
+            }
+        } else {
+            let mut n = NormalMessage::new(actual_text.clone(), service.clone());
+            n.link_meta = link_meta;
+            n.reply_guid = reply_guid.clone();
+            n.reply_part = reply_part.clone();
+            n.scheduled = schedule;
+            n
+        };
         let mut msg = MessageInst::new(
             conv.clone(),
             &handle,
@@ -2729,21 +3151,88 @@ impl Client {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
         };
-        let mut msg = MessageInst::new(conv.clone(), &handle, Message::MoveToRecycleBin(delete_msg));
+        let mut msg = MessageInst::new(conv, &handle, Message::MoveToRecycleBin(delete_msg));
         self.client.send(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send MoveToRecycleBin: {}", e) })?;
+        // Note: We intentionally do NOT send PermanentDelete. MoveToRecycleBin
+        // moves the chat to Apple's "Recently Deleted" (30-day retention),
+        // respecting the user's recycle bin. The chat can be restored with
+        // !restore-chat which re-uploads the record to CloudKit.
+        Ok(())
+    }
 
-        // Follow up with PermanentDelete to actually remove from CloudKit.
-        // MoveToRecycleBin only moves to "Recently Deleted" (30-day retention).
-        // Without PermanentDelete, records stay in CloudKit and get re-downloaded
-        // on every sync, resurrecting the portal.
-        let perm_msg = PermanentDeleteMessage {
-            target: DeleteTarget::Chat(operated_chat),
-            is_scheduled: false,
+    /// Send a RecoverChat APNs message (command 182) to notify other Apple
+    /// devices that a chat has been recovered from the recycle bin.
+    /// This is the inverse of send_move_to_recycle_bin.
+    pub async fn send_recover_chat(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+        chat_guid: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let bare_handle = handle.replace("mailto:", "").replace("tel:", "");
+        let bare_participants: Vec<String> = conv.participants.iter()
+            .map(|p| p.replace("mailto:", "").replace("tel:", ""))
+            .filter(|p| p != &bare_handle)
+            .collect();
+        let operated_chat = OperatedChat {
+            participants: bare_participants,
+            group_id: conv.sender_guid.clone().unwrap_or_default(),
+            guid: chat_guid,
+            delete_incoming_messages: None,
+            was_reported_as_junk: None,
         };
-        let mut perm = MessageInst::new(conv, &handle, Message::PermanentDelete(perm_msg));
-        self.client.send(&mut perm).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send PermanentDelete: {}", e) })?;
+        let mut msg = MessageInst::new(conv, &handle, Message::RecoverChat(operated_chat));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send RecoverChat: {}", e) })?;
+        Ok(())
+    }
+
+    /// Restore a chat record to CloudKit so it reappears on Apple devices.
+    /// Re-uploads the chat data using save_chats, which creates or overwrites
+    /// the record in chatManateeZone. Used by restore-chat to sync un-deletion
+    /// back to Apple devices.
+    pub async fn restore_cloud_chat(
+        &self,
+        record_name: String,
+        chat_identifier: String,
+        group_id: String,
+        style: i64,
+        service: String,
+        display_name: Option<String>,
+        participants: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let chat = rustpush::cloud_messages::CloudChat {
+            style,
+            is_filtered: 0,
+            successful_query: 1,
+            state: 3,
+            chat_identifier,
+            group_id: group_id.clone(),
+            service_name: service,
+            original_group_id: group_id,
+            properties: None,
+            participants: participants.into_iter().map(|uri| rustpush::cloud_messages::CloudParticipant { uri }).collect(),
+            prop001: Default::default(),
+            last_read_message_timestamp: 0,
+            last_addressed_handle: String::new(),
+            guid: String::new(),
+            display_name,
+            proto001: None,
+            group_photo_guid: None,
+            group_photo: None,
+            dids: vec![],
+        };
+        let mut chats = std::collections::HashMap::new();
+        chats.insert(record_name.clone(), chat);
+        let results = cloud_messages.save_chats(chats).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to restore CloudKit chat: {}", e) })?;
+        // Check individual result
+        if let Some(Err(e)) = results.get(&record_name) {
+            return Err(WrappedError::GenericError { msg: format!("Failed to save restored chat record: {}", e) });
+        }
         Ok(())
     }
 
@@ -2786,6 +3275,394 @@ impl Client {
         ).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to purge recoverable zones: {}", e) })?;
         Ok(())
+    }
+
+    /// List chat records from Apple's "Recently Deleted" recycle bin.
+    /// Paginates through all known recoverable-delete zones and returns all
+    /// non-tombstone chat records found there.
+    pub async fn list_recoverable_chats(&self) -> Result<Vec<WrappedCloudSyncChat>, WrappedError> {
+        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloudkit_proto::CloudKitRecord;
+        use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudChat};
+
+        info!("list_recoverable_chats: starting recycle bin query");
+
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+
+        let mut all_chats = Vec::new();
+        let mut seen_record_names = std::collections::HashSet::new();
+        // Accumulate diagnostics so they appear in the final summary log
+        // (which we KNOW gets output even if per-page logs are lost).
+        let mut zone_diag: Vec<String> = Vec::new();
+
+        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+            let mut token: Option<Vec<u8>> = None;
+            let mut zone_total_changes = 0usize;
+            let mut zone_tombstones = 0usize;
+            let mut zone_non_chat = 0usize;
+            let mut zone_pcs_err = 0usize;
+            let mut zone_panic = 0usize;
+            let mut zone_incomplete = 0usize;
+            let mut zone_accepted = 0usize;
+            let mut zone_pages = 0usize;
+            let mut zone_last_status = 0i32;
+
+            debug!("list_recoverable_chats: fetching zone encryption config for {}", zone_name);
+
+            for page in 0..256 {
+                zone_pages = page + 1;
+                let zone_id = container.private_zone(zone_name.to_string());
+                let key = container
+                    .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                    .await
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("Failed to get zone key for {}: {}", zone_name, e),
+                    })?;
+
+                debug!("list_recoverable_chats: performing FetchRecordChanges on {} page {}", zone_name, page);
+
+                let (_assets, response) = container
+                    .perform(
+                        &CloudKitSession::new(),
+                        FetchRecordChangesOperation::new(zone_id, token, &NO_ASSETS),
+                    )
+                    .await
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("Failed to fetch recoverable chats from {} page {}: {}", zone_name, page, e),
+                    })?;
+
+                let changes_count = response.change.len();
+                let status = response.status();
+                zone_last_status = status;
+                zone_total_changes += changes_count;
+                debug!("list_recoverable_chats: zone={} page={} changes={} status={}", zone_name, page, changes_count, status);
+
+                for change in &response.change {
+                    let id_proto = match change.identifier.as_ref() {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let id_value = match id_proto.value.as_ref() {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let identifier = id_value.name().to_string();
+
+                    let record = match &change.record {
+                        Some(r) => r,
+                        None => {
+                            zone_tombstones += 1;
+                            debug!("list_recoverable_chats: tombstone record {} in {}", identifier, zone_name);
+                            continue;
+                        }
+                    };
+
+                    let record_type = record
+                        .r#type
+                        .as_ref()
+                        .map(|t| t.name().to_string())
+                        .unwrap_or_else(|| "<missing>".to_string());
+                    let field_names = recoverable_record_field_names(&record.record_field);
+                    if !record_looks_chat_like(&record.record_field) {
+                        zone_non_chat += 1;
+                        debug!("list_recoverable_chats: skipping non-chat record {} in {} type={} fields={:?}", identifier, zone_name, record_type, field_names);
+                        continue;
+                    }
+
+                    let pcskey = match pcs_keys_for_record(record, &key) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            zone_pcs_err += 1;
+                            warn!("list_recoverable_chats: skipping record {} in {}: PCS key error: {}", identifier, zone_name, e);
+                            continue;
+                        }
+                    };
+
+                    let rec_id = match record.record_identifier.as_ref() {
+                        Some(id) => id,
+                        None => continue,
+                    };
+
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        CloudChat::from_record_encrypted(&record.record_field, Some((&pcskey, rec_id)))
+                    }));
+
+                    match result {
+                        Ok(chat) => {
+                            if !seen_record_names.insert(identifier.clone()) {
+                                continue;
+                            }
+                            if let Some(chat) = wrap_recoverable_chat(identifier.clone(), chat) {
+                                zone_accepted += 1;
+                                if record_type != CloudChat::record_type() {
+                                    info!(
+                                        "list_recoverable_chats: accepted recycle-bin record {} in {} with nonstandard type {}",
+                                        identifier, zone_name, record_type
+                                    );
+                                }
+                                all_chats.push(chat);
+                            } else {
+                                zone_incomplete += 1;
+                                warn!(
+                                    "list_recoverable_chats: skipping record {} in {}: chat-like fields decoded to incomplete chat (type={}, fields={:?})",
+                                    identifier,
+                                    zone_name,
+                                    record_type,
+                                    recoverable_record_field_names(&record.record_field),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            zone_panic += 1;
+                            let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                                      else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                                      else { "unknown panic".to_string() };
+                            warn!(
+                                "list_recoverable_chats: skipping record {} in {}: deserialization panic: {} (type={}, fields={:?})",
+                                identifier,
+                                zone_name,
+                                msg,
+                                record_type,
+                                recoverable_record_field_names(&record.record_field),
+                            );
+                        }
+                    }
+                }
+
+                let next_token = response.sync_continuation_token().to_vec();
+                if status == 3 || next_token.is_empty() {
+                    break;
+                }
+                token = Some(next_token);
+            }
+
+            zone_diag.push(format!(
+                "{}:pages={},changes={},status={},tombstones={},non_chat={},pcs_err={},panic={},incomplete={},accepted={}",
+                zone_name, zone_pages, zone_total_changes, zone_last_status,
+                zone_tombstones, zone_non_chat, zone_pcs_err, zone_panic, zone_incomplete, zone_accepted
+            ));
+        }
+
+        // Single summary line with ALL diagnostic info embedded.
+        // This line is confirmed to appear in logs — embed everything here.
+        info!("list_recoverable_chats: found {} chat(s) in recycle bin [{}]", all_chats.len(), zone_diag.join(" | "));
+        Ok(all_chats)
+    }
+
+    /// Read all message GUIDs from Apple's recoverableMessageDeleteZone.
+    /// These are the UUIDs of individually deleted messages (moved to trash).
+    /// When an entire chat is deleted, ALL its messages end up here.
+    /// Returns the list of message GUIDs that can be matched against
+    /// cloud_message.uuid to identify deleted chats.
+    /// Reads both recoverable message zones and returns message GUIDs.
+    /// These GUIDs match cloud_message.guid in the local DB. Entries may also
+    /// include base64-encoded metadata after `guid|...`; GUID-only callers can
+    /// safely ignore the suffix.
+    pub async fn list_recoverable_message_guids(&self) -> Result<Vec<String>, WrappedError> {
+        use std::collections::HashSet;
+        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloudkit_proto::CloudKitRecord;
+        use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+
+        info!("list_recoverable_message_guids: starting");
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+
+        let mut guids = Vec::new();
+        let mut seen = HashSet::new();
+        let mut zone_diag = Vec::new();
+        let mut successful_zones = 0usize;
+        let mut zone_errors = Vec::new();
+
+        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+            let mut token: Option<Vec<u8>> = None;
+            let zone_id = container.private_zone(zone_name.to_string());
+            let key = match container
+                .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                .await
+            {
+                Ok(key) => {
+                    successful_zones += 1;
+                    key
+                }
+                Err(e) => {
+                    let err = format!("{}: {}", zone_name, e);
+                    warn!("list_recoverable_message_guids: failed to get zone key for {}", err);
+                    zone_errors.push(err);
+                    continue;
+                }
+            };
+
+            let mut zone_guid_count = 0usize;
+            for page in 0..256 {
+                let zone_id = container.private_zone(zone_name.to_string());
+                let (_assets, response) = match container
+                    .perform(
+                        &CloudKitSession::new(),
+                        FetchRecordChangesOperation::new(zone_id, token, &NO_ASSETS),
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        let err = format!("{} page {}: {}", zone_name, page, e);
+                        warn!("list_recoverable_message_guids: failed to fetch {}", err);
+                        zone_errors.push(err);
+                        break;
+                    }
+                };
+
+                let changes_count = response.change.len();
+                let status = response.status();
+
+                for change in &response.change {
+                    let identifier = change.identifier.as_ref()
+                        .and_then(|i| i.value.as_ref())
+                        .map(|v| v.name().to_string())
+                        .unwrap_or_default();
+                    let record = match &change.record {
+                        Some(r) => r,
+                        None => continue,
+                    };
+
+                    let record_type = record.r#type.as_ref()
+                        .map(|t| t.name().to_string())
+                        .unwrap_or_default();
+                    if record_type != "recoverableMessage" {
+                        continue;
+                    }
+
+                    let pcskey = match pcs_keys_for_record(record, &key) {
+                        Ok(k) => k,
+                        Err(_) => continue,
+                    };
+                    let rec_id = match record.record_identifier.as_ref() {
+                        Some(id) => id,
+                        None => continue,
+                    };
+
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        CloudMessage::from_record_encrypted(&record.record_field, Some((&pcskey, rec_id)))
+                    }));
+                    if let Ok(msg) = result {
+                        if !msg.guid.is_empty() && seen.insert(msg.guid.clone()) {
+                            guids.push(encode_recoverable_message_entry(&msg.guid, &identifier, &msg));
+                            zone_guid_count += 1;
+                        }
+                    }
+                }
+
+                info!("list_recoverable_message_guids: zone={} page={} changes={} status={} guids_so_far={}", zone_name, page, changes_count, status, guids.len());
+
+                let next_token = response.sync_continuation_token().to_vec();
+                if status == 3 || next_token.is_empty() {
+                    break;
+                }
+                token = Some(next_token);
+            }
+            zone_diag.push(format!("{}:{}", zone_name, zone_guid_count));
+        }
+
+        if successful_zones == 0 && !zone_errors.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: format!("Failed to read recoverable message zones: {}", zone_errors.join(" | ")),
+            });
+        }
+
+        info!("list_recoverable_message_guids: found {} deleted message GUID(s) [{}]", guids.len(), zone_diag.join(" | "));
+        Ok(guids)
+    }
+
+    /// Raw diagnostic dump of the recoverable zone. Returns a human-readable
+    /// string describing every change record in the zone (not just chat-like
+    /// ones). Used by the !debug-recycle-bin bridgebot command.
+    pub async fn debug_recoverable_zones(&self) -> Result<String, WrappedError> {
+        use rustpush::cloudkit::{FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
+
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+
+        let mut lines = Vec::new();
+
+        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+            let mut token: Option<Vec<u8>> = None;
+            let mut total_changes = 0usize;
+
+            // Try to get zone encryption config — if this fails, report the error
+            let zone_id = container.private_zone(zone_name.to_string());
+            let key_result = container
+                .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                .await;
+            let _key = match key_result {
+                Ok(k) => {
+                    lines.push(format!("✅ Zone {} — encryption config OK", zone_name));
+                    k
+                }
+                Err(e) => {
+                    lines.push(format!("❌ Zone {} — encryption config FAILED: {}", zone_name, e));
+                    continue;
+                }
+            };
+
+            for page in 0..10 {
+                let zone_id = container.private_zone(zone_name.to_string());
+                let fetch_result = container
+                    .perform(
+                        &CloudKitSession::new(),
+                        FetchRecordChangesOperation::new(zone_id, token, &NO_ASSETS),
+                    )
+                    .await;
+
+                let (_assets, response) = match fetch_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        lines.push(format!("  ❌ Page {} fetch FAILED: {}", page, e));
+                        break;
+                    }
+                };
+
+                let status = response.status();
+                let changes = response.change.len();
+                total_changes += changes;
+                lines.push(format!("  Page {}: {} changes, status={}", page, changes, status));
+
+                for change in &response.change {
+                    let id = change.identifier.as_ref()
+                        .and_then(|i| i.value.as_ref())
+                        .map(|v| v.name().to_string())
+                        .unwrap_or_else(|| "<no-id>".to_string());
+
+                    match &change.record {
+                        None => {
+                            lines.push(format!("    [tombstone] {}", id));
+                        }
+                        Some(record) => {
+                            let rtype = record.r#type.as_ref()
+                                .map(|t| t.name().to_string())
+                                .unwrap_or_else(|| "<missing>".to_string());
+                            let fields = recoverable_record_field_names(&record.record_field);
+                            let chat_like = record_looks_chat_like(&record.record_field);
+                            lines.push(format!("    [record] {} type={} chat_like={} fields={:?}", id, rtype, chat_like, fields));
+                        }
+                    }
+                }
+
+                let next_token = response.sync_continuation_token().to_vec();
+                if status == 3 || next_token.is_empty() {
+                    break;
+                }
+                token = Some(next_token);
+            }
+
+            lines.push(format!("  Total: {} changes in {}", total_changes, zone_name));
+        }
+
+        Ok(lines.join("\n"))
     }
 
     pub async fn send_attachment(
@@ -2894,6 +3771,140 @@ impl Client {
             }
             Err(e) => Err(WrappedError::GenericError { msg: format!("Failed to send attachment: {}", e) }),
         }
+    }
+
+    /// Cancel a previously scheduled message.
+    pub async fn send_unschedule(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Unschedule,
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send unschedule: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Rename an iMessage group chat. Delivers a RenameMessage to all participants
+    /// so the group name updates on all of the user's Apple devices.
+    pub async fn send_rename_group(
+        &self,
+        conversation: WrappedConversation,
+        new_name: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::RenameMessage(RenameMessage { new_name }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send rename: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Update the participant list for an iMessage group chat.
+    /// `new_participants` must be the FULL new list of all participants (not
+    /// just the delta). `group_version` should be strictly increasing; using
+    /// the current Unix timestamp in seconds is a safe default when the exact
+    /// protocol counter is unknown.
+    pub async fn send_change_participants(
+        &self,
+        conversation: WrappedConversation,
+        new_participants: Vec<String>,
+        group_version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::ChangeParticipants(ChangeParticipantMessage {
+                new_participants,
+                group_version,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send participant change: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Upload `photo_data` to MMCS and deliver an IconChange message to set the
+    /// group chat photo on all of the user's Apple devices. The image should be
+    /// a 570×570 PNG as Apple expects. `group_version` should be strictly
+    /// increasing; using the current Unix timestamp in seconds is a safe default.
+    pub async fn send_icon_change(
+        &self,
+        conversation: WrappedConversation,
+        photo_data: Vec<u8>,
+        group_version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        // Prepare the MMCS encryption envelope (computes signature/key).
+        let cursor = Cursor::new(&photo_data);
+        let prepared = MMCSFile::prepare_put(cursor).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to prepare icon MMCS upload: {}", e) })?;
+
+        // Upload to Apple's MMCS servers and get back the file descriptor.
+        let cursor2 = Cursor::new(&photo_data);
+        let mmcs = MMCSFile::new(&self.conn, &prepared, cursor2, |_current, _total| {}).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload icon to MMCS: {}", e) })?;
+
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::IconChange(IconChangeMessage {
+                file: Some(mmcs),
+                group_version,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send icon change: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Deliver an IconChange message that clears (removes) the group chat photo
+    /// on all of the user's Apple devices.
+    pub async fn send_icon_clear(
+        &self,
+        conversation: WrappedConversation,
+        group_version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::IconChange(IconChangeMessage {
+                file: None,
+                group_version,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send icon clear: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Broadcast a PeerCacheInvalidate to all participants in the conversation.
+    /// Receiving clients respond by refreshing their IDS key cache for the sender,
+    /// which resolves delivery failures caused by stale/rotated identity keys.
+    pub async fn send_peer_cache_invalidate(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::PeerCacheInvalidate);
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send peer cache invalidate: {}", e) })?;
+        Ok(())
     }
 
     pub async fn cloud_sync_chats(
@@ -3445,7 +4456,7 @@ impl Client {
             let mut last_pcs_err: Option<rustpush::PushError> = None;
 
             for attempt in 0..MAX_SYNC_ATTEMPTS {
-                match cloud_messages.sync_messages(token.clone()).await {
+                match fetch_main_zone_page_newest_first(&cloud_messages, token.clone()).await {
                     Ok(result) => {
                         sync_result = Some(result);
                         break;
@@ -3732,6 +4743,83 @@ impl Client {
             h.abort();
         }
     }
+}
+
+/// Fetch one page of messageManateeZone with newest-first ordering.
+/// Returns (next_token, messages_map, status) — same shape as sync_messages().
+///
+/// Standalone (not a method on Client) so uniffi doesn't try to generate FFI
+/// bindings for it. We call the CloudKit container directly (same pattern as
+/// list_recoverable_chats) so we can set newest_first=true without touching the
+/// vendored sync_messages path. This lets cloud_fetch_recent_messages find recent
+/// messages in the first ~50 pages instead of requiring 200+ oldest-first pages.
+async fn fetch_main_zone_page_newest_first(
+    cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>,
+    token: Option<Vec<u8>>,
+) -> Result<(Vec<u8>, HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), rustpush::PushError> {
+    use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+    use rustpush::cloudkit_proto::CloudKitRecord;
+    use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+
+    let container = cloud_messages.get_container().await?;
+    let zone_id = container.private_zone("messageManateeZone".to_string());
+    let mut key = container
+        .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+        .await?;
+
+    // Create the op then flip newest_first — the inner proto field is pub, so we
+    // can mutate it here without touching the vendored FetchRecordChangesOperation::new.
+    let mut op = FetchRecordChangesOperation::new(zone_id.clone(), token, &NO_ASSETS);
+    op.0.newest_first = Some(true);
+
+    let (_assets, response) = container.perform(&CloudKitSession::new(), op).await?;
+
+    let mut results = HashMap::new();
+    let mut refreshed = false;
+    for change in &response.change {
+        let identifier = change.identifier.as_ref().unwrap()
+            .value.as_ref().unwrap().name().to_string();
+        let Some(record) = &change.record else {
+            results.insert(identifier, None);
+            continue;
+        };
+        if record.r#type.as_ref().unwrap().name() != CloudMessage::record_type() {
+            continue;
+        }
+        let pcskey = match pcs_keys_for_record(record, &key) {
+            Ok(k) => Some(k),
+            Err(rustpush::PushError::PCSRecordKeyMissing) if !refreshed => {
+                container.clear_cache_zone_encryption_config(&zone_id).await;
+                key = container.get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE).await?;
+                refreshed = true;
+                match pcs_keys_for_record(record, &key) {
+                    Ok(k) => Some(k),
+                    Err(rustpush::PushError::PCSRecordKeyMissing) => {
+                        warn!("Skipping record {}: PCS key missing (newest-first fetch)", identifier);
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) if matches!(e,
+                rustpush::PushError::PCSRecordKeyMissing
+                | rustpush::PushError::ShareKeyNotFound(_)
+                | rustpush::PushError::DecryptionKeyNotFound(_)
+                | rustpush::PushError::MasterKeyNotFound
+            ) => {
+                warn!("Skipping record {} due to PCS key error: {}", identifier, e);
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(pcskey) = pcskey else { continue };
+        let item = CloudMessage::from_record_encrypted(
+            &record.record_field,
+            Some((&pcskey, record.record_identifier.as_ref().unwrap())),
+        );
+        results.insert(identifier, Some(item));
+    }
+    Ok((response.sync_continuation_token().to_vec(), results, response.status()))
 }
 
 impl Drop for Client {

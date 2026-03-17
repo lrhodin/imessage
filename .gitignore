@@ -17,6 +17,8 @@
 /extract-key-intel
 /start
 /data/
+/build/
+/bbctl
 
 # Rust build artifacts
 librustpushgo.a
@@ -40,3 +42,4 @@ tools/nac-relay-app/.build/
 tools/nac-relay-app/NACRelay.app/
 !rustpush/open-absinthe/src/bin/
 _todo/
+.gocache/

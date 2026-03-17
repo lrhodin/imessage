@@ -317,6 +317,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		imGroupParticipants:     make(map[string][]string),
 		gidAliases:              make(map[string]string),
 		lastGroupForMember:      make(map[string]networkid.PortalKey),
+		restorePipelines:        make(map[string]bool),
 		forwardBackfillSem:      make(chan struct{}, 3),
 	}
 
