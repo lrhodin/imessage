@@ -17,6 +17,8 @@
 /extract-key-intel
 /start
 /data/
+/build/
+/bbctl
 
 # Rust build artifacts
 librustpushgo.a
