@@ -4928,10 +4928,10 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 	// otherwise fall back to QueueRemoteEvent.
 	for _, row := range tapbackRows {
 		sender := c.makeCloudSender(row)
-		sender = c.canonicalizeDMSender(networkid.PortalKey{ID: networkid.PortalID(row.PortalID)}, sender)
 		if sender.Sender == "" && !sender.IsFromMe {
 			continue
 		}
+		sender = c.canonicalizeDMSender(networkid.PortalKey{ID: networkid.PortalID(row.PortalID)}, sender)
 
 		tapbackType := *row.TapbackType
 		isRemove := tapbackType >= 3000
@@ -4968,7 +4968,6 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 
 func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {
 	sender := c.makeCloudSender(row)
-	sender = c.canonicalizeDMSender(networkid.PortalKey{ID: networkid.PortalID(row.PortalID)}, sender)
 	ts := time.UnixMilli(row.TimestampMS)
 
 	// Skip messages with no resolvable sender. These are typically iMessage
@@ -4979,6 +4978,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	if sender.Sender == "" && !sender.IsFromMe {
 		return nil
 	}
+	sender = c.canonicalizeDMSender(networkid.PortalKey{ID: networkid.PortalID(row.PortalID)}, sender)
 
 	// Skip system/service messages (group renames, participant changes, etc.).
 	// Two complementary signals:
