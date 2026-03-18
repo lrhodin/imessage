@@ -8023,6 +8023,53 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		}
 	}
 
+	// Deduplicate group chat entries with the same portal key (same participants,
+	// different GUIDs). Prefer entries with a display name; otherwise keep the
+	// first (most-recent-activity) entry since the list is still in DESC order.
+	{
+		groups := make(map[string][]int)
+		for i, entry := range entries {
+			if portalID := string(entry.portalKey.ID); strings.Contains(portalID, ",") {
+				groups[portalID] = append(groups[portalID], i)
+			}
+		}
+
+		skip := make(map[int]bool)
+		for portalID, indices := range groups {
+			if len(indices) <= 1 {
+				continue
+			}
+			bestIdx := indices[0]
+			for _, idx := range indices[1:] {
+				if entries[bestIdx].info.DisplayName == "" && entries[idx].info.DisplayName != "" {
+					bestIdx = idx
+				}
+			}
+			for _, idx := range indices {
+				if idx == bestIdx {
+					continue
+				}
+				skip[idx] = true
+				log.Info().
+					Str("skip_guid", entries[idx].chatGUID).
+					Str("keep_guid", entries[bestIdx].chatGUID).
+					Str("portal_id", portalID).
+					Msg("Deduplicating group chat entry with same portal key")
+			}
+		}
+
+		if len(skip) > 0 {
+			var deduped []chatEntry
+			for i, entry := range entries {
+				if !skip[i] {
+					deduped = append(deduped, entry)
+				}
+			}
+			log.Info().Int("before", len(entries)).Int("after", len(deduped)).Msg("Deduplicated group chat entries by portal key")
+			entries = deduped
+		}
+	}
+
 	// Reverse to process oldest-activity first, so the most recent chat
 	// gets the highest stream_ordering.
 	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
@@ -8092,7 +8139,8 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 	}
 
 	chatInfo := &bridgev2.ChatInfo{
-		CanBackfill: true,
+		CanBackfill:                true,
+		ExcludeChangesFromTimeline: true,
 	}
 
 	if parsed.IsGroup {
