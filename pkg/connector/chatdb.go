@@ -233,6 +233,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	// Deduplicate messages that appear under multiple chat GUIDs
 	// (e.g., same message linked to both any;-; and iMessage;-; variants,
 	// or across multiple email aliases for the same contact).
+	rawCount := len(messages)
 	seen := make(map[string]bool, len(messages))
 	unique := messages[:0]
 	for _, msg := range messages {
@@ -311,7 +312,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 	return &bridgev2.FetchMessagesResponse{
 		Messages:                backfillMessages,
-		HasMore:                 len(messages) >= count,
+		HasMore:                 rawCount >= count,
 		Forward:                 params.Forward,
 		AggressiveDeduplication: params.Forward,
 	}, nil
