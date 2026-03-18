@@ -230,6 +230,19 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		return nil, fmt.Errorf("failed to fetch messages from chat.db: %w", lastErr)
 	}
 
+	// Deduplicate messages that appear under multiple chat GUIDs
+	// (e.g., same message linked to both any;-; and iMessage;-; variants,
+	// or across multiple email aliases for the same contact).
+	seen := make(map[string]bool, len(messages))
+	unique := messages[:0]
+	for _, msg := range messages {
+		if !seen[msg.GUID] {
+			seen[msg.GUID] = true
+			unique = append(unique, msg)
+		}
+	}
+	messages = unique
+
 	// Sort chronologically — messages may come from multiple chat GUIDs
 	sort.Slice(messages, func(i, j int) bool {
 		return messages[i].Time.Before(messages[j].Time)
