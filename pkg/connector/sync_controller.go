@@ -1908,6 +1908,10 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 // uuidPattern matches a UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
 var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
+// hexGroupPattern matches bare hex strings of 40+ characters (SHA1 hashes
+// used as CloudKit group identifiers for SMS groups).
+var hexGroupPattern = regexp.MustCompile(`(?i)^[0-9a-f]{40,}$`)
+
 // isNumericSuffix returns true if s is non-empty and contains only ASCII digits.
 // Used to identify CloudKit self-chat identifiers of the form "chat<digits>".
 func isNumericSuffix(s string) bool {
@@ -1942,6 +1946,12 @@ func (c *IMClient) resolveConversationID(ctx context.Context, msg rustpushgo.Wra
 
 	// Fallback: if no chat record exists yet, a UUID chat_id means group.
 	if msg.CloudChatId != "" && uuidPattern.MatchString(msg.CloudChatId) {
+		return "gid:" + strings.ToLower(msg.CloudChatId)
+	}
+
+	// Fallback: bare hex hash (40+ chars) — SMS group identifiers use SHA1
+	// hashes as their CloudKit chatID. These are always group chats.
+	if msg.CloudChatId != "" && hexGroupPattern.MatchString(msg.CloudChatId) {
 		return "gid:" + strings.ToLower(msg.CloudChatId)
 	}
 
