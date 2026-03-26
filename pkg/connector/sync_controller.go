@@ -821,8 +821,20 @@ func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
 		}
 		total++
 
-		newName := c.resolveGroupName(ctx, portalID)
+		newName, authoritative := c.resolveGroupName(ctx, portalID)
 		if newName == "" || newName == portal.Name {
+			continue
+		}
+
+		// Don't overwrite an existing custom name (e.g. "The Fam") with a
+		// participant-generated fallback. Real name changes arrive via
+		// handleRename / APNs envelope and update imGroupNames directly.
+		if portal.Name != "" && !authoritative {
+			log.Debug().
+				Str("portal_id", portalID).
+				Str("current_name", portal.Name).
+				Str("fallback_name", newName).
+				Msg("Skipping fallback rename for portal with existing name")
 			continue
 		}
 

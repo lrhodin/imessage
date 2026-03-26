@@ -1993,7 +1993,7 @@ func (s *cloudBackfillStore) portalHasPreStartupOutgoingMessages(ctx context.Con
 // whose participants overlap with the given normalized participant list.
 // Used to find duplicate group portals that have the same members but different
 // group UUIDs. Participants are compared after normalization (tel:/mailto: prefix).
-func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, normalizedTarget []string) ([]string, error) {
+func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, normalizedTarget []string, selfHandle string) ([]string, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat WHERE login_id=$1 AND portal_id <> '' AND deleted=FALSE`,
 		s.loginID,
@@ -2031,7 +2031,7 @@ func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, no
 				normalized = append(normalized, n)
 			}
 		}
-		if participantSetsMatch(normalized, normalizedTarget) {
+		if participantSetsMatch(normalized, normalizedTarget, selfHandle) {
 			matches = append(matches, portalID)
 			seen[portalID] = true
 		}
@@ -2040,9 +2040,10 @@ func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, no
 }
 
 // participantSetsMatch checks if two normalized participant sets are equivalent
-// (same members, ignoring order). Allows ±1 member difference to handle cases
-// where self is included in one set but not the other.
-func participantSetsMatch(a, b []string) bool {
+// (same members, ignoring order). Allows a difference of exactly 1 only if the
+// single differing member is selfHandle (self may be in one set but not the other).
+// Pass an empty selfHandle to disallow any difference.
+func participantSetsMatch(a, b []string, selfHandle string) bool {
 	if len(a) == 0 || len(b) == 0 {
 		return false
 	}
@@ -2054,20 +2055,27 @@ func participantSetsMatch(a, b []string) bool {
 	for _, p := range b {
 		setB[p] = true
 	}
-	// Count members in A not in B, and vice versa.
+	// Count members in A not in B, and vice versa; track the differing member.
+	normalizedSelf := normalizeIdentifierForPortalID(selfHandle)
 	diff := 0
+	var diffMember string
 	for p := range setA {
 		if !setB[p] {
 			diff++
+			diffMember = p
 		}
 	}
 	for p := range setB {
 		if !setA[p] {
 			diff++
+			diffMember = p
 		}
 	}
-	// Allow ±1 difference (self may be in one set but not the other).
-	return diff <= 1
+	if diff == 0 {
+		return true
+	}
+	// Allow exactly 1 difference only when that member is self.
+	return diff == 1 && normalizedSelf != "" && diffMember == normalizedSelf
 }
 
 // deleteLocalChatByGroupID removes all local cloud_chat and cloud_message records
