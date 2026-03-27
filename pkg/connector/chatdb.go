@@ -90,7 +90,7 @@ func (db *chatDB) findGroupChatGUID(portalID string, c *IMClient) string {
 		chatMemberSet := make(map[string]struct{})
 		chatMemberSet[strings.ToLower(stripIdentifierPrefix(c.handle))] = struct{}{}
 		for _, m := range info.Members {
-			chatMemberSet[strings.ToLower(stripIdentifierPrefix(m))] = struct{}{}
+			chatMemberSet[strings.ToLower(stripIdentifierPrefix(stripSmsSuffix(m)))] = struct{}{}
 		}
 
 		// Check if members match

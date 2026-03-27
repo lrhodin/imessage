@@ -841,6 +841,7 @@ func completeLoginWithMeta(
 		imGroupParticipants:     make(map[string][]string),
 		gidAliases:              make(map[string]string),
 		lastGroupForMember:      make(map[string]networkid.PortalKey),
+		groupPortalIndex:        make(map[string]map[string]bool),
 		restorePipelines:        make(map[string]bool),
 		forwardBackfillSem:      make(chan struct{}, 3),
 	}
