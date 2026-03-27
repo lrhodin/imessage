@@ -878,7 +878,7 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Error().Interface("panic", r).Msg("Panic in SendDeliveryReceipt")
+					log.Error().Interface("panic", r).Str("stack", string(debug.Stack())).Msg("Panic in SendDeliveryReceipt")
 				}
 			}()
 			conv := c.makeConversation(msg.Participants, msg.GroupName)
