@@ -6438,7 +6438,7 @@ func (c *IMClient) resolveExistingGroupPortalID(computedID string, senderGuid *s
 		if diff > 1 {
 			continue
 		}
-		if diff == 1 && !participantSetsMatch(candidateMembers, existingMembers, c.handle) {
+		if diff == 1 && !participantSetsMatch(candidateMembers, existingMembers, c.isMyHandle) {
 			continue // diff=1 for a non-self member → different group
 		}
 
@@ -6595,7 +6595,7 @@ func (c *IMClient) guidCacheMatchIsStale(portalIDStr string, rawParticipants []s
 	if len(incomingParts) == 0 {
 		return false
 	}
-	return !participantSetsMatch(portalParts, incomingParts, c.handle)
+	return !participantSetsMatch(portalParts, incomingParts, c.isMyHandle)
 }
 
 // resolveExistingGroupByGid tries to find an existing group portal that matches
@@ -6698,7 +6698,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 		if !strings.HasPrefix(portalIDStr, "gid:") {
 			continue
 		}
-		if participantSetsMatch(parts, normalizedParts, c.handle) {
+		if participantSetsMatch(parts, normalizedParts, c.isMyHandle) {
 			c.imGroupParticipantsMu.RUnlock()
 			key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
 			if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
@@ -6738,7 +6738,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 		if diff > 1 {
 			continue
 		}
-		if diff == 1 && !participantSetsMatch(deduped, existingMembers, c.handle) {
+		if diff == 1 && !participantSetsMatch(deduped, existingMembers, c.isMyHandle) {
 			continue // diff=1 for a non-self member → different group
 		}
 		key := networkid.PortalKey{ID: networkid.PortalID(existingID), Receiver: c.UserLogin.ID}
@@ -6776,7 +6776,7 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	//    can accidentally match via ±1 participant tolerance because a
 	//    DM's [self, A] is one member short of a group's [self, A, B].
 	if c.cloudStore != nil {
-		matches, err := c.cloudStore.findPortalIDsByParticipants(ctx, normalizedParts, c.handle)
+		matches, err := c.cloudStore.findPortalIDsByParticipants(ctx, normalizedParts, c.isMyHandle)
 		if err == nil {
 			for _, matchPortalID := range matches {
 				if matchPortalID == gidPortalID {
