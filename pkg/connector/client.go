@@ -1635,10 +1635,10 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 	}
 
 	// Cache sender_guid and group_name under the (possibly new) portal ID.
-	// Mirror the guard from Site B (makePortalKey): only cache for comma-based
-	// portals and for gid: portals where the portal ID directly corresponds to
-	// this sender_guid. This prevents participant-change messages from poisoning
-	// the cache when a prior mis-routing led to a wrong finalPortalKey.
+	// For comma-based portals and gid: portals, cache the sender_guid so
+	// future messages can be resolved to this portal. This is skipped for
+	// other portal ID formats to avoid poisoning the cache with unrelated
+	// sender_guids.
 	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
 		portalIDStr := string(finalPortalKey.ID)
 		isGidPortal := strings.HasPrefix(portalIDStr, "gid:")
