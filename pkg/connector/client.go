@@ -1929,14 +1929,9 @@ func (c *IMClient) makeDeletePortalKey(log zerolog.Logger, msg rustpushgo.Wrappe
 		return networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
 	}
 	if len(msg.DeleteChatParticipants) > 1 {
-		members := make([]string, 0, len(msg.DeleteChatParticipants)+1)
-		members = append(members, c.handle)
-		for _, p := range msg.DeleteChatParticipants {
-			members = append(members, addIdentifierPrefix(p))
-		}
-		sort.Strings(members)
+		deduped := c.buildCanonicalParticipantList(msg.DeleteChatParticipants)
 		return networkid.PortalKey{
-			ID:       networkid.PortalID(strings.Join(members, ",")),
+			ID:       networkid.PortalID(strings.Join(deduped, ",")),
 			Receiver: c.UserLogin.ID,
 		}
 	}
@@ -6140,6 +6135,29 @@ func normalizePhoneIdentifierForPortalID(local string) string {
 	return cleaned
 }
 
+// buildCanonicalParticipantList normalizes, deduplicates, and sorts a
+// participant list into a deterministic form suitable for portal IDs.
+// The caller's own handle is always included exactly once.
+func (c *IMClient) buildCanonicalParticipantList(participants []string) []string {
+	sorted := make([]string, 0, len(participants)+1)
+	for _, p := range participants {
+		normalized := normalizeIdentifierForPortalID(p)
+		if normalized == "" || c.isMyHandle(normalized) {
+			continue
+		}
+		sorted = append(sorted, normalized)
+	}
+	sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
+	sort.Strings(sorted)
+	deduped := sorted[:0]
+	for i, s := range sorted {
+		if i == 0 || s != sorted[i-1] {
+			deduped = append(deduped, s)
+		}
+	}
+	return deduped
+}
+
 func (c *IMClient) makeEventSender(sender *string) bridgev2.EventSender {
 	if sender == nil || *sender == "" || c.isMyHandle(*sender) {
 		c.ensureDoublePuppet()
@@ -6732,24 +6750,8 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			}
 		} else {
 			// Fallback: build a participant-based ID for groups without a UUID.
-			sorted := make([]string, 0, len(participants))
-			for _, p := range participants {
-				normalized := normalizeIdentifierForPortalID(p)
-				if normalized == "" || c.isMyHandle(normalized) {
-					continue
-				}
-				sorted = append(sorted, normalized)
-			}
-			sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
-			sort.Strings(sorted)
-			deduped := sorted[:0]
-			for i, s := range sorted {
-				if i == 0 || s != sorted[i-1] {
-					deduped = append(deduped, s)
-				}
-			}
-			sorted = deduped
-			computedID := strings.Join(sorted, ",")
+			deduped := c.buildCanonicalParticipantList(participants)
+			computedID := strings.Join(deduped, ",")
 			portalID = c.resolveExistingGroupPortalID(computedID, senderGuid)
 		}
 		// Cache the actual iMessage group name (cv_name) so outbound
