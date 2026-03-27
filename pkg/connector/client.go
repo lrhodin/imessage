@@ -560,9 +560,7 @@ func (c *IMClient) onForwardBackfillDone() {
 		// If contacts loaded before backfill finished, the earlier
 		// refreshGhostNamesFromContacts call (triggered by setContactsReady)
 		// may have scanned the DB before backfill ghosts existed, leaving them
-		// with fallback display names. Multi-handle contacts are especially
-		// affected because makeCloudSender does not call canonicalizeDMSender,
-		// creating phantom sender ghosts that also need display names set.
+		// with fallback display names.
 		c.contactsReadyLock.RLock()
 		contactsReady := c.contactsReady
 		c.contactsReadyLock.RUnlock()
