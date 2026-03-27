@@ -1895,7 +1895,7 @@ var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[
 
 // hexGroupPattern matches bare hex strings of 40+ characters (SHA1 hashes
 // used as CloudKit group identifiers for SMS groups).
-var hexGroupPattern = regexp.MustCompile(`(?i)^[0-9a-f]{40,}$`)
+var hexGroupPattern = regexp.MustCompile(`(?i)^[0-9a-f]{40,128}$`)
 
 // isNumericSuffix returns true if s is non-empty and contains only ASCII digits.
 // Used to identify CloudKit self-chat identifiers of the form "chat<digits>".

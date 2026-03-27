@@ -279,9 +279,7 @@ func portalIDToChatGUIDs(portalID string) []string {
 	// Strip legacy (sms...) suffix from pre-fix portal IDs so chat.db GUID
 	// candidates match: "tel:+12155167207(smsft)" → localID "+12155167207(smsft)"
 	// → stripped "+12155167207", producing "any;-;+12155167207" which matches chat.db.
-	if idx := strings.Index(localID, "(sms"); idx > 0 {
-		localID = localID[:idx]
-	}
+	localID = stripSmsSuffix(localID)
 	return []string{
 		"any;-;" + localID,
 		"iMessage;-;" + localID,
@@ -298,9 +296,7 @@ func identifierToPortalID(id imessage.Identifier) networkid.PortalID {
 	// Strip Apple SMS service suffixes: "+12155167207(smsft)" → "+12155167207",
 	// "787473(smsft)" → "787473". These are native Apple formats that appear in
 	// chat.db for SMS Forwarding service types.
-	if idx := strings.Index(localID, "(sms"); idx > 0 {
-		localID = localID[:idx]
-	}
+	localID = stripSmsSuffix(localID)
 	if strings.HasPrefix(localID, "+") {
 		return networkid.PortalID("tel:" + localID)
 	}

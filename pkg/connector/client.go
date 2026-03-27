@@ -1150,15 +1150,26 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	go func(pk networkid.PortalKey, isSms bool) {
 		bgCtx := context.Background()
 		portal, portalErr := c.Main.Bridge.GetExistingPortalByKey(bgCtx, pk)
-		if portalErr == nil && portal != nil {
-			meta := &PortalMetadata{}
-			if existing, ok := portal.Metadata.(*PortalMetadata); ok {
-				*meta = *existing
-			}
-			if meta.IsSms != isSms {
-				meta.IsSms = isSms
-				portal.Metadata = meta
-				_ = portal.Save(bgCtx)
+		if portalErr != nil {
+			c.UserLogin.Log.Warn().Err(portalErr).
+				Str("portal_id", string(pk.ID)).
+				Msg("Failed to look up portal for IsSms persistence")
+			return
+		}
+		if portal == nil {
+			return
+		}
+		meta := &PortalMetadata{}
+		if existing, ok := portal.Metadata.(*PortalMetadata); ok {
+			*meta = *existing
+		}
+		if meta.IsSms != isSms {
+			meta.IsSms = isSms
+			portal.Metadata = meta
+			if err := portal.Save(bgCtx); err != nil {
+				c.UserLogin.Log.Warn().Err(err).
+					Str("portal_id", string(pk.ID)).
+					Msg("Failed to persist IsSms metadata")
 			}
 		}
 	}(portalKey, msg.IsSms)
@@ -3988,9 +3999,7 @@ func (c *IMClient) portalToChatGUID(portalID string) string {
 	cleanID := strings.TrimPrefix(strings.TrimPrefix(portalID, "tel:"), "mailto:")
 	// Strip legacy (sms...) suffix from pre-fix portal IDs so the chat GUID
 	// passed to Rust is well-formed (e.g., "SMS;-;+12155167207" not "SMS;-;+12155167207(smsft)").
-	if idx := strings.Index(cleanID, "(sms"); idx > 0 {
-		cleanID = cleanID[:idx]
-	}
+	cleanID = stripSmsSuffix(cleanID)
 	return service + ";-;" + cleanID
 }
 
@@ -6187,9 +6196,7 @@ func normalizeIdentifierForPortalID(identifier string) string {
 	// Strip Apple SMS service suffixes: "+12155167207(smsft)" → "+12155167207",
 	// "787473(smsft)" → "787473". Must happen before any other processing so
 	// the suffix never reaches isNumeric / normalizePhone checks.
-	if idx := strings.Index(id, "(sms"); idx > 0 {
-		id = id[:idx]
-	}
+	id = stripSmsSuffix(id)
 
 	if strings.HasPrefix(id, "mailto:") {
 		return "mailto:" + strings.ToLower(strings.TrimPrefix(id, "mailto:"))
@@ -7148,10 +7155,7 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 	// Strip any legacy (sms...) suffix before resolution — resolveSendTarget
 	// calls lookupContact → stripIdentifierPrefix, which would pass the suffix
 	// through to contact lookup and break alternate-handle resolution.
-	cleanPortalID := portalID
-	if idx := strings.Index(cleanPortalID, "(sms"); idx > 0 {
-		cleanPortalID = cleanPortalID[:idx]
-	}
+	cleanPortalID := stripSmsSuffix(portalID)
 	sendTo := c.resolveSendTarget(cleanPortalID)
 
 	// For self-chats, only include one participant. Duplicating our own
@@ -7893,7 +7897,7 @@ func (c *IMClient) isPortalSMS(portalID string) bool {
 	// Fallback for legacy portals that still have the raw suffix in their ID
 	// (pre-fix DB entries that survive without a full reset). Such portals can
 	// never transition to iMessage — their IDs are malformed by definition.
-	return strings.Contains(portalID, "(sms")
+	return portalID != stripSmsSuffix(portalID)
 }
 
 func (c *IMClient) trackUnsend(uuid string) {
@@ -8208,7 +8212,11 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 						if !meta.IsSms {
 							meta.IsSms = true
 							portal.Metadata = meta
-							_ = portal.Save(ctx)
+							if err := portal.Save(ctx); err != nil {
+								zerolog.Ctx(ctx).Warn().Err(err).
+									Str("portal_id", string(portal.ID)).
+									Msg("Failed to persist IsSms metadata during initial sync")
+							}
 						}
 					}
 					close(done)
