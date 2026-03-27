@@ -532,6 +532,11 @@ func maybeConvertHEIC(log *zerolog.Logger, data []byte, mimeType, fileName strin
 
 	if !enabled {
 		// Decode for dimensions/thumbnail only, keep original HEIC data
+		if len(data) > maxHEICInputSize {
+			log.Warn().Int("heic_bytes", len(data)).Int("max_bytes", maxHEICInputSize).
+				Msg("HEIC input too large to decode for dimensions, skipping")
+			return data, mimeType, fileName, nil
+		}
 		img, err := decodeHEICImage(data)
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to decode HEIC for dimensions")
