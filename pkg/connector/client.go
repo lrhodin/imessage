@@ -584,6 +584,9 @@ func (c *IMClient) loadSenderGuidsFromDB(log zerolog.Logger) {
 		return
 	}
 
+	// Migrate portal IDs that contain stale SMS suffixes before populating caches.
+	c.migrateSmsSuffixPortals(log, ctx, portals)
+
 	loadedGuids := 0
 	for _, portal := range portals {
 		if portal.Receiver != c.UserLogin.ID {
@@ -610,6 +613,66 @@ func (c *IMClient) loadSenderGuidsFromDB(log zerolog.Logger) {
 	}
 	if loadedGuids > 0 {
 		log.Info().Int("count", loadedGuids).Msg("Pre-populated sender_guid cache from database")
+	}
+}
+
+// migrateSmsSuffixPortals re-IDs portals whose IDs contain stale Apple SMS
+// suffixes like "(smsft)" or "(smsfp)". After stripSmsSuffix was added to
+// portal ID normalization, new lookups produce clean IDs, orphaning existing
+// portals that were created with the suffixed form. This runs once at startup
+// to reconcile old portal rows with the new normalized format.
+func (c *IMClient) migrateSmsSuffixPortals(log zerolog.Logger, ctx context.Context, portals []*bridgev2.Portal) {
+	migrated := 0
+	for _, portal := range portals {
+		if portal.Receiver != c.UserLogin.ID {
+			continue
+		}
+		oldID := string(portal.ID)
+
+		// Strip SMS suffixes from each member in the (possibly comma-separated) portal ID.
+		members := strings.Split(oldID, ",")
+		changed := false
+		for i, m := range members {
+			stripped := stripSmsSuffix(m)
+			if stripped != m {
+				members[i] = stripped
+				changed = true
+			}
+		}
+		if !changed {
+			continue
+		}
+
+		// Re-sort after stripping to maintain canonical order.
+		sort.Strings(members)
+		newID := strings.Join(members, ",")
+		if newID == oldID {
+			continue
+		}
+
+		oldKey := portal.PortalKey
+		newKey := networkid.PortalKey{
+			ID:       networkid.PortalID(newID),
+			Receiver: portal.Receiver,
+		}
+
+		result, _, err := c.reIDPortalWithCacheUpdate(ctx, oldKey, newKey)
+		if err != nil {
+			log.Warn().Err(err).
+				Str("old_portal_id", oldID).
+				Str("new_portal_id", newID).
+				Msg("Failed to migrate SMS-suffixed portal ID")
+			continue
+		}
+		log.Info().
+			Str("old_portal_id", oldID).
+			Str("new_portal_id", newID).
+			Int("result", int(result)).
+			Msg("Migrated SMS-suffixed portal ID")
+		migrated++
+	}
+	if migrated > 0 {
+		log.Info().Int("count", migrated).Msg("Finished migrating SMS-suffixed portal IDs")
 	}
 }
 
