@@ -148,8 +148,8 @@ type IMClient struct {
 	cloudSyncDoneLock sync.RWMutex
 
 	// cloudSyncRunning is true while any CloudKit sync cycle (bootstrap or
-	// periodic re-sync) is actively paging and importing records. Used by
-	// handleChatRecover to defer portal creation until messages are imported.
+	// periodic re-sync) is actively paging and importing records. Toggled by
+	// sync_controller.go and read in commands.go to report sync status to users.
 	cloudSyncRunning     bool
 	cloudSyncRunningLock sync.RWMutex
 
