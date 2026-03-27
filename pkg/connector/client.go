@@ -4203,7 +4203,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 		// names to stale values from CloudKit or metadata, and produce
 		// unwanted bridge bot "name changed" events.
 		if portal.MXID == "" || portal.Name == "" {
-			groupName := c.resolveGroupName(ctx, portalID)
+			groupName, _ := c.resolveGroupName(ctx, portalID)
 			chatInfo.Name = &groupName
 		}
 
@@ -7256,28 +7256,28 @@ func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []s
 //	2) CloudKit display_name (user-set group name persisted to iCloud,
 //	   the "name" field on CKChatRecord = cv_name from chat.db)
 //	3) contact-resolved member names via buildGroupName (non-authoritative)
-func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) string {
+func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) (name string, authoritative bool) {
 	// 1) In-memory cache (populated from real-time iMessage rename messages)
 	c.imGroupNamesMu.RLock()
-	name := c.imGroupNames[portalID]
+	cached := c.imGroupNames[portalID]
 	c.imGroupNamesMu.RUnlock()
-	if name != "" {
-		return name
+	if cached != "" {
+		return cached, true
 	}
 
 	// 2) CloudKit display_name (user-set group name from iCloud).
 	if c.cloudStore != nil {
 		if dn, err := c.cloudStore.getDisplayNameByPortalID(ctx, portalID); err == nil && dn != "" {
-			return dn
+			return dn, true
 		}
 	}
 
 	// 3) Build from contact-resolved member names (fallback, non-authoritative)
 	members := c.resolveGroupMembers(ctx, portalID)
 	if len(members) == 0 {
-		return "Group Chat"
+		return "Group Chat", false
 	}
-	return c.buildGroupName(members)
+	return c.buildGroupName(members), false
 }
 
 // buildGroupName creates a human-readable group name from member identifiers

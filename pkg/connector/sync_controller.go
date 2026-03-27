@@ -821,8 +821,14 @@ func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
 		}
 		total++
 
-		newName := c.resolveGroupName(ctx, portalID)
+		newName, authoritative := c.resolveGroupName(ctx, portalID)
 		if newName == "" || newName == portal.Name {
+			continue
+		}
+		// Don't overwrite an existing portal name with a contact-derived
+		// fallback — only authoritative sources (user-set iMessage group
+		// names from the in-memory cache or CloudKit) should rename.
+		if !authoritative && portal.Name != "" {
 			continue
 		}
 
