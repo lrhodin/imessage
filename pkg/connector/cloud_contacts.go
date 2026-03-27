@@ -573,6 +573,10 @@ func parseVCard(vcardData string) *imessage.Contact {
 		if semiIdx := strings.Index(nameWithParams, ";"); semiIdx >= 0 {
 			propName = nameWithParams[:semiIdx]
 		}
+		// Strip Apple vCard group prefix (e.g. "item1.TEL" → "TEL")
+		if dotIdx := strings.Index(propName, "."); dotIdx >= 0 {
+			propName = propName[dotIdx+1:]
+		}
 		propName = strings.ToUpper(propName)
 
 		switch propName {
