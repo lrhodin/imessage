@@ -4903,7 +4903,7 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 	// Pass 1: convert regular messages, defer tapback rows.
 	var messages []*bridgev2.BackfillMessage
 	var tapbackRows []cloudMessageRow
-	messageByGUID := make(map[string]*bridgev2.BackfillMessage)
+	messagesByGUID := make(map[string][]*bridgev2.BackfillMessage)
 
 	for _, row := range rows {
 		if row.TapbackType != nil && *row.TapbackType >= 2000 {
@@ -4913,10 +4913,10 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 		converted := c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)
 		messages = append(messages, converted...)
 		// Key by row GUID so tapbacks can find their target. A row may
-		// produce multiple BackfillMessages (text + attachments); attach
-		// the reaction to the first one (text, or first attachment).
+		// produce multiple BackfillMessages (text + attachments); the
+		// balloon-part index from "p:N/GUID" selects the right one.
 		if len(converted) > 0 {
-			messageByGUID[row.GUID] = converted[0]
+			messagesByGUID[row.GUID] = converted
 		}
 	}
 
@@ -4931,9 +4931,11 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 		tapbackType := *row.TapbackType
 		isRemove := tapbackType >= 3000
 
-		// Parse target GUID from "p:0/GUID" format.
+		// Parse target GUID and balloon-part index from "p:N/GUID" format.
 		targetGUID := row.TapbackTargetGUID
+		balloonPart := 0
 		if parts := strings.SplitN(targetGUID, "/", 2); len(parts) == 2 {
+			fmt.Sscanf(parts[0], "p:%d", &balloonPart)
 			targetGUID = parts[1]
 		}
 		if targetGUID == "" {
@@ -4942,8 +4944,16 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 
 		// Removes can't use BackfillReaction (framework only supports add).
 		// Tapbacks targeting messages outside this batch also fall back.
-		targetMsg, inBatch := messageByGUID[targetGUID]
+		targetMsgs, inBatch := messagesByGUID[targetGUID]
 		if !isRemove && inBatch {
+			// Select the correct BackfillMessage by balloon-part index.
+			// The converted slice is ordered [text, att0, att1, ...], matching
+			// iMessage balloon-part numbering.
+			targetIdx := 0
+			if balloonPart > 0 && balloonPart < len(targetMsgs) {
+				targetIdx = balloonPart
+			}
+			targetMsg := targetMsgs[targetIdx]
 			ts := time.UnixMilli(row.TimestampMS)
 			idx := tapbackType - 2000
 			emoji := tapbackTypeToEmoji(&idx, &row.TapbackEmoji)
@@ -7509,15 +7519,24 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 // bare UUID, which is how pre-existing messages were stored.
 func (c *IMClient) resolveTapbackTargetID(targetGUID string, bp int) networkid.MessageID {
 	if bp >= 1 {
-		suffixed := fmt.Sprintf("%s_att%d", targetGUID, bp-1)
-		suffixedID := makeMessageID(suffixed)
-		msg, err := c.Main.Bridge.DB.Message.GetFirstPartByID(
-			context.Background(), c.UserLogin.ID, suffixedID,
-		)
-		if err == nil && msg != nil {
-			return suffixedID
+		// Try with-text mapping first: attachment index = balloonPart - 1.
+		withTextID := makeMessageID(fmt.Sprintf("%s_att%d", targetGUID, bp-1))
+		if msg, err := c.Main.Bridge.DB.Message.GetFirstPartByID(
+			context.Background(), c.UserLogin.ID, withTextID,
+		); err == nil && msg != nil {
+			return withTextID
 		}
-		// Suffixed ID not found — fall back to bare UUID for old messages.
+		// Try no-text mapping: attachment index = balloonPart.
+		// When there is no text body, iMessage balloon parts map directly
+		// to attachment indices (part 0 = att0 stored as bare UUID,
+		// part 1 = att1, etc.), so the suffixed ID uses bp not bp-1.
+		noTextID := makeMessageID(fmt.Sprintf("%s_att%d", targetGUID, bp))
+		if msg, err := c.Main.Bridge.DB.Message.GetFirstPartByID(
+			context.Background(), c.UserLogin.ID, noTextID,
+		); err == nil && msg != nil {
+			return noTextID
+		}
+		// Neither found — fall back to bare UUID for old/legacy messages.
 	}
 	return makeMessageID(targetGUID)
 }
