@@ -4935,7 +4935,7 @@ func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloud
 		targetGUID := row.TapbackTargetGUID
 		bp := 0
 		if parts := strings.SplitN(targetGUID, "/", 2); len(parts) == 2 {
-			fmt.Sscanf(parts[0], "p:%d", &bp)
+			bp = parseBalloonPart(parts[0], "p:%d")
 			targetGUID = parts[1]
 		}
 		if targetGUID == "" {
@@ -5112,7 +5112,7 @@ func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.E
 	targetGUID := row.TapbackTargetGUID
 	bp := 0
 	if parts := strings.SplitN(targetGUID, "/", 2); len(parts) == 2 {
-		fmt.Sscanf(parts[0], "p:%d", &bp)
+		bp = parseBalloonPart(parts[0], "p:%d")
 		targetGUID = parts[1]
 	}
 	if targetGUID == "" {
@@ -7328,7 +7328,7 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 	if msg.ReplyGuid != nil && *msg.ReplyGuid != "" {
 		bp := 0
 		if msg.ReplyPart != nil {
-			fmt.Sscanf(*msg.ReplyPart, "%d:", &bp)
+			bp = parseBalloonPart(*msg.ReplyPart, "%d:")
 		}
 		cm.ReplyTo = chatDBReplyTarget(*msg.ReplyGuid, bp)
 	}
@@ -7505,7 +7505,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 	if attMsg.WrappedMessage.ReplyGuid != nil && *attMsg.WrappedMessage.ReplyGuid != "" {
 		bp := 0
 		if attMsg.WrappedMessage.ReplyPart != nil {
-			fmt.Sscanf(*attMsg.WrappedMessage.ReplyPart, "%d:", &bp)
+			bp = parseBalloonPart(*attMsg.WrappedMessage.ReplyPart, "%d:")
 		}
 		cm.ReplyTo = chatDBReplyTarget(*attMsg.WrappedMessage.ReplyGuid, bp)
 	}
@@ -7537,14 +7537,21 @@ func (c *IMClient) resolveTapbackTargetID(targetGUID string, bp int) networkid.M
 // Static helpers
 // ============================================================================
 
+// parseBalloonPart extracts an integer balloon-part index from s using the
+// given fmt.Sscanf format string. Returns 0 if s is empty or parsing fails.
+func parseBalloonPart(s, format string) int {
+	var bp int
+	fmt.Sscanf(s, format, &bp)
+	return bp
+}
+
 // extractTapbackTarget splits a message ID that may contain an _attN suffix into
 // the bare UUID and the iMessage tapback part index (0 = text body, ≥1 = attachment).
 // The _attN index is 0-based (att0 = first attachment = part 1 in iMessage).
 func extractTapbackTarget(messageID string) (string, uint64) {
 	if idx := strings.Index(messageID, "_att"); idx > 0 {
-		var attIndex uint64
-		fmt.Sscanf(messageID[idx+4:], "%d", &attIndex)
-		return messageID[:idx], attIndex + 1
+		attIndex := parseBalloonPart(messageID[idx+4:], "%d")
+		return messageID[:idx], uint64(attIndex) + 1
 	}
 	return messageID, 0
 }
@@ -7562,8 +7569,7 @@ func extractReplyInfo(replyTo *database.Message) (*string, *string) {
 	// but we derive the balloon-part index from the suffix to set reply_part correctly.
 	bp := 0
 	if idx := strings.Index(guid, "_att"); idx > 0 {
-		fmt.Sscanf(guid[idx+4:], "%d", &bp)
-		bp++
+		bp = parseBalloonPart(guid[idx+4:], "%d") + 1
 		guid = guid[:idx]
 	}
 	// iMessage thread_originator_part format is "bp:type:length" where:
