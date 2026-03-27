@@ -1026,7 +1026,8 @@ func (s *cloudBackfillStore) classifyRecycleBinPortals(ctx context.Context, reco
 // restarts on a fresh database. The ON CONFLICT clause ensures that if the
 // chat already exists (from a prior sync), we don't overwrite it — only
 // insert if it's genuinely new. If CloudKit later syncs the chat as live,
-// upsertChatBatch will set deleted=FALSE automatically.
+// upsertChatBatch will set deleted to whatever value the synced row carries
+// (i.e. ON CONFLICT sets deleted=cloud_chat.deleted, not unconditionally FALSE).
 func (s *cloudBackfillStore) insertDeletedChatTombstone(
 	ctx context.Context,
 	cloudChatID, portalID, recordName, groupID, service string,
@@ -1442,6 +1443,9 @@ func (s *cloudBackfillStore) getDisplayNameByPortalID(ctx context.Context, porta
 	if err == nil && displayName.Valid {
 		return displayName.String, nil
 	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
 	// Fallback: the portal ID's UUID might be a chat_id that differs from
 	// the group_id. Try matching by group_id so gid:<chat_id> portals can
 	// still find the display_name stored under gid:<group_id>.
@@ -1453,6 +1457,9 @@ func (s *cloudBackfillStore) getDisplayNameByPortalID(ctx context.Context, porta
 		).Scan(&displayName)
 		if err == nil && displayName.Valid {
 			return displayName.String, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
 		}
 	}
 	return "", nil
