@@ -1141,10 +1141,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 
 	// Track SMS portals so outbound replies use the correct service type.
 	// Unconditional so SMS→iMessage transitions are reflected immediately.
-	c.updatePortalSMS(string(portalKey.ID), msg.IsSms)
-	// IsSms persistence is handled by the GetChatInfo ExtraUpdates hook, which
-	// reads isPortalSMS() (already set above via updatePortalSMS). This avoids
-	// a race between a detached goroutine and the framework's own metadata updates.
+	smsChanged := c.updatePortalSMS(string(portalKey.ID), msg.IsSms)
 
 	// Only create new portals after CloudKit sync is done.
 	cloudSyncDone := c.isCloudSyncDone()
@@ -1164,6 +1161,31 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	backgroundCtx := context.Background()
 	msgTS := int64(msg.TimestampMs)
 	existingPortal, _ := c.Main.Bridge.GetExistingPortalByKey(backgroundCtx, portalKey)
+
+	// Persist IsSms change to DB immediately so it survives a crash.
+	// Without this, the in-memory update above would be lost on restart
+	// because loadSenderGuidsFromDB only loads IsSms=true entries.
+	if smsChanged && existingPortal != nil {
+		meta, ok := existingPortal.Metadata.(*PortalMetadata)
+		if !ok {
+			meta = &PortalMetadata{}
+		}
+		if meta.IsSms != msg.IsSms {
+			meta.IsSms = msg.IsSms
+			existingPortal.Metadata = meta
+			if err := existingPortal.Save(backgroundCtx); err != nil {
+				log.Warn().Err(err).
+					Str("portal_id", portalID).
+					Bool("is_sms", msg.IsSms).
+					Msg("Failed to persist IsSms change to database")
+			} else {
+				log.Debug().
+					Str("portal_id", portalID).
+					Bool("is_sms", msg.IsSms).
+					Msg("Persisted IsSms change to database")
+			}
+		}
+	}
 	missingPortal := existingPortal == nil || existingPortal.MXID == ""
 
 	// Lazy-load soft-deleted portal info. Only queries the DB when we
@@ -7854,10 +7876,12 @@ func mimeToMsgType(mime string) event.MessageType {
 	}
 }
 
-func (c *IMClient) updatePortalSMS(portalID string, isSms bool) {
+func (c *IMClient) updatePortalSMS(portalID string, isSms bool) bool {
 	c.smsPortalsLock.Lock()
 	defer c.smsPortalsLock.Unlock()
+	prev, existed := c.smsPortals[portalID]
 	c.smsPortals[portalID] = isSms
+	return !existed || prev != isSms
 }
 
 func (c *IMClient) isPortalSMS(portalID string) bool {

@@ -1697,11 +1697,13 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			continue
 		}
 
-		// Update SMS status in-memory so guards work immediately during this sync
-		// session. Unconditional so SMS→iMessage transitions are reflected.
-		// Persistence is handled by GetChatInfo ExtraUpdates when the
-		// portal is created/resynced via createPortalsFromCloudSync.
-		c.updatePortalSMS(portalID, strings.EqualFold(chat.Service, "SMS"))
+		// Only mark portals as SMS from CloudKit records. We intentionally do
+		// NOT clear the SMS flag here for iMessage records because CloudKit can
+		// deliver stale iMessage records for legitimately-SMS portals. The live
+		// message path (handleMessage) handles SMS→iMessage transitions instead.
+		if strings.EqualFold(chat.Service, "SMS") {
+			c.updatePortalSMS(portalID, true)
+		}
 
 		participantsJSON, jsonErr := json.Marshal(chat.Participants)
 		if jsonErr != nil {
