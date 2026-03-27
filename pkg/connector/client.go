@@ -6464,6 +6464,8 @@ func (c *IMClient) reIDPortalWithCacheUpdate(ctx context.Context, oldKey, newKey
 	c.groupPortalMu.Lock()
 	c.lastGroupForMemberMu.Lock()
 	c.gidAliasesMu.Lock()
+	c.smsPortalsLock.Lock()
+	defer c.smsPortalsLock.Unlock()
 	defer c.gidAliasesMu.Unlock()
 	defer c.lastGroupForMemberMu.Unlock()
 	defer c.groupPortalMu.Unlock()
@@ -6512,6 +6514,11 @@ func (c *IMClient) reIDPortalWithCacheUpdate(ctx context.Context, oldKey, newKey
 		if target == oldID {
 			c.gidAliases[alias] = newID
 		}
+	}
+	// Move SMS portal flag
+	if isSms, ok := c.smsPortals[oldID]; ok {
+		c.smsPortals[newID] = isSms
+		delete(c.smsPortals, oldID)
 	}
 
 	return result, portal, nil
