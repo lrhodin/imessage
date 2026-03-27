@@ -1697,12 +1697,14 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			continue
 		}
 
-		// Only mark portals as SMS from CloudKit records. We intentionally do
-		// NOT clear the SMS flag here for iMessage records because CloudKit can
-		// deliver stale iMessage records for legitimately-SMS portals. The live
-		// message path (handleMessage) handles SMS→iMessage transitions instead.
+		// Update SMS flag from CloudKit chat service type. If a stale
+		// CloudKit record briefly clears the flag for a legitimately-SMS
+		// portal, the next live SMS message will re-set it immediately
+		// via handleMessage's unconditional updatePortalSMS call.
 		if strings.EqualFold(chat.Service, "SMS") {
 			c.updatePortalSMS(portalID, true)
+		} else if strings.EqualFold(chat.Service, "iMessage") {
+			c.updatePortalSMS(portalID, false)
 		}
 
 		participantsJSON, jsonErr := json.Marshal(chat.Participants)
