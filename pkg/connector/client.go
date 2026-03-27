@@ -7891,8 +7891,8 @@ func (c *IMClient) updatePortalSMS(portalID string, isSms bool) {
 func (c *IMClient) isPortalSMS(portalID string) bool {
 	c.smsPortalsLock.RLock()
 	defer c.smsPortalsLock.RUnlock()
-	if c.smsPortals[portalID] {
-		return true
+	if val, ok := c.smsPortals[portalID]; ok {
+		return val
 	}
 	// Fallback for legacy portals that still have the raw suffix in their ID
 	// (pre-fix DB entries that survive without a full reset). Such portals can
