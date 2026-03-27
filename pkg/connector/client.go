@@ -3769,7 +3769,9 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 		// Sending via SendMessage() with the reaction text uses RawSmsOutgoingMessage
 		// format, which the iPhone routes by participants without needing a stable
 		// sender_guid, correctly delivering to the existing SMS/RCS thread.
-		targetGUID := string(msg.TargetMessage.ID)
+		// Strip _attN suffix: SMS doesn't support part-targeting, and the
+		// suffixed ID would fail lookups and relay routing.
+		targetGUID, _ := extractTapbackTarget(string(msg.TargetMessage.ID))
 		reactionText := formatSMSReactionText(reaction, emoji, false)
 		if c.cloudStore != nil {
 			if origText, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && origText != "" {
@@ -3814,7 +3816,9 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 	if conv.IsSms {
 		// Same SMS routing fix as HandleMatrixReaction: use SendMessage instead
 		// of SendTapback to avoid the phantom new-thread creation.
-		targetGUID := string(msg.TargetReaction.MessageID)
+		// Strip _attN suffix: SMS doesn't support part-targeting, and the
+		// suffixed ID would fail lookups and relay routing.
+		targetGUID, _ := extractTapbackTarget(string(msg.TargetReaction.MessageID))
 		reactionText := formatSMSReactionText(reaction, emoji, true)
 		if c.cloudStore != nil {
 			if origText, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && origText != "" {
