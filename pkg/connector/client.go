@@ -1641,8 +1641,8 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 	// the cache when a prior mis-routing led to a wrong finalPortalKey.
 	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
 		portalIDStr := string(finalPortalKey.ID)
-		isOwnGidPortal := portalIDStr == "gid:"+strings.ToLower(*msg.SenderGuid)
-		if strings.Contains(portalIDStr, ",") || isOwnGidPortal {
+		isGidPortal := strings.HasPrefix(portalIDStr, "gid:")
+		if strings.Contains(portalIDStr, ",") || isGidPortal {
 			c.imGroupGuidsMu.Lock()
 			c.imGroupGuids[portalIDStr] = *msg.SenderGuid
 			c.imGroupGuidsMu.Unlock()
