@@ -6433,7 +6433,12 @@ func (c *IMClient) ensureGroupPortalIndex() {
 
 // indexGroupPortalLocked adds a group portal ID to the in-memory index.
 // Caller must hold groupPortalMu write lock.
+// Safe to call before ensureGroupPortalIndex — returns early when the index
+// has not been built yet (nil map), since the full rebuild will pick it up.
 func (c *IMClient) indexGroupPortalLocked(portalID string) {
+	if c.groupPortalIndex == nil {
+		return
+	}
 	for _, member := range strings.Split(portalID, ",") {
 		if c.groupPortalIndex[member] == nil {
 			c.groupPortalIndex[member] = make(map[string]bool)
