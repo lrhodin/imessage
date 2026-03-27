@@ -1041,7 +1041,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// Create portals and queue forward backfill for all of them.
 	// Skip portals that are tombstoned or recently deleted this session.
 	portalStart := time.Now()
-	c.createPortalsFromCloudSync(ctx, log, skipPortals)
+	c.createPortalsFromCloudSync(ctx, log)
 	c.setCloudSyncDone()
 
 	log.Info().
@@ -1116,7 +1116,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		// Pre-upload any new attachments discovered by this re-sync;
 		// already-cached record_names are skipped instantly.
 		c.preUploadCloudAttachments(ctx)
-		c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
+		c.createPortalsFromCloudSync(ctx, resyncLog)
 		c.cloudSyncRunningLock.Lock()
 		c.cloudSyncRunning = false
 		c.cloudSyncRunningLock.Unlock()
@@ -2281,7 +2281,7 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	return string(portalKey.ID)
 }
 
-func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {
+func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger) {
 	if c.cloudStore == nil {
 		return
 	}
