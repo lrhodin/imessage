@@ -5419,7 +5419,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 		if imgWidth > 800 || imgHeight > 800 {
 			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
 		}
-	} else if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
+	} else if (strings.HasPrefix(mimeType, "image/") && !isHEIC(mimeType)) || looksLikeImage(data) {
 		if mimeType == "image/gif" {
 			if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 				imgWidth, imgHeight = cfg.Width, cfg.Height
@@ -7372,7 +7372,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		if imgWidth > 800 || imgHeight > 800 {
 			thumbData, thumbW, thumbH = scaleAndEncodeThumb(heicImg, imgWidth, imgHeight)
 		}
-	} else if inlineData != nil && (strings.HasPrefix(mimeType, "image/") || looksLikeImage(inlineData)) {
+	} else if inlineData != nil && ((strings.HasPrefix(mimeType, "image/") && !isHEIC(mimeType)) || looksLikeImage(inlineData)) {
 		log := zerolog.Ctx(ctx)
 		log.Debug().Str("mime_type", mimeType).Str("file_name", fileName).Int("data_len", len(inlineData)).Msg("Processing image attachment")
 		if mimeType == "image/gif" {
