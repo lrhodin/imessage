@@ -712,6 +712,22 @@ func (c *IMClient) migrateSmsSuffixPortals(log zerolog.Logger, ctx context.Conte
 	}
 }
 
+// safeRestoreTokenProvider wraps RestoreTokenProvider with a panic recovery.
+// Uniffi converts Rust panics to Go panics (CALL_UNEXPECTED_ERROR); without
+// recovery here the whole process crashes instead of degrading gracefully.
+func safeRestoreTokenProvider(
+	config *rustpushgo.WrappedOSConfig,
+	conn *rustpushgo.WrappedAPSConnection,
+	username, hashedPwHex, pet, spdBase64 string,
+) (tp rustpushgo.WrappedTokenProvider, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("RestoreTokenProvider panicked: %v", r)
+		}
+	}()
+	return rustpushgo.RestoreTokenProvider(config, conn, username, hashedPwHex, pet, spdBase64)
+}
+
 func (c *IMClient) Connect(ctx context.Context) {
 	c.startupTime = time.Now()
 	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
@@ -745,7 +761,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 		if meta.AccountUsername != "" && meta.AccountPET != "" && meta.AccountSPDBase64 != "" {
 			log.Info().Msg("Restoring iCloud TokenProvider from persisted credentials")
-			tp, err := rustpushgo.RestoreTokenProvider(c.config, c.connection,
+			tp, err := safeRestoreTokenProvider(c.config, c.connection,
 				meta.AccountUsername, meta.AccountHashedPasswordHex,
 				meta.AccountPET, meta.AccountSPDBase64)
 			if err != nil {

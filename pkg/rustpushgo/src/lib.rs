@@ -6860,6 +6860,7 @@ impl Client {
     ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
         use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, ALL_ASSETS};
         use rustpush::cloud_messages::MESSAGES_SERVICE;
+        use rustpush::pcs::{PCSShareProtection, PCSEncryptor};
         use rustpush::PushError;
 
         let token = decode_continuation_token(continuation_token)?;
@@ -7099,12 +7100,55 @@ impl Client {
             }));
             let pcskey_opt = match pcs_result {
                 Err(_panic) => {
-                    pcs_skipped += 1;
-                    warn!(
-                        "cloud_sync_attachments: pcs_keys_for_record panicked for {}, skipping",
-                        identifier
-                    );
-                    None
+                    // pcs_keys_for_record panicked — upstream's decode_record_protection
+                    // uses byte comparison (key.compress() vs stored pub_key) which
+                    // fails when the zone was key-rotated and the old key is missing
+                    // from zone_keys but still in the keychain.
+                    //
+                    // Fall back to decrypt_with_keychain, which does a format-agnostic
+                    // keychain lookup (base64 of stored pub_key bytes) and succeeds
+                    // where the byte comparison fails. This is the wrapper-layer
+                    // re-implementation of the aecc7ed fix from the vendored tree.
+                    if let Some(protection) = &record.protection_info {
+                        let record_protection = PCSShareProtection::from_protection_info(protection);
+                        let keychain_state = cloud_messages.keychain.state.read().await;
+                        let fallback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            record_protection.decrypt_with_keychain(&keychain_state, &MESSAGES_SERVICE, false)
+                        }));
+                        match fallback {
+                            Ok(Ok((pcs_keys, _))) => {
+                                let record_id = record.record_identifier.clone().expect("no record id");
+                                info!(
+                                    "cloud_sync_attachments: fallback decrypt_with_keychain succeeded for {}",
+                                    identifier
+                                );
+                                Some(PCSEncryptor { keys: pcs_keys, record_id })
+                            }
+                            Ok(Err(e)) => {
+                                pcs_skipped += 1;
+                                warn!(
+                                    "cloud_sync_attachments: pcs panic + fallback failed for {}: {}",
+                                    identifier, e
+                                );
+                                None
+                            }
+                            Err(_) => {
+                                pcs_skipped += 1;
+                                warn!(
+                                    "cloud_sync_attachments: pcs panic + fallback panicked for {}",
+                                    identifier
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        pcs_skipped += 1;
+                        warn!(
+                            "cloud_sync_attachments: pcs_keys_for_record panicked for {} (no protection_info for fallback)",
+                            identifier
+                        );
+                        None
+                    }
                 }
                 Ok(Ok(k)) => Some(k),
                 Ok(Err(PushError::PCSRecordKeyMissing)) if !refreshed_zone_key_config => {
