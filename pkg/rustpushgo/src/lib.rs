@@ -7030,6 +7030,24 @@ impl Client {
         let mut no_identifier = 0usize;
         let mut no_record_tombstone = 0usize;
         let mut wrong_type = 0usize;
+        // `cm_decode_fail` = records whose `cm` field (GZipWrapper<AttachmentMeta>)
+        // panicked or returned None on decode. A failed `cm` means we have no
+        // aguid / no attachment metadata, so the record must be skipped — but
+        // we now log WHY and increment a counter, instead of silently dropping
+        // inside a whole-record `catch_unwind`.
+        //
+        // `lqa_decode_fail` = records whose `lqa` field (Asset, the primary
+        // MMCS blob) panicked on decode. Unlike `cm`, a failed `lqa` does NOT
+        // drop the record — we still emit the record with a missing Ford key,
+        // so Go sees the aguid in attachments_json and the download path can
+        // attempt Ford recovery. This is the fix for the 4-record regression:
+        // upstream's `Asset::from_value_encrypted` unwraps `protection_info`
+        // twice (cloudkit-proto/src/lib.rs:273), which panics on any record
+        // whose lqa has `protection_info=None` or `protection_info.protection_info=None`.
+        // The previous catch_unwind(from_record_encrypted) caught that panic
+        // but nuked the whole record, losing `cm` along with `lqa`.
+        let mut cm_decode_fail = 0usize;
+        let mut lqa_decode_fail = 0usize;
         for change in &response.change {
             let identifier = match change.identifier.as_ref().and_then(|i| i.value.as_ref()) {
                 Some(v) => v.name().to_string(),
@@ -7128,47 +7146,142 @@ impl Client {
                 None => continue,
             };
 
-            // Use upstream's CloudAttachment (cm + lqa only) — same struct and
-            // same decode path that master uses via sync_records_with_assets.
-            // CloudAttachmentWithAvid (cm + lqa + avid) was the sync struct
-            // before this; something about the avid field on the local derive
-            // was silently dropping records from the result. Avid (Live Photo
-            // MOV companion) detection is re-derived below by scanning the raw
-            // record_field for a field literally named "avid" and extracting
-            // its asset value — no dependency on a local CloudKitRecord derive.
-            let att: rustpush::cloud_messages::CloudAttachment = match std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| {
-                    <rustpush::cloud_messages::CloudAttachment as rustpush::cloudkit_proto::CloudKitRecord>::from_record_encrypted(&record.record_field, Some(&pcskey))
-                }),
-            ) {
-                Ok(parsed) => parsed,
-                Err(_) => {
+            // Per-field manual decode.
+            //
+            // Previously this call used upstream's derive-generated
+            // `<CloudAttachment as CloudKitRecord>::from_record_encrypted`
+            // inside a whole-record `catch_unwind`. That path has two
+            // load-bearing panic sites in upstream's code that silently
+            // nuked entire records:
+            //
+            //   1. `Asset::from_value_encrypted`
+            //      (cloudkit-proto/src/lib.rs:273) double-unwraps
+            //      `asset.protection_info` and `.protection_info`. Any
+            //      record whose `lqa` Asset is missing either nested Option
+            //      panics immediately.
+            //   2. `GZipWrapper::from_bytes`
+            //      (cloud_messages.rs:211) calls `.expect("ungzip fialed")`.
+            //      Any record whose `cm` field decrypts to non-gzip bytes
+            //      panics immediately.
+            //
+            // The old catch_unwind caught the panic but then `continue`d,
+            // dropping the entire record — so the aguid never reached Go,
+            // `attMap` never saw it, and the bridge ingest code logged
+            // "Attachment GUID not found in attachment zone". That's the
+            // observed regression for the 4 stubborn aguids.
+            //
+            // Fix: decode each field independently with its own
+            // catch_unwind. `cm` is required (no aguid → skip record);
+            // `lqa` and `avid` are best-effort (missing Asset just means
+            // we emit the record without a Ford key).
+            let find_field = |name: &str| -> Option<&rustpush::cloudkit_proto::record::field::Value> {
+                record
+                    .record_field
+                    .iter()
+                    .find(|f| {
+                        f.identifier
+                            .as_ref()
+                            .and_then(|i| i.name.as_deref())
+                            == Some(name)
+                    })
+                    .and_then(|f| f.value.as_ref())
+            };
+
+            let field_names: Vec<String> = record
+                .record_field
+                .iter()
+                .filter_map(|f| f.identifier.as_ref().and_then(|i| i.name.clone()))
+                .collect();
+
+            // Decode `cm` (GZipWrapper<AttachmentMeta>).
+            // We pull the GZipWrapper out, then move the inner AttachmentMeta.
+            let cm_opt: Option<rustpush::cloud_messages::AttachmentMeta> = match find_field("cm") {
+                None => None,
+                Some(v) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    <rustpush::cloud_messages::GZipWrapper<rustpush::cloud_messages::AttachmentMeta>
+                        as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(
+                        v, &pcskey, "cm",
+                    )
+                })) {
+                    Ok(Some(gzw)) => Some(gzw.0),
+                    Ok(None) => None,
+                    Err(_panic) => {
+                        // from_bytes panic (ungzip or plist parse). Log and
+                        // fall through — counted as cm_decode_fail below.
+                        warn!(
+                            "cloud_sync_attachments: {} — cm decode panicked (likely ungzip/plist). fields={:?}",
+                            identifier, field_names
+                        );
+                        None
+                    }
+                },
+            };
+            let cm = match cm_opt {
+                Some(cm) => cm,
+                None => {
+                    cm_decode_fail += 1;
                     warn!(
-                        "cloud_sync_attachments: skipping record {} (PCS decode panic)",
-                        identifier
+                        "cloud_sync_attachments: skipping {} — cm field missing or undecodable. fields={:?}",
+                        identifier, field_names
                     );
                     continue;
                 }
             };
 
-            // Manually look up the "avid" field in the raw record_field slice.
-            // This field is an encrypted Asset (Live Photo MOV companion) and
-            // is only present on Live Photo attachments. Records without an
-            // avid field produce None, which is the correct behavior — and it
-            // cannot silently corrupt the decode of `cm` or `lqa`.
-            let avid_asset = record
-                .record_field
-                .iter()
-                .find(|f| {
-                    f.identifier
-                        .as_ref()
-                        .and_then(|i| i.name.as_deref())
-                        == Some("avid")
-                })
-                .and_then(|f| f.value.as_ref())
-                .and_then(|v| {
+            // Decode `lqa` (Asset). Best-effort: on failure we still emit
+            // the record so Go sees the aguid in attMap. The Ford download
+            // path will attempt recovery later if needed.
+            //
+            // `lqa_outcome` distinguishes three states: Ok(asset present),
+            // Ok(None) = field absent (fine, not counted), Err = present
+            // but decode panicked or returned None (counted + logged).
+            let lqa_field = find_field("lqa");
+            let lqa_opt: Option<rustpush::cloudkit_proto::Asset> = match lqa_field {
+                None => None,
+                Some(v) => {
+                    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        <rustpush::cloudkit_proto::Asset as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "lqa")
+                    }));
+                    match decoded {
+                        Ok(Some(asset)) => Some(asset),
+                        Ok(None) => {
+                            lqa_decode_fail += 1;
+                            warn!(
+                                "cloud_sync_attachments: {} aguid={} — lqa present but from_value_encrypted returned None; emitting record without Ford key",
+                                identifier, cm.guid
+                            );
+                            None
+                        }
+                        Err(_panic) => {
+                            lqa_decode_fail += 1;
+                            warn!(
+                                "cloud_sync_attachments: {} aguid={} — lqa decode panicked (likely None protection_info); emitting record without Ford key. fields={:?}",
+                                identifier, cm.guid, field_names
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+
+            // Decode `avid` (Live Photo MOV companion, Asset). Best-effort.
+            // Same panic risk as lqa.
+            let avid_asset: Option<rustpush::cloudkit_proto::Asset> = match find_field("avid") {
+                None => None,
+                Some(v) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     <rustpush::cloudkit_proto::Asset as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "avid")
-                });
+                })) {
+                    Ok(parsed) => parsed,
+                    Err(_panic) => {
+                        warn!(
+                            "cloud_sync_attachments: {} aguid={} — avid decode panicked; treating as no Live Photo",
+                            identifier, cm.guid
+                        );
+                        None
+                    }
+                },
+            };
+
             let has_avid = avid_asset
                 .as_ref()
                 .and_then(|a| a.size)
@@ -7180,10 +7293,9 @@ impl Client {
                 .and_then(|p| p.protection_info.as_ref())
                 .cloned();
 
-            let ford_key = att
-                .lqa
-                .protection_info
+            let ford_key = lqa_opt
                 .as_ref()
+                .and_then(|lqa| lqa.protection_info.as_ref())
                 .and_then(|p| p.protection_info.as_ref())
                 .cloned();
 
@@ -7205,20 +7317,22 @@ impl Client {
             // Missing a specific aguid from this list = CloudKit change feed
             // isn't returning it, and the fix is not in the sync loop.
             info!(
-                "cloud_sync_attachments: att guid={} record={} mime={:?} size={}",
-                att.cm.0.guid,
+                "cloud_sync_attachments: att guid={} record={} mime={:?} size={} lqa_ok={} avid_ok={}",
+                cm.guid,
                 identifier,
-                att.cm.0.mime_type,
-                att.cm.0.total_bytes
+                cm.mime_type,
+                cm.total_bytes,
+                lqa_opt.is_some(),
+                avid_asset.is_some(),
             );
             normalized.push(WrappedCloudAttachmentInfo {
-                guid: att.cm.0.guid.clone(),
-                mime_type: att.cm.0.mime_type.clone(),
-                uti_type: att.cm.0.uti.clone(),
-                filename: att.cm.0.transfer_name.clone().or_else(|| att.cm.0.filename.clone()),
-                file_size: att.cm.0.total_bytes,
+                guid: cm.guid.clone(),
+                mime_type: cm.mime_type.clone(),
+                uti_type: cm.uti.clone(),
+                filename: cm.transfer_name.clone().or_else(|| cm.filename.clone()),
+                file_size: cm.total_bytes,
                 record_name: identifier,
-                hide_attachment: att.cm.0.hide_attachment,
+                hide_attachment: cm.hide_attachment,
                 has_avid,
                 ford_key,
                 avid_ford_key,
@@ -7226,13 +7340,15 @@ impl Client {
         }
 
         info!(
-            "cloud_sync_attachments: {} normalized, {} ford_cached, {} pcs_skipped, {} no_id, {} tombstones, {} wrong_type, {} total_change_entries",
+            "cloud_sync_attachments: {} normalized, {} ford_cached, {} pcs_skipped, {} no_id, {} tombstones, {} wrong_type, {} cm_decode_fail, {} lqa_decode_fail, {} total_change_entries",
             normalized.len(),
             ford_cached,
             pcs_skipped,
             no_identifier,
             no_record_tombstone,
             wrong_type,
+            cm_decode_fail,
+            lqa_decode_fail,
             response.change.len()
         );
 
