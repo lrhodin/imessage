@@ -7090,9 +7090,24 @@ impl Client {
             // Ford keys master would have recovered — producing gaps in
             // the cache that showed up as "all cached keys exhausted"
             // failures during Ford dedup recovery.
-            let pcskey_opt = match pcs_keys_for_record(record, &zone_key) {
-                Ok(k) => Some(k),
-                Err(PushError::PCSRecordKeyMissing) if !refreshed_zone_key_config => {
+            // Upstream's decode_record_protection uses .unwrap()/.expect() and
+            // can panic when zone-key lookup fails. Wrap in catch_unwind so a
+            // single bad record skips gracefully instead of aborting the whole
+            // page and freezing the continuation token forever.
+            let pcs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pcs_keys_for_record(record, &zone_key)
+            }));
+            let pcskey_opt = match pcs_result {
+                Err(_panic) => {
+                    pcs_skipped += 1;
+                    warn!(
+                        "cloud_sync_attachments: pcs_keys_for_record panicked for {}, skipping",
+                        identifier
+                    );
+                    None
+                }
+                Ok(Ok(k)) => Some(k),
+                Ok(Err(PushError::PCSRecordKeyMissing)) if !refreshed_zone_key_config => {
                     info!("cloud_sync_attachments: PCSRecordKeyMissing for {}, refreshing zone config", identifier);
                     container.clear_cache_zone_encryption_config(&zone_id).await;
                     refreshed_zone_key_config = true;
@@ -7102,9 +7117,20 @@ impl Client {
                     {
                         Ok(new_key) => {
                             zone_key = new_key;
-                            match pcs_keys_for_record(record, &zone_key) {
-                                Ok(k) => Some(k),
-                                Err(e) => {
+                            let retry_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                pcs_keys_for_record(record, &zone_key)
+                            }));
+                            match retry_result {
+                                Err(_panic) => {
+                                    pcs_skipped += 1;
+                                    warn!(
+                                        "cloud_sync_attachments: pcs_keys_for_record panicked on retry for {}, skipping",
+                                        identifier
+                                    );
+                                    None
+                                }
+                                Ok(Ok(k)) => Some(k),
+                                Ok(Err(e)) => {
                                     pcs_skipped += 1;
                                     warn!(
                                         "cloud_sync_attachments: PCS key still missing after refresh for {}: {}",
@@ -7120,7 +7146,7 @@ impl Client {
                         }
                     }
                 }
-                Err(err)
+                Ok(Err(err))
                     if matches!(
                         err,
                         PushError::PCSRecordKeyMissing
@@ -7136,7 +7162,7 @@ impl Client {
                     );
                     None
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!("cloud_sync_attachments: unexpected PCS error for {}: {}", identifier, e);
                     None
                 }
