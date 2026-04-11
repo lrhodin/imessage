@@ -6858,7 +6858,7 @@ impl Client {
         &self,
         continuation_token: Option<String>,
     ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
-        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, ALL_ASSETS};
+        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
         use rustpush::cloud_messages::MESSAGES_SERVICE;
         use rustpush::pcs::{PCSShareProtection, PCSEncryptor};
         use rustpush::PushError;
@@ -6866,14 +6866,22 @@ impl Client {
         let token = decode_continuation_token(continuation_token)?;
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
 
-        // Hand-rolled sync with ALL_ASSETS — matches master's
-        // sync_records_with_assets::<CloudAttachment>(... &ALL_ASSETS) pattern.
+        // Hand-rolled sync with NO_ASSETS — matches master's
+        // sync_attachments → sync_records → FetchRecordChangesOperation(..., &NO_ASSETS) path.
         //
-        // DO NOT use upstream's cloud_messages.sync_attachments() here —
-        // that path uses NO_ASSETS internally, which causes the server
-        // to return fewer/different records and strips some asset
-        // metadata. Empirically: ALL_ASSETS populates ~913 Ford keys,
-        // NO_ASSETS populates ~886 and recovery hits 0% success.
+        // DO NOT use ALL_ASSETS here. ALL_ASSETS asks the server to include
+        // download authorization for every asset field in every returned record.
+        // The server silently omits records whose MMCS assets are unavailable
+        // (expired, pending GC, or otherwise un-authorizable). Those records ARE
+        // present in the zone and returned by NO_ASSETS — they just can't have
+        // their asset download URLs generated. This was the root cause of exactly
+        // 4 records being absent from the change feed on the refactor branch
+        // while master (NO_ASSETS) returned them correctly.
+        //
+        // Ford keys come from lqa.protection_info (PCS-encrypted record field,
+        // NOT the asset download content), so NO_ASSETS vs ALL_ASSETS makes no
+        // difference to Ford key population. The earlier "913 vs 886" measurement
+        // was incorrect — protection_info is available either way.
         //
         // We parse records as CloudAttachmentWithAvid (our local type
         // that declares the avid field) so sync-time has_avid detection
@@ -6953,7 +6961,7 @@ impl Client {
             let join = tokio::task::spawn(async move {
                 c.perform(
                     &CloudKitSession::new(),
-                    FetchRecordChangesOperation::new(z, tok, &ALL_ASSETS),
+                    FetchRecordChangesOperation::new(z, tok, &NO_ASSETS),
                 )
                 .await
             })
