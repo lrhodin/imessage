@@ -982,6 +982,69 @@ fn keychain_retry_delay(attempt: usize) -> Duration {
     }
 }
 
+/// Try to recover usable CloudKit keys after a NotInClique failure.
+///
+/// Upstream's `sync_keychain` gates everything behind `is_in_clique()`, which
+/// calls `sync_trust()` → Cuttlefish `fetchChanges`. If another device (e.g.
+/// an iPhone running Messages) posts a trust-update that excludes us, every
+/// `is_in_clique()` call returns false and `sync_keychain` is dead.
+///
+/// Recovery strategy — all public upstream APIs, no internal field access:
+///   1. Try to refresh TLK shares via `fetch_shares_for` + `store_keys`.
+///      These hit a different Cuttlefish endpoint that doesn't check clique
+///      membership, so they work even when we appear excluded.
+///   2. Check `state.items` (public field): if the prior join/sync already
+///      populated the CloudKit key cache, those keys are sufficient for
+///      decryption. Return Ok — callers proceed with cached keys.
+///   3. If cache is empty (fresh install, no prior sync), return the real
+///      error so the caller knows it cannot proceed.
+///
+/// This mirrors what master's rustpush fork achieves by ignoring self-exclusion
+/// inside `fast_forward_trust`, but implemented entirely at the wrapper layer.
+async fn recover_keychain_after_exclusion(
+    keychain: &rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>,
+    context: &str,
+) -> Result<(), WrappedError> {
+    // Step 1: attempt TLK share refresh (best-effort; doesn't need clique membership).
+    let identity_opt = {
+        let state = keychain.state.read().await;
+        state.user_identity.clone()
+    };
+    if let Some(identity) = identity_opt {
+        match keychain.fetch_shares_for(&identity).await {
+            Ok(shares) if !shares.is_empty() => {
+                match keychain.store_keys(&shares).await {
+                    Ok(()) => info!("{}: refreshed {} TLK share(s) despite exclusion", context, shares.len()),
+                    Err(e) => warn!("{}: store_keys failed (non-fatal): {}", context, e),
+                }
+            }
+            Ok(_) => info!("{}: no TLK shares returned; using persisted keystore", context),
+            Err(e) => warn!("{}: fetch_shares_for failed (non-fatal): {}", context, e),
+        }
+    }
+
+    // Step 2: check whether the persisted CloudKit key cache is usable.
+    let has_cached_keys = {
+        let state = keychain.state.read().await;
+        state.items.values().any(|zone| !zone.keys.is_empty())
+    };
+
+    if has_cached_keys {
+        warn!(
+            "{}: excluded from Cuttlefish trust circle by another device, \
+             but CloudKit key cache is populated — using cached keys. \
+             Messages in iCloud sync will work; key rotation may require re-login.",
+            context
+        );
+        return Ok(());
+    }
+
+    // Step 3: nothing to fall back on — propagate the error.
+    Err(WrappedError::GenericError {
+        msg: format!("{} keychain sync failed: not in clique and no cached keys available", context),
+    })
+}
+
 async fn sync_keychain_with_retries(
     keychain: &rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>,
     max_attempts: usize,
@@ -999,9 +1062,9 @@ async fn sync_keychain_with_retries(
             }
             Err(err) => {
                 if matches!(err, rustpush::PushError::NotInClique) {
-                    return Err(WrappedError::GenericError {
-                        msg: format!("{} keychain sync failed: {}", context, err),
-                    });
+                    // Don't retry — NotInClique won't resolve with more attempts.
+                    // Fall back to cached CloudKit keys if available.
+                    return recover_keychain_after_exclusion(keychain, context).await;
                 }
 
                 let retrying = attempt + 1 < attempts;
