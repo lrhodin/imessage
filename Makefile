@@ -192,9 +192,11 @@ ensure-rustpush-source:
 			done; \
 		fi; \
 		if [ -d rustpush/open-absinthe ] && [ -f rustpush/open-absinthe/Cargo.toml ]; then \
-			echo "Overlaying our open-absinthe (Local NAC wiring) onto $(RUSTPUSH_DIR)/open-absinthe..."; \
-			rm -rf third_party/rustpush-upstream/open-absinthe; \
-			cp -R rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe; \
+			if ! diff -rq rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe >/dev/null 2>&1; then \
+				echo "Overlaying our open-absinthe (Local NAC wiring) onto $(RUSTPUSH_DIR)/open-absinthe..."; \
+				rm -rf third_party/rustpush-upstream/open-absinthe; \
+				cp -Rp rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe; \
+			fi; \
 		fi; \
 		if [ -d rustpush/apple-private-apis ] && [ -f rustpush/apple-private-apis/Cargo.toml ]; then \
 			if [ ! -f third_party/rustpush-upstream/apple-private-apis/icloud-auth/Cargo.toml ]; then \
