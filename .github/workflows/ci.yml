@@ -67,6 +67,13 @@ jobs:
   # ───────────────────────────────────────────────────────────────
   build-macos:
     name: Build (macOS)
+    # Manual-dispatch only. macOS runs on the Apple Silicon GitHub-hosted
+    # runner; every push/PR doesn't need to burn a macOS slot since Linux
+    # already catches the vast majority of breakage. Trigger this job
+    # explicitly via Actions → CI → "Run workflow" when you want macOS
+    # parity coverage (e.g. after bumping third_party/rustpush-upstream.sha
+    # or touching platform-gated code in pkg/rustpushgo or local_config).
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-14          # Apple Silicon (ARM64)
     steps:
       - uses: actions/checkout@v4
