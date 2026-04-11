@@ -6878,25 +6878,140 @@ impl Client {
         // We parse records as CloudAttachmentWithAvid (our local type
         // that declares the avid field) so sync-time has_avid detection
         // AND avid Ford key caching work in one pass.
-        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
-            msg: format!("Failed to sync CloudKit attachments (get_container): {}", e),
-        })?;
-        let zone_id = container.private_zone("attachmentManateeZone".to_string());
-        let mut zone_key = container
-            .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
-            .await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to sync CloudKit attachments (zone_key): {}", e),
-            })?;
-        let (_assets, response) = container
-            .perform(
-                &CloudKitSession::new(),
-                FetchRecordChangesOperation::new(zone_id.clone(), token, &ALL_ASSETS),
-            )
-            .await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to sync CloudKit attachments (perform): {}", e),
-            })?;
+        // SLEDGEHAMMER: the whole container+zone_key+perform call chain runs
+        // inside a spawned task. Upstream omnisette has an unconditional
+        // `panic!()` on any non-`AnisetteNotProvisioned` error from
+        // `get_headers` (remote_anisette_v3.rs:417), and MMCS/PCS paths
+        // below it have their own scattered `.expect()` calls. Any of
+        // these can fire mid-sync and abort the entire page, silently
+        // losing its records because the continuation token hasn't
+        // advanced yet.
+        //
+        // Retry up to 4 times with the SAME continuation token. Between
+        // attempts, on panic (JoinError), fully reset the cloud client
+        // (cloud_messages_client + cloud_keychain_client → None) so the
+        // next get_or_init builds a fresh omnisette provider with fresh
+        // state. On final failure, return an empty done-page so Go's
+        // loop breaks without advancing the persisted token — the
+        // next sync cycle will retry the same page from DB state.
+        const ATT_SYNC_RETRIES: usize = 4;
+        let mut cm_handle = cloud_messages;
+        let mut perform_result: Option<(Vec<rustpush::cloudkit::AssetGetResponse>, rustpush::cloudkit_proto::retrieve_changes_response::RetrieveChangesResponse)> = None;
+        let mut last_perform_err: Option<String> = None;
+        let mut container_holder: Option<Arc<_>> = None;
+        let mut zone_id_holder: Option<rustpush::cloudkit_proto::RecordZoneIdentifier> = None;
+        let mut zone_key_holder: Option<rustpush::icloud::pcs::PCSZoneConfig> = None;
+        for attempt in 0..ATT_SYNC_RETRIES {
+            // Re-fetch container + zone_key INSIDE the retry so a reset
+            // cloud_messages_client picks up a fresh container, fresh keychain,
+            // fresh omnisette state on retry.
+            let container = match cm_handle.get_container().await {
+                Ok(c) => c,
+                Err(e) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "cloud_sync_attachments: get_container() failed on attempt {}/{}: {}",
+                        attempt_no, ATT_SYNC_RETRIES, e
+                    );
+                    last_perform_err = Some(format!("get_container: {}", e));
+                    if attempt_no < ATT_SYNC_RETRIES {
+                        self.reset_cloud_client().await;
+                        cm_handle = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            let zone_id_local = container.private_zone("attachmentManateeZone".to_string());
+            let zone_key_local = match container
+                .get_zone_encryption_config(&zone_id_local, &cm_handle.keychain, &MESSAGES_SERVICE)
+                .await
+            {
+                Ok(k) => k,
+                Err(e) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "cloud_sync_attachments: zone_key fetch failed on attempt {}/{}: {}",
+                        attempt_no, ATT_SYNC_RETRIES, e
+                    );
+                    last_perform_err = Some(format!("zone_key: {}", e));
+                    if attempt_no < ATT_SYNC_RETRIES {
+                        self.reset_cloud_client().await;
+                        cm_handle = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                    break;
+                }
+            };
+
+            let c = Arc::clone(&container);
+            let z = zone_id_local.clone();
+            let tok = token.clone();
+            let join = tokio::task::spawn(async move {
+                c.perform(
+                    &CloudKitSession::new(),
+                    FetchRecordChangesOperation::new(z, tok, &ALL_ASSETS),
+                )
+                .await
+            })
+            .await;
+            match join {
+                Ok(Ok(ok)) => {
+                    perform_result = Some(ok);
+                    container_holder = Some(container);
+                    zone_id_holder = Some(zone_id_local);
+                    zone_key_holder = Some(zone_key_local);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "cloud_sync_attachments: perform() returned error on attempt {}/{}: {}",
+                        attempt_no, ATT_SYNC_RETRIES, e
+                    );
+                    last_perform_err = Some(format!("{}", e));
+                    if attempt_no < ATT_SYNC_RETRIES {
+                        self.reset_cloud_client().await;
+                        cm_handle = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                }
+                Err(join_err) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "cloud_sync_attachments: perform() panicked on attempt {}/{} \
+                         (likely upstream omnisette/anisette panic); resetting cloud client and retrying with same token. panic={}",
+                        attempt_no, ATT_SYNC_RETRIES, join_err
+                    );
+                    last_perform_err = Some(format!("panic: {}", join_err));
+                    if attempt_no < ATT_SYNC_RETRIES {
+                        self.reset_cloud_client().await;
+                        cm_handle = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                }
+            }
+        }
+        let (_assets, response) = match perform_result {
+            Some(r) => r,
+            None => {
+                let err_msg = last_perform_err.unwrap_or_else(|| "unknown".into());
+                warn!(
+                    "cloud_sync_attachments: perform() failed after {} attempts ({}); returning empty done page to let caller skip",
+                    ATT_SYNC_RETRIES, err_msg
+                );
+                return Ok(WrappedCloudSyncAttachmentsPage {
+                    continuation_token: None,
+                    status: 0,
+                    done: true,
+                    attachments: vec![],
+                });
+            }
+        };
+        let container = container_holder.expect("container set on success");
+        let zone_id = zone_id_holder.expect("zone_id set on success");
+        let mut zone_key = zone_key_holder.expect("zone_key set on success");
+        let cloud_messages = cm_handle;
 
         let status = response.status();
         let next_token = response.sync_continuation_token().to_vec();
