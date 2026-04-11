@@ -3766,9 +3766,11 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
 
-	// When FileName is set, Body contains the caption text rather than the filename.
+	// Per MSC2530, when FileName is set and differs from Body, Body is the caption.
+	// Some clients duplicate the filename into Body (no real caption) — treating that
+	// as a caption would land in the iMessage subject field and show to iPhone users.
 	var caption *string
-	if msg.Content.FileName != "" && msg.Content.Body != "" {
+	if msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
 		caption = &msg.Content.Body
 	}
 
