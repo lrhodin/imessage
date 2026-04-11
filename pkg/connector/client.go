@@ -716,10 +716,10 @@ func (c *IMClient) migrateSmsSuffixPortals(log zerolog.Logger, ctx context.Conte
 // Uniffi converts Rust panics to Go panics (CALL_UNEXPECTED_ERROR); without
 // recovery here the whole process crashes instead of degrading gracefully.
 func safeRestoreTokenProvider(
-	config *rustpushgo.WrappedOSConfig,
-	conn *rustpushgo.WrappedAPSConnection,
+	config *rustpushgo.WrappedOsConfig,
+	conn *rustpushgo.WrappedApsConnection,
 	username, hashedPwHex, pet, spdBase64 string,
-) (tp rustpushgo.WrappedTokenProvider, err error) {
+) (tp *rustpushgo.WrappedTokenProvider, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("RestoreTokenProvider panicked: %v", r)
