@@ -45,13 +45,20 @@ fn relay_config() -> &'static Mutex<Option<RelayConfig>> {
 /// Install a NAC relay so subsequent `ValidationCtx::new()` calls route
 /// validation through the relay's 3-step endpoints instead of the local
 /// x86-64 emulator. Idempotent; overwriting with a fresh call is fine.
+///
+/// Hardware keys extracted by the baked-in `extract-key` app store the
+/// full single-shot URL (e.g. `https://host:5001/validation-data`).
+/// We strip the `/validation-data` suffix so the base URL is stored and
+/// `/nac/init` etc. are appended correctly by `relay_post_json`.
 pub fn set_relay_config(url: String, token: Option<String>, cert_fp: Option<String>) {
-    let cfg = RelayConfig { url, token, cert_fp };
+    let trimmed = url.trim_end_matches('/');
+    let base_url = trimmed.strip_suffix("/validation-data").unwrap_or(trimmed).to_string();
+    let cfg = RelayConfig { url: base_url, token, cert_fp };
     let mut slot = match relay_config().lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    info!("NAC relay configured: {}", cfg.url);
+    info!("NAC relay base URL: {}", cfg.url);
     *slot = Some(cfg);
 }
 
