@@ -2125,10 +2125,21 @@ func (c *IMClient) ingestCloudMessages(
 	// every attachment we actually have in attMap regardless of what the
 	// NSAttributedString parser could see.
 	attachmentsByMessage := make(map[string][]string, len(attMap))
+	// Case-insensitive companion index for attMap lookups. Rust's
+	// plist/serde decode preserves whatever casing Apple's backend wrote
+	// into `cm.aguid`, while extract_attachment_guids_from_attributed_body
+	// preserves whatever casing the NSAttributedString recorded. On some
+	// records these diverge (upper-case UUID in the message, lower-case in
+	// the attachment record, or vice versa), so a direct map lookup
+	// misses even though both sides refer to the same attachment. Keyed
+	// by strings.ToLower(aguid) → original aguid string used as attMap
+	// key, so the fallback below can resolve either casing.
+	attMapLowercased := make(map[string]string, len(attMap))
 	for attGUID := range attMap {
 		if !strings.HasPrefix(attGUID, "at_") {
 			continue
 		}
+		attMapLowercased[strings.ToLower(attGUID)] = attGUID
 		// Split at_<index>_<message_guid> by finding the second underscore.
 		rest := attGUID[len("at_"):]
 		underscore := strings.IndexByte(rest, '_')
@@ -2137,6 +2148,12 @@ func (c *IMClient) ingestCloudMessages(
 		}
 		msgGUID := rest[underscore+1:]
 		attachmentsByMessage[msgGUID] = append(attachmentsByMessage[msgGUID], attGUID)
+		// ALSO index by the lowercased msg_guid suffix so attributedBody
+		// parses that extract the UUID in the opposite case still hit.
+		msgGUIDLower := strings.ToLower(msgGUID)
+		if msgGUIDLower != msgGUID {
+			attachmentsByMessage[msgGUIDLower] = append(attachmentsByMessage[msgGUIDLower], attGUID)
+		}
 	}
 
 	batch := make([]cloudMessageRow, 0, len(liveMessages))
@@ -2289,11 +2306,40 @@ func (c *IMClient) ingestCloudMessages(
 				}
 			}
 
+			// Also probe attachmentsByMessage by the lowercased msg.Guid
+			// suffix. Fresh reverse-index entries created during the
+			// case-insensitive indexing pass above pick up aguids that
+			// differ from the message's casing.
+			msgGuidLower := strings.ToLower(msg.Guid)
+			if msgGuidLower != msg.Guid {
+				for _, g := range attachmentsByMessage[msgGuidLower] {
+					if _, ok := seen[g]; ok {
+						continue
+					}
+					seen[g] = struct{}{}
+					mergedGuids = append(mergedGuids, g)
+					log.Info().
+						Str("msg_guid", msg.Guid).
+						Str("att_guid", g).
+						Msg("Recovered attachment via case-insensitive aguid suffix match")
+				}
+			}
+
 			if len(mergedGuids) > 0 {
 				var attRows []cloudAttachmentRow
 				for _, guid := range mergedGuids {
 					if enriched, ok := attMap[guid]; ok {
 						attRows = append(attRows, enriched)
+					} else if origKey, ok := attMapLowercased[strings.ToLower(guid)]; ok {
+						// Case mismatch: the message's attributedBody has one
+						// casing, the attachment record has the other. Look up
+						// the actual attMap entry under its original key.
+						log.Info().
+							Str("msg_guid", msg.Guid).
+							Str("att_guid_from_message", guid).
+							Str("att_guid_in_attmap", origKey).
+							Msg("Recovered attachment via case-insensitive attMap lookup")
+						attRows = append(attRows, attMap[origKey])
 					} else {
 						log.Warn().Str("msg_guid", msg.Guid).Str("att_guid", guid).
 							Msg("Attachment GUID not found in attachment zone")
