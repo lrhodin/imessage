@@ -6860,7 +6860,6 @@ impl Client {
     ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
         use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, ALL_ASSETS};
         use rustpush::cloud_messages::MESSAGES_SERVICE;
-        use rustpush::cloudkit_proto::CloudKitRecord as _;
         use rustpush::PushError;
 
         let token = decode_continuation_token(continuation_token)?;
@@ -6896,11 +6895,14 @@ impl Client {
         // next sync cycle will retry the same page from DB state.
         const ATT_SYNC_RETRIES: usize = 4;
         let mut cm_handle = cloud_messages;
-        let mut perform_result: Option<(Vec<rustpush::cloudkit::AssetGetResponse>, rustpush::cloudkit_proto::retrieve_changes_response::RetrieveChangesResponse)> = None;
+        // All of these are populated on a successful perform() and consumed
+        // after the retry loop. Types are inferred from the first Some(...)
+        // assignment so we don't have to hard-code upstream's crate paths.
+        let mut perform_result = None;
         let mut last_perform_err: Option<String> = None;
-        let mut container_holder: Option<Arc<_>> = None;
-        let mut zone_id_holder: Option<rustpush::cloudkit_proto::RecordZoneIdentifier> = None;
-        let mut zone_key_holder: Option<rustpush::icloud::pcs::PCSZoneConfig> = None;
+        let mut container_holder = None;
+        let mut zone_id_holder = None;
+        let mut zone_key_holder = None;
         for attempt in 0..ATT_SYNC_RETRIES {
             // Re-fetch container + zone_key INSIDE the retry so a reset
             // cloud_messages_client picks up a fresh container, fresh keychain,
