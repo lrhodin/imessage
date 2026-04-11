@@ -49,15 +49,8 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
-      - name: Run tests with coverage
-        run: go test -v -count=1 -coverprofile=coverage-imessage.out ./imessage/...
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-imessage
-          path: coverage-imessage.out
-          retention-days: 7
+      - name: Run tests
+        run: go test -count=1 ./imessage/...
 
   # NOTE: pkg/connector/ tests require the Rust static library (librustpushgo.a)
   # and are run as part of the build jobs below (after `make build`).
@@ -121,23 +114,7 @@ jobs:
         env:
           CGO_CFLAGS: -I/opt/homebrew/include
           CGO_LDFLAGS: -L/opt/homebrew/lib
-        run: go test -v -count=1 -coverprofile=coverage-connector-macos.out ./pkg/connector/...
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-connector-macos
-          path: coverage-connector-macos.out
-          retention-days: 7
-
-      - name: Upload macOS app bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: mautrix-imessage-v2-macos-arm64
-          path: |
-            mautrix-imessage-v2.app/
-            bbctl
-          retention-days: 14
+        run: go test -count=1 ./pkg/connector/...
 
   build-linux:
     name: Build (Linux)
@@ -189,20 +166,4 @@ jobs:
         run: make build
 
       - name: Test pkg/connector/
-        run: go test -v -count=1 -coverprofile=coverage-connector-linux.out ./pkg/connector/...
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-connector-linux
-          path: coverage-connector-linux.out
-          retention-days: 7
-
-      - name: Upload Linux binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: mautrix-imessage-v2-linux
-          path: |
-            mautrix-imessage-v2
-            bbctl
-          retention-days: 14
+        run: go test -count=1 ./pkg/connector/...
