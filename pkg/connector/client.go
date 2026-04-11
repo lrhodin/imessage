@@ -5020,6 +5020,17 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			if hasMessages {
 				log.Info().Str("portal_id", portalID).
 					Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
+				// Sleep before returning HasMore=true so the bridgev2 backfill
+				// queue doesn't tight-loop on this task and steal scheduler
+				// time from forward backfill (which we're waiting on). Each
+				// tight-loop iteration was ~1s of pure no-op — with 30+
+				// deferred portals, that's 30+ CPU-seconds per second burned
+				// waiting for a state change that takes minutes to happen.
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(30 * time.Second):
+				}
 				return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
 			}
 			log.Info().Str("portal_id", portalID).

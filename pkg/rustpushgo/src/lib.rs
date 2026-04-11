@@ -6741,37 +6741,24 @@ impl Client {
             });
         }
 
-        // Cap brute-force retries. Each iteration is a full
-        // `container.get_assets` call which re-runs the MMCS fetch over
-        // HTTP (~200-500ms per attempt). Without a cap, 913 cached keys
-        // would take 3-8 minutes per failing record, making backfill
-        // take hours. MAX_RETRIES is tuned for typical dedup chain depth:
-        // Apple's MMCS dedup is chronologically local, so if the right
-        // key isn't in the first N tries (iterated recency-first), it's
-        // almost certainly not in the cache at all and more retries
-        // just burn bandwidth. Override via RUSTPUSHGO_FORD_RETRY_LIMIT
-        // if you need aggressive recovery.
-        const DEFAULT_MAX_RETRIES: usize = 20;
-        let max_retries: usize = std::env::var("RUSTPUSHGO_FORD_RETRY_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_MAX_RETRIES);
-
-        // Iterate in REVERSE (most recently registered keys first). Dedup
-        // targets tend to be recent because MMCS dedups blob content
-        // across a rolling window of uploads, so the correct key is
-        // usually from a record we saw recently.
+        // Try EVERY cached Ford key — that's the whole point of the
+        // cross-batch dedup cache. The correct key for a dedup'd blob
+        // might be from any earlier record on any device on the account,
+        // and we can't predict which one without trying. Iterate
+        // recency-first because Apple's MMCS dedup is chronologically
+        // local, so the correct key is most often from a record we saw
+        // recently — this makes the common case fast while still trying
+        // every key for deep dedup chains.
         let mut cached_keys = ford_key_cache_values();
         cached_keys.reverse();
         let total_cached = cached_keys.len();
-        let attempt_limit = max_retries.min(total_cached);
 
         info!(
-            "Ford recovery {}: trying up to {} keys (recency-first, out of {} cached)",
-            record_name, attempt_limit, total_cached
+            "Ford recovery {}: trying all {} cached keys (recency-first)",
+            record_name, total_cached
         );
 
-        for (idx, alt_key) in cached_keys.iter().take(attempt_limit).enumerate() {
+        for (idx, alt_key) in cached_keys.iter().enumerate() {
             let mut record = base_record.clone();
             if let Some(pi) = record.lqa.protection_info.as_mut() {
                 pi.protection_info = Some(alt_key.clone());
@@ -6792,7 +6779,7 @@ impl Client {
                         "Ford dedup recovery SUCCESS: record={} attempt={}/{} bytes={}",
                         record_name,
                         idx + 1,
-                        attempt_limit,
+                        total_cached,
                         bytes.len()
                     );
                     return Ok(bytes);
@@ -6807,13 +6794,13 @@ impl Client {
         }
 
         warn!(
-            "Ford dedup recovery FAILED: record={} tried={}/{} cached keys — giving up",
-            record_name, attempt_limit, total_cached
+            "Ford dedup recovery FAILED: record={} tried={} all cached keys exhausted",
+            record_name, total_cached
         );
         Err(WrappedError::GenericError {
             msg: format!(
-                "Ford dedup recovery for {}: {}/{} cached keys failed SIV decrypt (retry cap)",
-                record_name, attempt_limit, total_cached
+                "Ford dedup recovery for {}: all {} cached keys failed SIV decrypt",
+                record_name, total_cached
             ),
         })
     }
