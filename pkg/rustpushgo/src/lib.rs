@@ -6959,9 +6959,21 @@ impl Client {
             let z = zone_id_local.clone();
             let tok = token.clone();
             let join = tokio::task::spawn(async move {
+                // Construct request directly (not via ::new helper) so we can set
+                // newest_first: Some(true), matching master's sync_records path.
+                // The ::new helper hard-codes newest_first: Some(false), which
+                // causes the CloudKit server to return a different (incomplete)
+                // record set — empirically 4 records are omitted when false.
                 c.perform(
                     &CloudKitSession::new(),
-                    FetchRecordChangesOperation::new(z, tok, &NO_ASSETS),
+                    FetchRecordChangesOperation(rustpush::cloudkit_proto::RetrieveChangesRequest {
+                        sync_continuation_token: tok,
+                        zone_identifier: Some(z),
+                        requested_changes_types: Some(3),
+                        assets_to_download: Some(NO_ASSETS.clone()),
+                        newest_first: Some(true),
+                        ..Default::default()
+                    }),
                 )
                 .await
             })
@@ -7215,6 +7227,7 @@ impl Client {
                     None
                 }
                 Ok(Err(e)) => {
+                    pcs_skipped += 1;
                     warn!("cloud_sync_attachments: unexpected PCS error for {}: {}", identifier, e);
                     None
                 }
