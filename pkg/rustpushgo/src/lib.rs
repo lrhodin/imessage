@@ -6938,7 +6938,7 @@ impl Client {
                 }
             };
             if record.r#type.as_ref().and_then(|t| t.name.as_deref())
-                != Some(CloudAttachmentWithAvid::record_type())
+                != Some(<rustpush::cloud_messages::CloudAttachment as rustpush::cloudkit_proto::CloudKitRecord>::record_type())
             {
                 wrong_type += 1;
                 continue;
@@ -7011,9 +7011,17 @@ impl Client {
                 None => continue,
             };
 
-            let att: CloudAttachmentWithAvid = match std::panic::catch_unwind(
+            // Use upstream's CloudAttachment (cm + lqa only) — same struct and
+            // same decode path that master uses via sync_records_with_assets.
+            // CloudAttachmentWithAvid (cm + lqa + avid) was the sync struct
+            // before this; something about the avid field on the local derive
+            // was silently dropping records from the result. Avid (Live Photo
+            // MOV companion) detection is re-derived below by scanning the raw
+            // record_field for a field literally named "avid" and extracting
+            // its asset value — no dependency on a local CloudKitRecord derive.
+            let att: rustpush::cloud_messages::CloudAttachment = match std::panic::catch_unwind(
                 std::panic::AssertUnwindSafe(|| {
-                    CloudAttachmentWithAvid::from_record_encrypted(&record.record_field, Some(&pcskey))
+                    <rustpush::cloud_messages::CloudAttachment as rustpush::cloudkit_proto::CloudKitRecord>::from_record_encrypted(&record.record_field, Some(&pcskey))
                 }),
             ) {
                 Ok(parsed) => parsed,
@@ -7026,16 +7034,37 @@ impl Client {
                 }
             };
 
-            let has_avid = att.avid.size.unwrap_or(0) > 0;
+            // Manually look up the "avid" field in the raw record_field slice.
+            // This field is an encrypted Asset (Live Photo MOV companion) and
+            // is only present on Live Photo attachments. Records without an
+            // avid field produce None, which is the correct behavior — and it
+            // cannot silently corrupt the decode of `cm` or `lqa`.
+            let avid_asset = record
+                .record_field
+                .iter()
+                .find(|f| {
+                    f.identifier
+                        .as_ref()
+                        .and_then(|i| i.name.as_deref())
+                        == Some("avid")
+                })
+                .and_then(|f| f.value.as_ref())
+                .and_then(|v| {
+                    <rustpush::cloudkit_proto::Asset as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "avid")
+                });
+            let has_avid = avid_asset
+                .as_ref()
+                .and_then(|a| a.size)
+                .unwrap_or(0)
+                > 0;
+            let avid_ford_key = avid_asset
+                .as_ref()
+                .and_then(|a| a.protection_info.as_ref())
+                .and_then(|p| p.protection_info.as_ref())
+                .cloned();
 
             let ford_key = att
                 .lqa
-                .protection_info
-                .as_ref()
-                .and_then(|p| p.protection_info.as_ref())
-                .cloned();
-            let avid_ford_key = att
-                .avid
                 .protection_info
                 .as_ref()
                 .and_then(|p| p.protection_info.as_ref())
