@@ -6381,6 +6381,17 @@ impl Client {
         // loop, so it naturally only fired on real Ford failures. The
         // wrapper has to do this check explicitly.
         let is_ford_asset = is_ford_encrypted_asset(&records.assets, &record.lqa);
+        // Diagnostic log so we can verify from logs that only Ford-encrypted
+        // records are entering the recovery path. If this ever shows
+        // is_ford=false for a record that still panics through Ford
+        // recovery, something's wrong with the gating.
+        info!(
+            "cloud_download_attachment {}: is_ford={} mime={:?} filename={:?}",
+            record_name,
+            is_ford_asset,
+            record.cm.0.mime_type.as_deref().unwrap_or("<none>"),
+            record.cm.0.transfer_name.as_deref().or(record.cm.0.filename.as_deref()).unwrap_or("<none>")
+        );
 
         // Attempt 1 — get_assets with the record's own lqa, wrapped in
         // catch_unwind so a panic doesn't take down the bridge.
