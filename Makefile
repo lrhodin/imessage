@@ -205,7 +205,12 @@ ensure-rustpush-source:
 		fi; \
 	fi
 
-$(RUST_LIB): ensure-rustpush-source $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES)
+# `ensure-rustpush-source` is an order-only prereq (the `|` separator):
+# it runs before the recipe when needed, but its phony "always-dirty"
+# timestamp doesn't force $(RUST_LIB) to rebuild on every `make` invocation.
+# Only actual Rust source changes / Cargo.toml changes should trigger a
+# rebuild; the pinned SHA + submodule setup is idempotent once done.
+$(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES) | ensure-rustpush-source
 	cd pkg/rustpushgo && $(CARGO_ENV) cargo build --release $(CARGO_FEATURES)
 	cp pkg/rustpushgo/target/release/librustpushgo.a .
 
