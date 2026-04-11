@@ -939,6 +939,13 @@ enum ValidationCtxInner {
         // used from a single task — the `unsafe impl Send` below mirrors
         // that invariant.
         ctx: UnsafeCell<nac_validation::NacContext>,
+        /// Pre-computed result from the one-shot `generate_validation_data()`.
+        /// When Some, `sign()` returns this directly — the one-shot already
+        /// completed the full NACInit → POST → NACKeyEstablishment → NACSign
+        /// sequence internally. The 3-step `ctx` is still driven for the
+        /// upstream HTTP flow (so MacOSConfig's POST succeeds), but its
+        /// NACSign result is discarded in favour of this authoritative bytes.
+        final_data: Option<Vec<u8>>,
     },
     /// Relay mode: NAC flows through a 3-step HTTPS protocol against a
     /// `tools/nac-relay` server running on a real Mac. Used when the
@@ -1008,35 +1015,58 @@ impl ValidationCtx {
         // unicorn emulator is entirely skipped; hardware `_enc` fields are
         // irrelevant because Apple's native framework reads real hardware
         // identifiers from IOKit itself.
+        //
+        // Strategy: try the one-shot first. It runs the full protocol
+        // internally (fetch cert → NACInit → POST → NACKeyEstablishment →
+        // NACSign) and is the most reliable path. We then ALSO run
+        // NacContext::init to get valid NACInit request bytes for the
+        // upstream MacOSConfig HTTP flow (POST to id-initialize-validation).
+        // sign() returns the pre-computed one-shot result, making the
+        // 3-step ctx's NACSign call unnecessary.
+        //
+        // If the one-shot fails (rare), we fall back to using the 3-step
+        // ctx result from NACSign — same behaviour as before.
         // ====================================================================
         #[cfg(all(target_os = "macos", feature = "native-nac"))]
         {
             info!(
-                "NAC init (native path): delegating to nac-validation \
-                 (AAAbsintheContext via AppleAccount.framework) — \
-                 emulator bypass, hw_config _enc fields ignored"
+                "NAC native path: attempting one-shot via \
+                 nac_validation::generate_validation_data() …"
             );
+            let one_shot_result = match nac_validation::generate_validation_data() {
+                Ok(data) => {
+                    info!(
+                        "NAC one-shot succeeded: {} bytes (will use as final result)",
+                        data.len()
+                    );
+                    Some(data)
+                }
+                Err(e) => {
+                    warn!(
+                        "NAC one-shot failed (will fall back to 3-step result): {}",
+                        e
+                    );
+                    None
+                }
+            };
+
             match nac_validation::NacContext::init(cert_chain) {
                 Ok((ctx, request_bytes)) => {
                     info!(
-                        "NAC native path: NACInit produced {} request bytes",
+                        "NAC native path: NacContext::init produced {} request bytes",
                         request_bytes.len()
                     );
-                    // Hand the real request bytes back so upstream
-                    // MacOSConfig::generate_validation_data can POST them to
-                    // Apple's id-initialize-validation endpoint. Apple's
-                    // session-info response will come back to us through
-                    // key_establishment() below.
                     *out_request_bytes = request_bytes;
                     return Ok(ValidationCtx {
                         inner: ValidationCtxInner::Native {
                             ctx: UnsafeCell::new(ctx),
+                            final_data: one_shot_result,
                         },
                     });
                 }
                 Err(e) => {
                     warn!(
-                        "NAC native path failed, falling back to emulator: {}",
+                        "NAC native path: NacContext::init failed, falling back to emulator: {}",
                         e
                     );
                     // Fall through to emulator path below.
@@ -1203,11 +1233,13 @@ impl ValidationCtx {
                 Ok(())
             }
             #[cfg(all(target_os = "macos", feature = "native-nac"))]
-            ValidationCtxInner::Native { ctx } => {
+            ValidationCtxInner::Native { ctx, .. } => {
                 debug!(
                     "NAC key_establishment: native path, {} bytes -> AAAbsintheContext",
                     response.len()
                 );
+                // Drive key_establishment on ctx so it reaches a valid state
+                // (needed in case the 3-step NACSign path is used as fallback).
                 // Safety: single-task use; see ValidationCtx struct doc.
                 let ctx = unsafe { &mut *ctx.get() };
                 ctx.key_establishment(response)
@@ -1253,14 +1285,24 @@ impl ValidationCtx {
                 return Ok(bytes);
             }
             #[cfg(all(target_os = "macos", feature = "native-nac"))]
-            ValidationCtxInner::Native { ctx } => {
+            ValidationCtxInner::Native { ctx, final_data } => {
+                // If the one-shot pre-computed the result, return it directly —
+                // it already ran the full NACInit→POST→KeyEst→Sign sequence
+                // internally and is more reliable than the 3-step path.
+                if let Some(data) = final_data {
+                    debug!(
+                        "NAC sign: returning pre-computed one-shot result ({} bytes)",
+                        data.len()
+                    );
+                    return Ok(data.clone());
+                }
+                // No pre-computed data — use the 3-step NACSign result.
                 // Safety: single-task use; see ValidationCtx struct doc.
-                // UnsafeCell makes the aliasing valid for raw-pointer access.
                 let ctx = unsafe { &mut *ctx.get() };
                 let bytes = ctx
                     .sign()
                     .map_err(|e| AbsintheError::Other(format!("NACSign: {e}")))?;
-                debug!("NAC sign: native path produced {} bytes", bytes.len());
+                debug!("NAC sign: native 3-step path produced {} bytes", bytes.len());
                 return Ok(bytes);
             }
             ValidationCtxInner::Emulator { uc, state, validation_ctx_addr } => {
