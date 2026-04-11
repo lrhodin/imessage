@@ -2320,6 +2320,13 @@ fn extract_attachment_guids_from_summary_info(data: &[u8]) -> Vec<String> {
     if let Some(plist::Value::Array(ams)) = dict.get("ams") {
         for entry in ams {
             if let Some(entry_dict) = entry.as_dictionary() {
+                // Log all keys so we can discover fields like "rn" (record name).
+                // This is a one-time diagnostic — remove once ams schema is confirmed.
+                let keys: Vec<&str> = entry_dict.keys().map(|k| k.as_str()).collect();
+                info!("messageSummaryInfo ams entry keys={:?} values={:?}",
+                    keys,
+                    keys.iter().map(|k| format!("{:?}", entry_dict.get(*k))).collect::<Vec<_>>()
+                );
                 // "g" = attachment GUID (file transfer GUID)
                 if let Some(plist::Value::String(guid)) = entry_dict.get("g") {
                     if !guid.is_empty() {
