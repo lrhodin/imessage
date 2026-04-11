@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -2103,6 +2104,41 @@ func (c *IMClient) ingestCloudMessages(
 		return fmt.Errorf("batch existence check failed: %w", err)
 	}
 
+	// Reverse index: message_guid -> []attachment_guid, derived from attMap.
+	//
+	// CloudAttachment.AttachmentMeta.guid (aguid) is always shaped
+	// `at_<index>_<MESSAGE_GUID>` (see upstream rustpush
+	// imessage/cloud_messages.rs:445, serde rename "aguid"), so we can
+	// recover which message owns an attachment purely from the attachment
+	// record's own metadata, without relying on the parent message's
+	// attributedBody parse.
+	//
+	// This is the load-bearing fix for a class of silently-dropped
+	// attachments: when the wrapper's extract_attachment_guids_from_attributed_body
+	// returns [] (either because the body is in a format the
+	// NSAttributedString decoder doesn't understand, or because
+	// coder_decode_flattened panicked and got swallowed by catch_unwind),
+	// the pre-fix code path skipped the entire enrichment block below and
+	// wrote `attachments_json=""` into the DB — resulting in a Matrix event
+	// with just a space character where an image should have been. By
+	// merging in any attachments the aguid-suffix lookup finds, we recover
+	// every attachment we actually have in attMap regardless of what the
+	// NSAttributedString parser could see.
+	attachmentsByMessage := make(map[string][]string, len(attMap))
+	for attGUID := range attMap {
+		if !strings.HasPrefix(attGUID, "at_") {
+			continue
+		}
+		// Split at_<index>_<message_guid> by finding the second underscore.
+		rest := attGUID[len("at_"):]
+		underscore := strings.IndexByte(rest, '_')
+		if underscore <= 0 || underscore == len(rest)-1 {
+			continue
+		}
+		msgGUID := rest[underscore+1:]
+		attachmentsByMessage[msgGUID] = append(attachmentsByMessage[msgGUID], attGUID)
+	}
+
 	batch := make([]cloudMessageRow, 0, len(liveMessages))
 	for _, msg := range liveMessages {
 		if msg.Guid == "" {
@@ -2205,23 +2241,68 @@ func (c *IMClient) ingestCloudMessages(
 		}
 
 		// Enrich and serialize attachment metadata.
+		//
+		// Merge two sources of attachment GUIDs so we don't silently drop
+		// any attachment the account actually has:
+		//   1. msg.AttachmentGuids — from the wrapper's NSAttributedString
+		//      parse of the message proto's attributedBody. Authoritative
+		//      for ORDER and may include guids for which the attachment
+		//      record itself didn't sync (e.g. inline/tiny blobs).
+		//   2. attachmentsByMessage[msg.Guid] — from the attachment zone's
+		//      own aguid field (`at_<N>_<msg.Guid>`). Load-bearing fallback
+		//      for messages where the attributedBody parse returned []:
+		//      without this, those messages ship to Matrix as an empty
+		//      " " text event and the attachment is silently lost.
+		//
+		// Dedup by guid, preserving attributedBody order first.
 		attachmentsJSON := ""
-		if len(msg.AttachmentGuids) > 0 && attMap != nil {
-			var attRows []cloudAttachmentRow
-			for _, guid := range msg.AttachmentGuids {
-				if guid == "" {
+		if attMap != nil {
+			seen := make(map[string]struct{}, len(msg.AttachmentGuids)+4)
+			mergedGuids := make([]string, 0, len(msg.AttachmentGuids)+4)
+			for _, g := range msg.AttachmentGuids {
+				if g == "" {
 					continue
 				}
-				if enriched, ok := attMap[guid]; ok {
-					attRows = append(attRows, enriched)
-				} else {
-					log.Warn().Str("msg_guid", msg.Guid).Str("att_guid", guid).
-						Msg("Attachment GUID not found in attachment zone")
+				if _, ok := seen[g]; ok {
+					continue
+				}
+				seen[g] = struct{}{}
+				mergedGuids = append(mergedGuids, g)
+			}
+			fallback := attachmentsByMessage[msg.Guid]
+			if len(fallback) > 0 {
+				// Deterministic order for the fallback set — sorting by
+				// the aguid string (which starts with `at_<index>_`) keeps
+				// the original attachment order for messages that have
+				// more than one attachment.
+				sort.Strings(fallback)
+				for _, g := range fallback {
+					if _, ok := seen[g]; ok {
+						continue
+					}
+					seen[g] = struct{}{}
+					mergedGuids = append(mergedGuids, g)
+					log.Info().
+						Str("msg_guid", msg.Guid).
+						Str("att_guid", g).
+						Msg("Recovered attachment via aguid suffix match (attributedBody parse missed it)")
 				}
 			}
-			if len(attRows) > 0 {
-				if attJSON, jsonErr := json.Marshal(attRows); jsonErr == nil {
-					attachmentsJSON = string(attJSON)
+
+			if len(mergedGuids) > 0 {
+				var attRows []cloudAttachmentRow
+				for _, guid := range mergedGuids {
+					if enriched, ok := attMap[guid]; ok {
+						attRows = append(attRows, enriched)
+					} else {
+						log.Warn().Str("msg_guid", msg.Guid).Str("att_guid", guid).
+							Msg("Attachment GUID not found in attachment zone")
+					}
+				}
+				if len(attRows) > 0 {
+					if attJSON, jsonErr := json.Marshal(attRows); jsonErr == nil {
+						attachmentsJSON = string(attJSON)
+					}
 				}
 			}
 		}
