@@ -1,4 +1,7 @@
 fn main() {
+    println!("cargo:rerun-if-changed=src/validation_data.m");
+    println!("cargo:rerun-if-changed=src/validation_data.h");
+
     // Compile the Objective-C file
     cc::Build::new()
         .file("src/validation_data.m")

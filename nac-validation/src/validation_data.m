@@ -399,6 +399,223 @@ int nac_generate_validation_data(uint8_t **out_buf, size_t *out_len, char **out_
     }
 }
 
+// ============================================================================
+// 3-step NAC API — exposes NACInit/NACKeyEstablishment/NACSign as individual
+// C functions so callers can drive the HTTP session-info roundtrip themselves.
+//
+// This is what `rustpush::macos::MacOSConfig::generate_validation_data` needs:
+// it owns the cert fetch and the id-initialize-validation POST, and expects
+// a ValidationCtx that exposes new(cert) → request bytes, key_establishment,
+// and sign() as distinct steps. The 3-step API lets `open-absinthe`'s
+// ValidationCtx delegate each step directly to `AAAbsintheContext`, producing
+// Local NAC validation data through upstream's existing HTTP flow — no
+// patching of rustpush, no double-POST to Apple, no stub request bytes.
+// ============================================================================
+
+/**
+ * Opaque handle that keeps an initialized `AAAbsintheContext` alive across
+ * the three NAC steps. Stored as CFBridgingRetain to survive outside ARC.
+ */
+typedef struct {
+    void *ctx;            // __bridge_retained AAAbsintheContext *
+    SEL initSel;
+    SEL keyEstabSel;
+    SEL signSel;
+} NacContext;
+
+/**
+ * Step 1: NACInit.
+ * Loads AppleAccount.framework, creates AAAbsintheContext, discovers the
+ * three NAC selectors, and calls NACInit(cert) to produce the session-info
+ * request bytes. The caller POSTs those bytes to Apple's
+ * id-initialize-validation endpoint.
+ *
+ * @param cert_buf         cert bytes (from id-validation-cert)
+ * @param cert_len         length of cert_buf
+ * @param out_handle       receives opaque context handle (free via nac_ctx_free)
+ * @param out_request_buf  receives request bytes (caller must free())
+ * @param out_request_len  receives length of request bytes
+ * @param out_err_buf      receives error message on failure (caller must free())
+ * @return 0 on success, non-zero on failure
+ */
+int nac_ctx_init(
+    const uint8_t *cert_buf,
+    size_t cert_len,
+    void **out_handle,
+    uint8_t **out_request_buf,
+    size_t *out_request_len,
+    char **out_err_buf
+) {
+    @autoreleasepool {
+        if (out_handle) *out_handle = NULL;
+        if (out_request_buf) *out_request_buf = NULL;
+        if (out_request_len) *out_request_len = 0;
+        if (out_err_buf) *out_err_buf = NULL;
+
+        void *handle = dlopen("/System/Library/PrivateFrameworks/AppleAccount.framework/AppleAccount", RTLD_NOW);
+        if (!handle) {
+            if (out_err_buf) *out_err_buf = strdup("Failed to load AppleAccount.framework");
+            return 1;
+        }
+
+        Class ctxClass = NSClassFromString(@"AAAbsintheContext");
+        if (!ctxClass) {
+            if (out_err_buf) *out_err_buf = strdup("AAAbsintheContext class not found");
+            return 4;
+        }
+
+        NSData *certData = [NSData dataWithBytes:cert_buf length:cert_len];
+
+        NACSelectors sels = {0};
+        NSError *selErr = nil;
+        int discoverResult = discover_nac_selectors(ctxClass, certData, &sels, &selErr);
+        if (discoverResult != 0) {
+            if (out_err_buf) {
+                const char *msg = selErr ? [[selErr localizedDescription] UTF8String] : "selector discovery failed";
+                *out_err_buf = strdup(msg ? msg : "selector discovery failed");
+            }
+            return discoverResult;
+        }
+
+        id ctx = [[ctxClass alloc] init];
+        NSError *nacError = nil;
+        NSData *requestBytes = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(
+            ctx, sels.initSel, certData, &nacError);
+
+        if (!requestBytes) {
+            if (out_err_buf) {
+                const char *msg = nacError ? [[nacError localizedDescription] UTF8String] : "NACInit returned nil";
+                *out_err_buf = strdup(msg ? msg : "NACInit returned nil");
+            }
+            return 5;
+        }
+
+        NacContext *nacCtx = (NacContext *)malloc(sizeof(NacContext));
+        if (!nacCtx) {
+            if (out_err_buf) *out_err_buf = strdup("Failed to allocate NacContext");
+            return 40;
+        }
+        // Transfer ownership of ctx out of ARC so the context survives until nac_ctx_free.
+        nacCtx->ctx = (void *)CFBridgingRetain(ctx);
+        nacCtx->initSel = sels.initSel;
+        nacCtx->keyEstabSel = sels.keyEstabSel;
+        nacCtx->signSel = sels.signSel;
+
+        NSUInteger reqLen = [requestBytes length];
+        uint8_t *reqBuf = (uint8_t *)malloc(reqLen);
+        if (!reqBuf) {
+            CFBridgingRelease(nacCtx->ctx);
+            free(nacCtx);
+            if (out_err_buf) *out_err_buf = strdup("Failed to allocate request buffer");
+            return 41;
+        }
+        memcpy(reqBuf, [requestBytes bytes], reqLen);
+
+        *out_handle = (void *)nacCtx;
+        *out_request_buf = reqBuf;
+        *out_request_len = reqLen;
+        return 0;
+    }
+}
+
+/**
+ * Step 2: NACKeyEstablishment.
+ * Feeds Apple's session-info response into the AAAbsintheContext.
+ */
+int nac_ctx_key_establishment(
+    void *handle,
+    const uint8_t *session_info_buf,
+    size_t session_info_len,
+    char **out_err_buf
+) {
+    @autoreleasepool {
+        if (out_err_buf) *out_err_buf = NULL;
+        if (!handle) {
+            if (out_err_buf) *out_err_buf = strdup("NULL NAC context handle");
+            return 50;
+        }
+        NacContext *nacCtx = (NacContext *)handle;
+        id ctx = (__bridge id)(nacCtx->ctx);
+        NSData *sessionInfo = [NSData dataWithBytes:session_info_buf length:session_info_len];
+
+        NSError *nacError = nil;
+        BOOL keyResult = ((BOOL(*)(id, SEL, id, NSError **))objc_msgSend)(
+            ctx, nacCtx->keyEstabSel, sessionInfo, &nacError);
+
+        if (!keyResult) {
+            if (out_err_buf) {
+                const char *msg = nacError ? [[nacError localizedDescription] UTF8String] : "NACKeyEstablishment failed";
+                *out_err_buf = strdup(msg ? msg : "NACKeyEstablishment failed");
+            }
+            return 10;
+        }
+        return 0;
+    }
+}
+
+/**
+ * Step 3: NACSign.
+ * Produces the final validation data bytes from the established context.
+ */
+int nac_ctx_sign(
+    void *handle,
+    uint8_t **out_buf,
+    size_t *out_len,
+    char **out_err_buf
+) {
+    @autoreleasepool {
+        if (out_buf) *out_buf = NULL;
+        if (out_len) *out_len = 0;
+        if (out_err_buf) *out_err_buf = NULL;
+
+        if (!handle) {
+            if (out_err_buf) *out_err_buf = strdup("NULL NAC context handle");
+            return 50;
+        }
+        NacContext *nacCtx = (NacContext *)handle;
+        id ctx = (__bridge id)(nacCtx->ctx);
+
+        NSError *nacError = nil;
+        NSData *validationData = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(
+            ctx, nacCtx->signSel, nil, &nacError);
+
+        if (!validationData || ![validationData isKindOfClass:[NSData class]]) {
+            if (out_err_buf) {
+                const char *msg = nacError ? [[nacError localizedDescription] UTF8String] : "NACSign failed or returned non-data";
+                *out_err_buf = strdup(msg ? msg : "NACSign failed or returned non-data");
+            }
+            return 11;
+        }
+
+        NSUInteger len = [validationData length];
+        uint8_t *buf = (uint8_t *)malloc(len);
+        if (!buf) {
+            if (out_err_buf) *out_err_buf = strdup("Failed to allocate validation buffer");
+            return 42;
+        }
+        memcpy(buf, [validationData bytes], len);
+        *out_buf = buf;
+        *out_len = len;
+        return 0;
+    }
+}
+
+/**
+ * Release the NAC context handle. Safe to call with NULL.
+ */
+void nac_ctx_free(void *handle) {
+    if (!handle) return;
+    NacContext *nacCtx = (NacContext *)handle;
+    if (nacCtx->ctx) {
+        // CFBridgingRelease converts back to an ARC-managed reference; the
+        // temporary then goes out of scope and the AAAbsintheContext dealloc
+        // fires. The cast-to-void silences the unused-value warning.
+        (void)CFBridgingRelease(nacCtx->ctx);
+        nacCtx->ctx = NULL;
+    }
+    free(nacCtx);
+}
+
 // ---- CLI entry point (excluded when building as a library) ----
 
 #ifndef NAC_NO_MAIN
