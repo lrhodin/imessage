@@ -52,6 +52,19 @@ libc = "0.2"
 # gating check — match upstream's version so cargo feature unification
 # resolves cleanly (upstream uses 0.12).
 prost = "0.12"
+# Crypto deps for the manual Ford download path that implements V1+V2
+# Ford decryption at the wrapper layer. Upstream rustpush's `get_mmcs`
+# only supports V1 Ford and panics on V2 records (`chunks.item.expect`
+# at mmcs.rs:1117), so the wrapper has to perform the download itself
+# for Ford-encrypted assets. Versions match upstream rustpush exactly so
+# cargo feature unification doesn't double up crates.
+aes-siv = "0.7.0"
+hkdf = "0.12.4"
+aes = "0.8.4"
+ctr = "0.9.2"
+openssl = { version = "0.10.56", features = ["vendored"] }
+reqwest = { version = "0.11", features = ["stream", "rustls-tls", "rustls-tls-webpki-roots", "gzip", "native-tls-vendored"] }
+once_cell = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 icloud_auth = { path = "../../third_party/rustpush-upstream/apple-private-apis/icloud-auth", default-features = false }

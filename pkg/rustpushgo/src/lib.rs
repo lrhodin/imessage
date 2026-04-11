@@ -175,6 +175,578 @@ fn is_ford_encrypted_asset(
 }
 
 // ============================================================================
+// Manual Ford download (V1 + V2 support — zero-patch workaround for upstream)
+// ============================================================================
+//
+// Upstream rustpush's `get_mmcs` supports V1 Ford (`FordItem` with a flat
+// `chunks: Vec<FordChunkItem>`) only. When Apple's CloudKit serves a
+// V2 Ford blob (`FordItemV2` with grouped chunks) — which master's fork
+// supports via an extended proto — upstream panics unconditionally at
+// `chunks.item.expect("Ford chunks missing?")` (mmcs.rs:1117). The panic
+// is post-SIV, so no amount of key brute-forcing in the wrapper can
+// recover: upstream crashes before it ever tries to extract per-chunk
+// keys.
+//
+// This module reimplements the Ford download path entirely at the
+// wrapper layer using upstream's public primitives:
+//   - `rustpush::mmcsp::AuthorizeGetResponse` (the proto bytes we get
+//     back from the CloudKit AssetGetResponse body)
+//   - `rustpush::mmcs::transfer_mmcs_container` (the public HTTP fetch)
+//   - local prost types for `LocalFordChunk` that understand BOTH V1
+//     and V2 layouts (fields 1 and 2 of the wire format)
+//   - manual SIV decrypt loop (HKDF + CmacSiv) over every cached Ford
+//     key, because the dedup case means the record's OWN key isn't
+//     necessarily the right one
+//   - manual V2 chunk decrypt (AES-256-CTR + HKDF + HMAC verify)
+//   - manual V1 chunk decrypt (AES-128-CFB)
+//
+// The control flow is: upstream's `container.get_assets` is still the
+// happy path (fast, no panic on V1 correct-key records). Only when that
+// panics or errors do we fall through to `manual_ford_download_asset`.
+// That function handles dedup, V2 Ford, V1 Ford, AND plain V1 chunks
+// all via the same code path, so recovery is a superset of upstream's
+// capabilities.
+
+mod manual_ford {
+    use super::*;
+    use aes_siv::{siv::CmacSiv, KeyInit};
+    use aes::Aes256;
+    use hkdf::Hkdf;
+    use once_cell::sync::Lazy;
+    use openssl::{
+        hash::MessageDigest,
+        pkey::PKey,
+        sign::Signer,
+        symm::{decrypt as openssl_decrypt, Cipher},
+    };
+    use prost::Message;
+    use sha2::{Digest as Sha2Digest, Sha256};
+    use std::sync::Mutex;
+
+    /// Shared reqwest client for HTTP container fetches. We can't use
+    /// upstream's private `REQWEST` static, so we maintain our own.
+    pub(super) static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+        reqwest::Client::builder()
+            .gzip(true)
+            .timeout(Duration::from_secs(120))
+            .build()
+            .expect("reqwest client build")
+    });
+
+    /// Local FordChunk message. Upstream's `mmcsp::FordChunk` only has
+    /// field 1 (`item: FordItem`) because upstream's proto doesn't know
+    /// about V2. We decode the same bytes through this local type to get
+    /// access to the V2 `item_v2` field (tag 2), which carries chunks
+    /// grouped by size with multiple keys per group.
+    ///
+    /// Since prost decoders skip unknown fields by default, decoding the
+    /// same wire bytes through either type works regardless of which
+    /// version the server actually sent. Presence of `item`/`item_v2`
+    /// tells us which layout we got.
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordChunk {
+        #[prost(message, optional, tag = "1")]
+        pub item: Option<LocalFordItem>,
+        #[prost(message, optional, tag = "2")]
+        pub item_v2: Option<LocalFordItemV2>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordItem {
+        #[prost(message, repeated, tag = "1")]
+        pub chunks: Vec<LocalFordChunkItem>,
+        #[prost(bytes = "vec", tag = "2")]
+        pub checksum: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordChunkItem {
+        #[prost(bytes = "vec", tag = "1")]
+        pub key: Vec<u8>,
+        #[prost(bytes = "vec", tag = "2")]
+        pub chunk_len: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordItemV2 {
+        #[prost(bytes = "vec", tag = "1")]
+        pub checksum: Vec<u8>,
+        #[prost(message, repeated, tag = "2")]
+        pub chunks: Vec<LocalFordChunkGroup>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordChunkGroup {
+        #[prost(bytes = "vec", tag = "1")]
+        pub chunk_len: Vec<u8>,
+        #[prost(message, repeated, tag = "2")]
+        pub keys: Vec<LocalFordKeyWrapper>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordKeyWrapper {
+        #[prost(bytes = "vec", tag = "1")]
+        pub key: Vec<u8>,
+    }
+
+    /// Flatten a LocalFordChunk (V1 or V2) into a sequence of
+    /// `(ford_key, chunk_len_bytes)` pairs, one per data chunk, in the
+    /// same order as the file's `wanted_chunks.chunk_references`.
+    pub(super) fn flatten_ford_entries(chunk: LocalFordChunk) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        if let Some(item) = chunk.item {
+            Some(item.chunks.into_iter().map(|c| (c.key, c.chunk_len)).collect())
+        } else if let Some(item_v2) = chunk.item_v2 {
+            let mut out = Vec::new();
+            for group in item_v2.chunks {
+                let chunk_len = group.chunk_len.clone();
+                for kw in group.keys {
+                    out.push((kw.key, chunk_len.clone()));
+                }
+            }
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Attempt a single SIV decrypt with the given key over the given
+    /// Ford blob. Returns None on failure (wrong key). Matches master's
+    /// `try_ford_siv` exactly: HKDF("PCSMMCS2", key) → expand 64 bytes →
+    /// CmacSiv::decrypt with headers [iv, version_byte].
+    pub(super) fn try_ford_siv(key: &[u8], ford_blob: &[u8]) -> Option<Vec<u8>> {
+        if ford_blob.len() < 17 {
+            return None;
+        }
+        let hk = Hkdf::<Sha256>::new(Some(b"PCSMMCS2"), key);
+        let mut result = [0u8; 64];
+        if hk.expand(&[], &mut result).is_err() {
+            return None;
+        }
+        let cipher = match CmacSiv::<Aes256>::new_from_slice(&result) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+        // Wrap in catch_unwind — CmacSiv's decrypt has been observed to
+        // panic on malformed blobs in some aes-siv versions. Defensive.
+        let blob = ford_blob.to_vec();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut cipher = cipher;
+            cipher
+                .decrypt::<&[&[u8]], &&[u8]>(&[&blob[1..17], &blob[..1]], &blob[17..])
+                .ok()
+        }));
+        match res {
+            Ok(Some(plaintext)) => Some(plaintext),
+            _ => None,
+        }
+    }
+
+    /// Try every cached Ford key against the blob. The correct key for a
+    /// dedup'd upload is often from a DIFFERENT record than the one we're
+    /// currently downloading, so "trying the record's own key" is never
+    /// enough. Recency-first ordering makes the happy case (dedup with
+    /// recently-seen source) fast.
+    pub(super) fn ford_siv_retry(
+        record_own_key: &[u8],
+        ford_checksum: &[u8],
+        ford_blob: &[u8],
+        record_name: &str,
+    ) -> Option<Vec<u8>> {
+        // 1. The record's own declared key — usually the right one for
+        //    non-dedup'd uploads.
+        if let Some(d) = try_ford_siv(record_own_key, ford_blob) {
+            return Some(d);
+        }
+
+        // 2. fordChecksum direct lookup — the server gave us a chunk
+        //    reference checksum that identifies the original uploader's
+        //    key. If we've seen that key in a prior batch, we have an
+        //    exact-match hit.
+        if !ford_checksum.is_empty() {
+            let hit = {
+                let cache = ford_key_cache().lock().unwrap_or_else(|p| p.into_inner());
+                cache.get(ford_checksum).cloned()
+            };
+            if let Some(alt) = hit {
+                if let Some(d) = try_ford_siv(&alt, ford_blob) {
+                    info!(
+                        "manual_ford_download {}: SIV succeeded via fordChecksum cache hit",
+                        record_name
+                    );
+                    return Some(d);
+                }
+            }
+        }
+
+        // 3. Brute-force: try every cached key. The cross-batch dedup
+        //    case requires this — the right key can be from any record
+        //    the account has ever seen.
+        let all_keys = ford_key_cache_values();
+        let total = all_keys.len();
+        for (idx, alt) in all_keys.iter().enumerate() {
+            if let Some(d) = try_ford_siv(alt, ford_blob) {
+                info!(
+                    "manual_ford_download {}: SIV succeeded via brute-force (attempt {}/{})",
+                    record_name,
+                    idx + 1,
+                    total
+                );
+                return Some(d);
+            }
+        }
+
+        None
+    }
+
+    /// V2 chunk decrypt — ported from upstream's private `ChunkDesc::decrypt`
+    /// at mmcs.rs:696. HKDF(key[1..]) → expand 0x60 bytes → split into
+    /// (sig_hmac [0..32], auth_hmac [32..64], aes_key [64..96]). IV is
+    /// HMAC(auth_hmac, chunk_id_padded_40)[..16]. Decrypts AES-256-CTR,
+    /// truncates to declared length, verifies sig HMAC.
+    ///
+    /// Returns `Err` on HMAC mismatch (wrong key or corrupt data) — the
+    /// upstream version has `assert_eq!` there, which panics; we return
+    /// a typed error instead so the caller can fall through.
+    pub(super) fn decrypt_v2_chunk(
+        key33: &[u8],
+        chunk_len_bytes: &[u8],
+        chunk_id21: &[u8; 21],
+        data: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if key33.len() != 33 {
+            return Err(format!("V2 key wrong length: {}", key33.len()));
+        }
+        if chunk_len_bytes.len() != 4 {
+            return Err(format!("V2 chunk_len wrong length: {}", chunk_len_bytes.len()));
+        }
+
+        let hk = Hkdf::<Sha256>::new(None, &key33[1..]);
+        let mut expanded = [0u8; 0x60];
+        hk.expand(b"signature-key", &mut expanded)
+            .map_err(|e| format!("V2 HKDF expand: {e}"))?;
+
+        let auth_hmac_key = &expanded[0x20..0x40];
+        let aes_key = &expanded[0x40..0x60];
+        let sig_hmac_key = &expanded[0x00..0x20];
+
+        // IV construction: chunk_id[1..] (20 bytes) padded to 40 bytes,
+        // with data length (little-endian u32) at offset [32..36].
+        let mut id_padded = [0u8; 40];
+        id_padded[..20].copy_from_slice(&chunk_id21[1..]);
+        id_padded[32..36].copy_from_slice(&(data.len() as u32).to_le_bytes());
+
+        let auth_pkey = PKey::hmac(auth_hmac_key)
+            .map_err(|e| format!("V2 auth PKey: {e}"))?;
+        let mut signer = Signer::new(MessageDigest::sha256(), &auth_pkey)
+            .map_err(|e| format!("V2 auth Signer: {e}"))?;
+        let iv_material = signer
+            .sign_oneshot_to_vec(&id_padded)
+            .map_err(|e| format!("V2 IV sign: {e}"))?;
+        let iv = &iv_material[..16];
+
+        let mut result = openssl_decrypt(Cipher::aes_256_ctr(), aes_key, Some(iv), data)
+            .map_err(|e| format!("V2 AES-CTR decrypt: {e}"))?;
+
+        let length = u32::from_le_bytes(
+            chunk_len_bytes
+                .try_into()
+                .map_err(|_| "chunk_len bytes->[u8;4]")?,
+        ) as usize;
+        result.resize(length, 0);
+
+        // HMAC verify — if the decrypted chunk doesn't authenticate, the
+        // wrong key was used. This is the "is this chunk really mine"
+        // check that lets us fall through to try another key.
+        let plaintext_hash = {
+            let mut h = Sha256::new();
+            h.update(&result);
+            h.finalize()
+        };
+        let sig_pkey = PKey::hmac(sig_hmac_key)
+            .map_err(|e| format!("V2 sig PKey: {e}"))?;
+        let mut verifier = Signer::new(MessageDigest::sha256(), &sig_pkey)
+            .map_err(|e| format!("V2 sig Signer: {e}"))?;
+        let computed_id = verifier
+            .sign_oneshot_to_vec(&plaintext_hash)
+            .map_err(|e| format!("V2 sig sign: {e}"))?;
+
+        if &computed_id[..chunk_id21.len() - 1] != &chunk_id21[1..] {
+            return Err("V2 chunk HMAC mismatch".to_string());
+        }
+
+        Ok(result)
+    }
+
+    /// V1 chunk decrypt — AES-128-CFB with `key[1..]` as the 16-byte
+    /// key, no IV. Ported from upstream's mmcs.rs:695.
+    pub(super) fn decrypt_v1_chunk(key17: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+        if key17.len() != 17 {
+            return Err(format!("V1 key wrong length: {}", key17.len()));
+        }
+        openssl_decrypt(Cipher::aes_128_cfb128(), &key17[1..], None, data)
+            .map_err(|e| format!("V1 AES-CFB decrypt: {e}"))
+    }
+
+    /// Re-authorize a fresh AuthorizeGetResponse body directly from
+    /// MMCS. The cached body that came in the original AssetGetResponse
+    /// may be tied to a specific auth session that's since expired; on
+    /// the recovery path we want to re-issue the authorization to make
+    /// sure the container HTTP URLs are still valid.
+    ///
+    /// We don't currently re-authorize — the cached body from CloudKit
+    /// is usually still fresh (CloudKit authorization is bundled with
+    /// the AssetGetResponse). This helper is reserved for future use if
+    /// we start seeing auth expiry.
+    #[allow(dead_code)]
+    pub(super) fn noop_reauth() {}
+
+    /// Fetch the entire HTTP body of one container. Returns bytes ready
+    /// to slice by offset.
+    pub(super) async fn fetch_container_body(
+        container: &rustpush::mmcsp::Container,
+        user_agent: &str,
+    ) -> Result<Vec<u8>, String> {
+        let req = container
+            .request
+            .as_ref()
+            .ok_or_else(|| "container has no HttpRequest".to_string())?;
+        let url = format!("{}://{}:{}{}", req.scheme, req.domain, req.port, req.path);
+
+        let mut builder = match req.method.as_str() {
+            "GET" => HTTP_CLIENT.get(&url),
+            other => return Err(format!("unsupported MMCS method: {}", other)),
+        }
+        .header("x-apple-request-uuid", uuid::Uuid::new_v4().to_string().to_uppercase())
+        .header("user-agent", user_agent);
+
+        let complete_at_edge = req.headers.iter().any(|h| {
+            h.name == "x-apple-put-complete-at-edge-version" && h.value == "2"
+        });
+
+        for header in &req.headers {
+            if (header.name == "Content-Length" && complete_at_edge) || header.name == "Host" {
+                continue;
+            }
+            builder = builder.header(header.name.clone(), header.value.clone());
+        }
+
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| format!("MMCS fetch send: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("MMCS fetch HTTP {}", resp.status()));
+        }
+
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("MMCS fetch body: {e}"))?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Manual Ford download of one asset. This is the V1+V2-capable
+    /// replacement for upstream's `get_assets` → `get_mmcs` chain. It
+    /// bypasses all of upstream's panicking code paths by reimplementing
+    /// the download primitives at this layer.
+    ///
+    /// Inputs:
+    /// - `asset_response`: the AuthorizeGetResponse body bytes from the
+    ///   original CloudKit AssetGetResponse for this bundled_request_id
+    /// - `asset_signature`: `record.lqa.signature` — identifies our file
+    ///   within the response's `references` list
+    /// - `asset_ford_key`: `record.lqa.protection_info.protection_info`
+    ///   — the record's own declared Ford key (usually right, but not
+    ///   always in the dedup case)
+    /// - `user_agent`: the CloudKit user agent string (for HTTP)
+    /// - `record_name`: diagnostic only
+    ///
+    /// Returns the decrypted file bytes.
+    pub(super) async fn manual_ford_download_asset(
+        asset_response_body: &[u8],
+        asset_signature: &[u8],
+        asset_ford_key: &[u8],
+        user_agent: &str,
+        record_name: &str,
+    ) -> Result<Vec<u8>, String> {
+        let response = rustpush::mmcsp::AuthorizeGetResponse::decode(asset_response_body)
+            .map_err(|e| format!("decode AuthorizeGetResponse: {e}"))?;
+
+        let f1 = response.f1.ok_or_else(|| {
+            let reason = response
+                .error
+                .and_then(|e| e.f2)
+                .map(|f2| f2.reason)
+                .unwrap_or_default();
+            format!("MMCS server returned error: {}", reason)
+        })?;
+
+        // Find OUR file's chunk references + ford_reference.
+        let wanted = f1
+            .references
+            .iter()
+            .find(|r| &r.file_checksum[..] == asset_signature)
+            .ok_or_else(|| {
+                format!(
+                    "no references entry matches signature {}",
+                    encode_hex(asset_signature)
+                )
+            })?;
+
+        // Fetch every container body once up front. Master's approach
+        // streams chunks through a matcher; we just pull each container
+        // in full (simpler, avoids needing the private MMCSMatcher).
+        // For typical attachments this is ONE container per file.
+        let mut container_bodies: Vec<Vec<u8>> = Vec::with_capacity(f1.containers.len());
+        for container in &f1.containers {
+            let body = fetch_container_body(container, user_agent).await?;
+            container_bodies.push(body);
+        }
+
+        // ---- Build ford_keymap: data_chunk_checksum -> (ford_key, chunk_len) ----
+        //
+        // If this file has a ford_reference, decrypt the Ford blob and
+        // flatten into per-chunk keys. Otherwise, we expect V1 per-chunk
+        // keys to come from `chunk.meta.encryption_key`.
+        let mut ford_keymap: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = HashMap::new();
+
+        if let Some(ford_ref) = &wanted.ford_reference {
+            let container_idx = ford_ref.container_index as usize;
+            let chunk_idx = ford_ref.chunk_index as usize;
+            let container = f1
+                .containers
+                .get(container_idx)
+                .ok_or_else(|| format!("ford_reference container_idx {} OOB", container_idx))?;
+            let body = container_bodies
+                .get(container_idx)
+                .ok_or_else(|| "ford container body missing".to_string())?;
+            let chunk = container
+                .chunks
+                .get(chunk_idx)
+                .ok_or_else(|| format!("ford_reference chunk_idx {} OOB", chunk_idx))?;
+            let enc_meta = chunk
+                .encryption
+                .as_ref()
+                .ok_or_else(|| "ford chunk has no encryption meta".to_string())?;
+
+            let blob_offset = enc_meta.offset as usize;
+            let blob_size = enc_meta.size as usize;
+            if blob_offset + blob_size > body.len() {
+                return Err(format!(
+                    "ford blob OOB: offset={} size={} body_len={}",
+                    blob_offset,
+                    blob_size,
+                    body.len()
+                ));
+            }
+            let ford_blob = &body[blob_offset..blob_offset + blob_size];
+
+            // SIV retry over record_own_key + cache.
+            let plaintext = ford_siv_retry(
+                asset_ford_key,
+                &wanted.ford_checksum,
+                ford_blob,
+                record_name,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "Ford SIV failed: tried record key + {} cached keys, no match",
+                    ford_key_cache_size()
+                )
+            })?;
+
+            // Decode plaintext as our local V1/V2-capable FordChunk.
+            let ford_chunk = LocalFordChunk::decode(&plaintext[..])
+                .map_err(|e| format!("decode FordChunk: {e}"))?;
+
+            let ford_entries = flatten_ford_entries(ford_chunk)
+                .ok_or_else(|| "FordChunk has neither item nor item_v2".to_string())?;
+
+            if ford_entries.len() != wanted.chunk_references.len() {
+                warn!(
+                    "manual_ford_download {}: ford_entries={} != chunk_references={} (will map what's present)",
+                    record_name,
+                    ford_entries.len(),
+                    wanted.chunk_references.len()
+                );
+            }
+
+            for (entry, chunk_ref) in ford_entries.iter().zip(wanted.chunk_references.iter()) {
+                let cidx = chunk_ref.container_index as usize;
+                let kidx = chunk_ref.chunk_index as usize;
+                let chunk = f1
+                    .containers
+                    .get(cidx)
+                    .and_then(|c| c.chunks.get(kidx))
+                    .ok_or_else(|| {
+                        format!("chunk_ref ({},{}) OOB", cidx, kidx)
+                    })?;
+                let meta = chunk
+                    .meta
+                    .as_ref()
+                    .ok_or_else(|| "data chunk has no meta".to_string())?;
+                ford_keymap.insert(meta.checksum.clone(), (entry.0.clone(), entry.1.clone()));
+            }
+        }
+
+        // ---- Assemble the file by iterating data chunk refs in order ----
+        let mut out = Vec::new();
+        for chunk_ref in &wanted.chunk_references {
+            let cidx = chunk_ref.container_index as usize;
+            let kidx = chunk_ref.chunk_index as usize;
+            let container = f1
+                .containers
+                .get(cidx)
+                .ok_or_else(|| format!("chunk_ref container OOB {}", cidx))?;
+            let body = container_bodies
+                .get(cidx)
+                .ok_or_else(|| "container body missing".to_string())?;
+            let chunk = container
+                .chunks
+                .get(kidx)
+                .ok_or_else(|| format!("chunk_ref chunk OOB {}", kidx))?;
+            let meta = chunk
+                .meta
+                .as_ref()
+                .ok_or_else(|| "chunk has no meta".to_string())?;
+
+            let offset = meta.offset as usize;
+            let size = meta.size as usize;
+            if offset + size > body.len() {
+                return Err(format!(
+                    "chunk OOB: offset={} size={} body_len={}",
+                    offset,
+                    size,
+                    body.len()
+                ));
+            }
+            let encrypted = &body[offset..offset + size];
+
+            let plaintext = if let Some((fkey, clen)) = ford_keymap.get(&meta.checksum) {
+                // V2: Ford-derived key + chunk_len
+                let chunk_id: [u8; 21] = meta
+                    .checksum
+                    .clone()
+                    .try_into()
+                    .map_err(|_| "chunk checksum not 21 bytes".to_string())?;
+                decrypt_v2_chunk(fkey, clen, &chunk_id, encrypted)?
+            } else if let Some(enc_key) = &meta.encryption_key {
+                // V1: per-chunk AES-128-CFB key from the authorize response
+                decrypt_v1_chunk(enc_key, encrypted)?
+            } else {
+                // Unencrypted chunk
+                encrypted.to_vec()
+            };
+
+            out.extend_from_slice(&plaintext);
+        }
+
+        Ok(out)
+    }
+}
+
+// ============================================================================
 // NAC relay config (Apple Silicon hardware keys that can't run in the
 // x86-64 unicorn emulator on Linux)
 // ============================================================================
@@ -6949,110 +7521,100 @@ impl Client {
         base_record: CloudAttachmentWithAvid,
         record_name: &str,
     ) -> Result<Vec<u8>, WrappedError> {
-        use futures::FutureExt;
-
-        if base_record.lqa.bundled_request_id.is_none() {
-            warn!(
-                "Ford recovery {}: lqa.bundled_request_id is None, skipping recovery",
-                record_name
-            );
-            return Err(WrappedError::GenericError {
-                msg: format!("Ford dedup recovery for {}: lqa asset has no bundled_request_id", record_name),
-            });
-        }
-
-        // Try EVERY cached Ford key — that's the whole point of the
-        // cross-batch dedup cache. The correct key for a dedup'd blob
-        // might be from any earlier record on any device on the account,
-        // and we can't predict which one without trying.
+        // Fully-manual Ford download. Bypasses upstream's V1-only
+        // `get_mmcs` (which panics on V2 Ford records) and handles V1,
+        // V2, and dedup (cross-batch brute force via the cached key set)
+        // in a single pure-crypto pass.
         //
-        // Parallelism: fire N retries concurrently per batch. Each retry
-        // is a full container.get_assets call (~500ms HTTP round-trip),
-        // but running them in parallel lets a batch of N keys complete
-        // in roughly ONE round-trip of wall-clock time instead of N.
-        // For 913 cached keys at parallelism 20:
-        //   sequential: 913 × 500ms ≈ 7-8 minutes per failing record
-        //   parallel:   (913/20) × 500ms ≈ 23 seconds per failing record
-        // That's a ~20× speedup, under Go's 90s timeout, same correctness
-        // (every key still gets tried).
+        // The outer `cloud_download_attachment` attempted upstream's
+        // happy path first and catch_unwind'd its panic; we're here
+        // because that failed. The ONLY path upstream takes to its
+        // panic is the Ford path, so we know this is a Ford-encrypted
+        // asset (is_ford_asset was also pre-checked by the caller).
         //
-        // Iterate recency-first because Apple's MMCS dedup is
-        // chronologically local — the correct key is most often from a
-        // record we saw recently, so the happy case wins in the first
-        // batch and we return without firing the rest.
-        //
-        // Tunable via RUSTPUSHGO_FORD_RETRY_PARALLEL env var.
-        const DEFAULT_PARALLEL: usize = 20;
-        let parallel: usize = std::env::var("RUSTPUSHGO_FORD_RETRY_PARALLEL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_PARALLEL)
-            .max(1);
+        // What this function does NOT do that upstream does:
+        //   - getComplete confirmation (CloudKit passes empty url, so
+        //     upstream skips it too — see mmcs.rs:1260-1272)
+        //   - chunk-level HTTP range requests with streaming matcher
+        //     (we fetch each container body in full — simpler, same
+        //     result for typical attachment sizes)
 
-        let mut cached_keys = ford_key_cache_values();
-        cached_keys.reverse();
-        let total_cached = cached_keys.len();
+        let lqa = &base_record.lqa;
+        let bundled_id = lqa.bundled_request_id.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!("manual_ford_download {}: lqa.bundled_request_id is None", record_name),
+            }
+        })?;
+        let signature = lqa.signature.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!("manual_ford_download {}: lqa.signature is None", record_name),
+            }
+        })?;
+        let ford_key = lqa
+            .protection_info
+            .as_ref()
+            .and_then(|pi| pi.protection_info.as_ref())
+            .cloned()
+            .unwrap_or_default();
+
+        // Find the AssetGetResponse for this asset's bundled_request_id.
+        let asset_response = records
+            .assets
+            .iter()
+            .find(|r| r.asset_id.as_ref() == Some(bundled_id))
+            .ok_or_else(|| WrappedError::GenericError {
+                msg: format!(
+                    "manual_ford_download {}: no AssetGetResponse for bundled_request_id",
+                    record_name
+                ),
+            })?;
+        let body = asset_response.body.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!(
+                    "manual_ford_download {}: AssetGetResponse.body is None",
+                    record_name
+                ),
+            }
+        })?;
+
+        // User agent for MMCS fetches — CloudKit style (matches what
+        // upstream's `get_assets` constructs at cloudkit.rs:2080).
+        let user_agent = container
+            .client
+            .config
+            .get_normal_ua("CloudKit/1970");
 
         info!(
-            "Ford recovery {}: trying all {} cached keys ({} parallel, recency-first)",
-            record_name, total_cached, parallel
+            "manual_ford_download {}: starting V1+V2 Ford path (ford_key_len={} cache_size={})",
+            record_name,
+            ford_key.len(),
+            ford_key_cache_size()
         );
 
-        // Iterate in chunks of `parallel` keys. Fire all keys in a chunk
-        // concurrently via join_all. First success in the batch wins;
-        // remaining futures in that batch finish but their results are
-        // discarded. If no key in the batch works, advance to next batch.
-        for (batch_idx, chunk) in cached_keys.chunks(parallel).enumerate() {
-            let futures_iter = chunk.iter().enumerate().map(|(within_batch, alt_key)| {
-                let global_idx = batch_idx * parallel + within_batch + 1;
-                let mut record = base_record.clone();
-                if let Some(pi) = record.lqa.protection_info.as_mut() {
-                    pi.protection_info = Some(alt_key.clone());
-                }
-                let shared = SharedWriter::new();
-                let shared_for_result = shared.clone();
-                let container = container.clone();
-                let assets_for_call = &records.assets;
-                async move {
-                    let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
-                        vec![(&record.lqa, shared)];
-                    let fut = container.get_assets(assets_for_call, assets_tuple);
-                    let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
-                    (global_idx, result, shared_for_result)
-                }
-            });
-
-            let results = futures::future::join_all(futures_iter).await;
-            for (global_idx, result, shared_for_result) in results {
-                match result {
-                    Ok(Ok(())) => {
-                        let bytes = shared_for_result.into_bytes();
-                        warn!(
-                            "Ford dedup recovery SUCCESS: record={} attempt={}/{} bytes={}",
-                            record_name, global_idx, total_cached, bytes.len()
-                        );
-                        return Ok(bytes);
-                    }
-                    Ok(Err(e)) => {
-                        debug!("Ford recovery attempt {} returned error: {}", global_idx, e);
-                    }
-                    Err(_panic) => {
-                        debug!("Ford recovery attempt {} panicked (wrong key)", global_idx);
-                    }
-                }
+        match manual_ford::manual_ford_download_asset(
+            body,
+            signature,
+            &ford_key,
+            &user_agent,
+            record_name,
+        )
+        .await
+        {
+            Ok(bytes) => {
+                warn!(
+                    "manual_ford_download {}: SUCCESS bytes={}",
+                    record_name,
+                    bytes.len()
+                );
+                Ok(bytes)
+            }
+            Err(e) => {
+                warn!("manual_ford_download {}: FAILED: {}", record_name, e);
+                Err(WrappedError::GenericError {
+                    msg: format!("Manual Ford download for {}: {}", record_name, e),
+                })
             }
         }
-
-        warn!(
-            "Ford dedup recovery FAILED: record={} tried={} all cached keys exhausted",
-            record_name, total_cached
-        );
-        Err(WrappedError::GenericError {
-            msg: format!(
-                "Ford dedup recovery for {}: all {} cached keys failed SIV decrypt",
-                record_name, total_cached
-            ),
-        })
     }
 
     /// Ford dedup recovery path: fetch the CloudAttachment record, iterate
@@ -7192,65 +7754,83 @@ impl Client {
         base_record: CloudAttachmentWithAvid,
         record_name: &str,
     ) -> Result<Vec<u8>, WrappedError> {
-        use futures::FutureExt;
+        // Manual V1+V2 Ford download for the Live Photo (avid) asset.
+        // Same algorithm as the lqa recovery path, but targeting
+        // `base_record.avid` instead of `base_record.lqa`.
+        let avid = &base_record.avid;
+        let bundled_id = avid.bundled_request_id.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!(
+                    "manual_ford_download (avid) {}: avid.bundled_request_id is None",
+                    record_name
+                ),
+            }
+        })?;
+        let signature = avid.signature.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!("manual_ford_download (avid) {}: avid.signature is None", record_name),
+            }
+        })?;
+        let ford_key = avid
+            .protection_info
+            .as_ref()
+            .and_then(|pi| pi.protection_info.as_ref())
+            .cloned()
+            .unwrap_or_default();
 
-        let cached_keys = ford_key_cache_values();
+        let asset_response = records
+            .assets
+            .iter()
+            .find(|r| r.asset_id.as_ref() == Some(bundled_id))
+            .ok_or_else(|| WrappedError::GenericError {
+                msg: format!(
+                    "manual_ford_download (avid) {}: no AssetGetResponse for bundled_request_id",
+                    record_name
+                ),
+            })?;
+        let body = asset_response.body.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!(
+                    "manual_ford_download (avid) {}: AssetGetResponse.body is None",
+                    record_name
+                ),
+            }
+        })?;
+
+        let user_agent = container
+            .client
+            .config
+            .get_normal_ua("CloudKit/1970");
+
         info!(
-            "Ford recovery (avid) {}: trying {} cached keys",
-            record_name,
-            cached_keys.len()
+            "manual_ford_download (avid) {}: starting V1+V2 Ford path",
+            record_name
         );
 
-        for (idx, alt_key) in cached_keys.iter().enumerate() {
-            let mut record = base_record.clone();
-            if let Some(pi) = record.avid.protection_info.as_mut() {
-                pi.protection_info = Some(alt_key.clone());
-            } else {
-                continue;
+        match manual_ford::manual_ford_download_asset(
+            body,
+            signature,
+            &ford_key,
+            &user_agent,
+            record_name,
+        )
+        .await
+        {
+            Ok(bytes) => {
+                warn!(
+                    "manual_ford_download (avid) {}: SUCCESS bytes={}",
+                    record_name,
+                    bytes.len()
+                );
+                Ok(bytes)
             }
-
-            let shared = SharedWriter::new();
-            let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
-                vec![(&record.avid, shared.clone())];
-
-            let fut = container.get_assets(&records.assets, assets_tuple);
-            let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
-            match result {
-                Ok(Ok(())) => {
-                    let bytes = shared.into_bytes();
-                    warn!(
-                        "Ford dedup recovery SUCCESS (avid): record={} attempt={}/{} bytes={}",
-                        record_name,
-                        idx + 1,
-                        cached_keys.len(),
-                        bytes.len()
-                    );
-                    return Ok(bytes);
-                }
-                Ok(Err(e)) => {
-                    debug!("Ford avid recovery attempt {} returned error: {}", idx + 1, e);
-                }
-                Err(_panic) => {
-                    debug!(
-                        "Ford avid recovery attempt {} panicked (wrong key, retrying)",
-                        idx + 1
-                    );
-                }
+            Err(e) => {
+                warn!("manual_ford_download (avid) {}: FAILED: {}", record_name, e);
+                Err(WrappedError::GenericError {
+                    msg: format!("Manual Ford download (avid) for {}: {}", record_name, e),
+                })
             }
         }
-
-        warn!(
-            "Ford recovery (avid) {}: all {} cached keys failed",
-            record_name,
-            cached_keys.len()
-        );
-        Err(WrappedError::GenericError {
-            msg: format!(
-                "Ford dedup recovery (avid) for {}: all {} cached keys failed SIV decrypt",
-                record_name,
-                cached_keys.len()
-            ),
-        })
     }
 }
 
