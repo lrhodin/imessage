@@ -30,6 +30,12 @@ rustpush = { path = "../../third_party/rustpush-upstream", default-features = fa
 # type in lib.rs fails to compile because the derive expects the crate to be
 # importable by its literal name.
 cloudkit-proto = { path = "../../third_party/rustpush-upstream/cloudkit-proto", package = "cloudkit-proto" }
+# Direct dep on open-absinthe so the wrapper can call
+# `open_absinthe::nac::set_relay_config` from Linux and macOS alike.
+# The macOS-only dep block below ADDITIONALLY enables the `native-nac`
+# feature via Cargo feature unification — this base dep provides access
+# to the relay setter on all platforms.
+open-absinthe = { path = "../../third_party/rustpush-upstream/open-absinthe" }
 keystore = { path = "../../third_party/rustpush-upstream/keystore" }
 plist = "1.7.0"
 serde = { version = "1.0", features = ["derive"] }
