@@ -7477,8 +7477,17 @@ impl Client {
                 .map(|a| a.record_name.clone())
                 .collect();
 
+            // Paginate QueryRecords until continuation_marker is empty.
+            // CloudKit typically returns ~200 records per page; with 875+
+            // attachment records we need multiple pages to cover all of them.
+            let mut qr_continuation: Option<Vec<u8>> = None;
+            let mut qr_extra = 0usize;
+            let mut qr_page = 0usize;
+            loop {
+            qr_page += 1;
             let c = Arc::clone(&container);
             let z = zone_id.clone();
+            let qr_cont = qr_continuation.clone();
             let query_join = tokio::task::spawn(async move {
                 c.perform(&CloudKitSession::new(), RawQueryOp(cloudkit_proto::QueryRetrieveRequest {
                     query: Some(cloudkit_proto::Query {
@@ -7489,6 +7498,7 @@ impl Client {
                     }),
                     zone_identifier: Some(z),
                     assets_to_download: Some(NO_ASSETS.clone()),
+                    continuation_marker: qr_cont,
                     ..Default::default()
                 })).await
             }).await;
@@ -7496,16 +7506,16 @@ impl Client {
             let qr = match query_join {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    warn!("cloud_sync_attachments: QueryRecords fallback failed: {}", e);
-                    cloudkit_proto::QueryRetrieveResponse::default()
+                    warn!("cloud_sync_attachments: QueryRecords fallback page {} failed: {}", qr_page, e);
+                    break;
                 }
                 Err(e) => {
-                    warn!("cloud_sync_attachments: QueryRecords fallback panicked: {}", e);
-                    cloudkit_proto::QueryRetrieveResponse::default()
+                    warn!("cloud_sync_attachments: QueryRecords fallback page {} panicked: {}", qr_page, e);
+                    break;
                 }
             };
+            let next_qr_marker = qr.continuation_marker.clone();
 
-            let mut qr_extra = 0usize;
             for qresult in &qr.query_results {
                 let record = match &qresult.record {
                     Some(r) => r,
@@ -7658,10 +7668,17 @@ impl Client {
                     avid_ford_key,
                 });
             }
+            // Advance pagination or stop.
+            match next_qr_marker {
+                Some(m) if !m.is_empty() => { qr_continuation = Some(m); }
+                _ => break,
+            }
+            } // end pagination loop
+
             if qr_extra > 0 {
-                info!("cloud_sync_attachments: QueryRecords fallback added {} extra records", qr_extra);
+                info!("cloud_sync_attachments: QueryRecords fallback added {} extra records across {} pages", qr_extra, qr_page);
             } else {
-                info!("cloud_sync_attachments: QueryRecords fallback found no new records (change feed was complete, or records are tombstoned)");
+                info!("cloud_sync_attachments: QueryRecords fallback found no new records after {} pages (change feed was complete, or records are tombstoned)", qr_page);
             }
         }
 
