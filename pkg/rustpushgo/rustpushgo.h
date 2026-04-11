@@ -775,6 +775,11 @@ RustBuffer uniffi_rustpushgo_fn_method_wrappedosconfig_get_device_id(
 	RustCallStatus* out_status
 );
 
+int8_t uniffi_rustpushgo_fn_method_wrappedosconfig_requires_nac_relay(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void uniffi_rustpushgo_fn_free_wrappedpasswordsclient(
 	void* ptr,
 	RustCallStatus* out_status
@@ -1857,6 +1862,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedidsusers_validate_keystore(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedosconfig_get_device_id(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedosconfig_requires_nac_relay(
 	RustCallStatus* out_status
 );
 

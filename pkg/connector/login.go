@@ -334,11 +334,16 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		apsState := getExistingAPSState(session, extLog)
 		l.conn = rustpushgo.Connect(cfg, apsState)
 
+		nacNote := "Registration uses the hardware key for NAC validation (no Mac needed at runtime)."
+		if cfg.RequiresNacRelay() {
+			nacNote = "Apple Silicon hardware key detected.\n" +
+				"The NAC relay server must be running on the Mac that provided this key during registration.\n" +
+				"Start it with: go run tools/nac-relay/main.go"
+		}
 		return &bridgev2.LoginStep{
 			Type:   bridgev2.LoginStepTypeUserInput,
 			StepID: LoginStepAppleIDPassword,
-			Instructions: "Enter your Apple ID credentials.\n" +
-				"Registration uses the hardware key for NAC validation (no Mac needed at runtime).",
+			Instructions: "Enter your Apple ID credentials.\n" + nacNote,
 			UserInputParams: &bridgev2.LoginUserInputParams{
 				Fields: []bridgev2.LoginInputDataField{{
 					Type: bridgev2.LoginInputFieldTypeEmail,

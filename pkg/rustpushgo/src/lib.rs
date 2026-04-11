@@ -942,6 +942,9 @@ impl WrappedIDSNGMIdentity {
 #[derive(uniffi::Object)]
 pub struct WrappedOSConfig {
     pub config: Arc<dyn OSConfig>,
+    /// True when this config was built from an Apple Silicon hardware key
+    /// that requires the NAC relay server to be running during registration.
+    pub has_nac_relay: bool,
 }
 
 #[uniffi::export]
@@ -949,6 +952,12 @@ impl WrappedOSConfig {
     /// Get the device UUID from the underlying OSConfig.
     pub fn get_device_id(&self) -> String {
         self.config.get_device_uuid()
+    }
+
+    /// Returns true if this config requires the NAC relay server to be
+    /// running during initial registration (Apple Silicon hardware keys).
+    pub fn requires_nac_relay(&self) -> bool {
+        self.has_nac_relay
     }
 }
 
@@ -3161,6 +3170,7 @@ pub fn create_local_macos_config() -> Result<Arc<WrappedOSConfig>, WrappedError>
             .into_macos_config();
         Ok(Arc::new(WrappedOSConfig {
             config: Arc::new(config),
+            has_nac_relay: false,
         }))
     }
     #[cfg(not(target_os = "macos"))]
@@ -3183,6 +3193,7 @@ pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc
             .into_macos_config();
         Ok(Arc::new(WrappedOSConfig {
             config: Arc::new(config),
+            has_nac_relay: false,
         }))
     }
     #[cfg(not(target_os = "macos"))]
@@ -3367,6 +3378,7 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
 
     Ok(Arc::new(WrappedOSConfig {
         config: Arc::new(config),
+        has_nac_relay: nac_relay_url.is_some(),
     }))
 }
 

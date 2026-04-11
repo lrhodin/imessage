@@ -1003,8 +1003,14 @@ impl ValidationCtx {
                     });
                 }
                 Err(e) => {
-                    warn!("NAC relay init failed, falling back to local path: {e}");
-                    // Fall through to native/emulator path below.
+                    // Relay is explicitly configured — this key cannot fall back to
+                    // the x86-64 emulator (ARM hardware identifiers are incompatible).
+                    return Err(AbsintheError::Other(format!(
+                        "NAC relay init failed (relay: {}): {e}. \
+                         Ensure the nac-relay server is running on the Mac that provided \
+                         this hardware key.",
+                        cfg.url
+                    )));
                 }
             }
         }
