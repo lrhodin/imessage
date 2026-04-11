@@ -1547,20 +1547,6 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 		}
 	}
 
-	// Diagnostic: fetch the 4 known-missing message records from messageManateeZone
-	// and dump all NSAttributedString attribute keys. These attachment GUIDs are absent
-	// from attachmentManateeZone but present in the local DB — MMCS info may be
-	// embedded in the message record's attributedBody under __kIMFileTransferLocalUserInfoKey.
-	diagRecordNames := []string{
-		"352ab69b11c171f4772a10637aeb5e398d35e082743b025bbd761317f3ddc95b", // 2BC0E8EE
-		"89e6fdeba1ee9f1a62d29adb8fe2d4b8c6df90a75bc11b15efc4f3058adb1e23", // 20BDEF75
-		"fd0a6ef9d0b7a3b5fa9e0cda63dadcdd732c4ee29f241a18766dd8802d751a9f", // 5935AF77
-		"7d473feb4fb2c8afd982c9b0788d15cc70c562849b40045571c8dd9c07d99094", // CBC6144D
-	}
-	if diagErr := safeCloudDiagMessageAttributedKeys(c.client, diagRecordNames); diagErr != nil {
-		log.Warn().Err(diagErr).Msg("cloud_diag_message_attributed_keys failed")
-	}
-
 	return attMap, token, nil
 }
 
@@ -1668,13 +1654,6 @@ func safeCloudQueryAttachmentsFallback(client *rustpushgo.Client, knownRecordNam
 	return safeFFICall("CloudQueryAttachmentsFallback", func() (rustpushgo.WrappedCloudSyncAttachmentsPage, error) {
 		return client.CloudQueryAttachmentsFallback(knownRecordNames)
 	})
-}
-
-func safeCloudDiagMessageAttributedKeys(client *rustpushgo.Client, recordNames []string) error {
-	_, err := safeFFICall("CloudDiagMessageAttributedKeys", func() (struct{}, error) {
-		return struct{}{}, client.CloudDiagMessageAttributedKeys(recordNames)
-	})
-	return err
 }
 
 func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]cloudAttachmentRow) (cloudSyncCounters, *string, error) {

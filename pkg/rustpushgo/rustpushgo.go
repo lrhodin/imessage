@@ -474,15 +474,6 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rustpushgo_checksum_method_client_cloud_diag_message_attributed_keys(uniffiStatus)
-		})
-		if checksum != 12051 {
-			// If this happens try cleaning and rebuilding your project
-			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_diag_message_attributed_keys: UniFFI API checksum mismatch")
-		}
-	}
-	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_cloud_download_attachment(uniffiStatus)
 		})
 		if checksum != 39378 {
@@ -2087,31 +2078,6 @@ func (_self *Client) CloudDiagFullCount() (string, error) {
 		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
-		})
-}
-
-func (_self *Client) CloudDiagMessageAttributedKeys(recordNames []string) error {
-	_pointer := _self.ffiObject.incrementPointer("*Client")
-	defer _self.ffiObject.decrementPointer()
-	return uniffiRustCallAsyncWithError(
-		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
-			// rustFutureFunc
-			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_diag_message_attributed_keys(
-				_pointer, rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(recordNames)),
-				status,
-			))
-		},
-		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
-			// pollFunc
-			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
-		},
-		func(handle *C.void, status *C.RustCallStatus) {
-			// completeFunc
-			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
-		},
-		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
-			// freeFunc
-			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
 		})
 }
 
