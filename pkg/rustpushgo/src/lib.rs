@@ -123,6 +123,57 @@ fn ford_key_cache_values() -> Vec<Vec<u8>> {
     cache.values().cloned().collect()
 }
 
+/// Check whether a given asset is Ford-encrypted by parsing the CloudKit
+/// `AssetGetResponse` body (which is a `mmcsp::AuthorizeGetResponse` proto)
+/// and looking up the `wanted_chunks` entry for the asset's file_checksum.
+/// If that entry has a `ford_reference`, the asset uses Ford encryption
+/// (V2 / videos). If not, it's V1 per-chunk encryption (images, etc.) and
+/// the Ford dedup recovery path shouldn't run for it.
+///
+/// Returns `true` ONLY when we've proven the asset is Ford-encrypted.
+/// Returns `false` if the body can't be parsed, the checksum isn't found,
+/// or `ford_reference` is None — anything ambiguous is treated as non-Ford
+/// to avoid burning retries on records recovery can't help.
+fn is_ford_encrypted_asset(
+    asset_responses: &[rustpush::cloudkit_proto::AssetGetResponse],
+    asset: &rustpush::cloudkit_proto::Asset,
+) -> bool {
+    use prost::Message;
+
+    let Some(bundled_id) = asset.bundled_request_id.as_ref() else {
+        return false;
+    };
+    let Some(signature) = asset.signature.as_ref() else {
+        return false;
+    };
+    let Some(response) = asset_responses
+        .iter()
+        .find(|r| r.asset_id.as_ref() == Some(bundled_id))
+    else {
+        return false;
+    };
+    let Some(body) = response.body.as_ref() else {
+        return false;
+    };
+
+    let auth_response = match rustpush::mmcsp::AuthorizeGetResponse::decode(&body[..]) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let Some(f1) = auth_response.f1.as_ref() else {
+        return false;
+    };
+    // Find our file's `wanted_chunks` entry by matching file_checksum
+    // (= the asset signature). If it has a ford_reference, the server is
+    // telling us this asset's chunks are Ford-wrapped and the Ford key
+    // lives in the asset's protection_info.
+    f1.references
+        .iter()
+        .find(|w| &w.file_checksum == signature)
+        .and_then(|w| w.ford_reference.as_ref())
+        .is_some()
+}
+
 // ============================================================================
 // NAC relay config (Apple Silicon hardware keys that can't run in the
 // x86-64 unicorn emulator on Linux)
@@ -6031,41 +6082,111 @@ impl Client {
         &self,
         continuation_token: Option<String>,
     ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
+        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, ALL_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
+        use rustpush::cloudkit_proto::CloudKitRecord as _;
+
         let token = decode_continuation_token(continuation_token)?;
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
 
-        // Use upstream's own `sync_attachments` — same code path master
-        // went through via its vendored tree. This is battle-tested: same
-        // PCS decryption, same record parsing, same Ford key extraction.
-        // The hand-rolled version had a subtle drift that produced cached
-        // bytes that didn't match what MMCS expected, causing every Ford
-        // recovery to brute-force through invalid keys.
+        // Hand-rolled sync with ALL_ASSETS — matches master's
+        // sync_records_with_assets::<CloudAttachment>(... &ALL_ASSETS) pattern.
         //
-        // avid detection / avid Ford key registration happens at download
-        // time in `cloud_download_attachment` (which uses our local
-        // CloudAttachmentWithAvid type) so we still get Live Photo support
-        // — it's just driven by the download path instead of sync.
-        let (next_token, results, status) = cloud_messages
-            .sync_attachments(token)
+        // DO NOT use upstream's cloud_messages.sync_attachments() here —
+        // that path uses NO_ASSETS internally, which causes the server
+        // to return fewer/different records and strips some asset
+        // metadata. Empirically: ALL_ASSETS populates ~913 Ford keys,
+        // NO_ASSETS populates ~886 and recovery hits 0% success.
+        //
+        // We parse records as CloudAttachmentWithAvid (our local type
+        // that declares the avid field) so sync-time has_avid detection
+        // AND avid Ford key caching work in one pass.
+        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to sync CloudKit attachments (get_container): {}", e),
+        })?;
+        let zone_id = container.private_zone("attachmentManateeZone".to_string());
+        let zone_key = container
+            .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
             .await
             .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to sync CloudKit attachments: {}", e),
+                msg: format!("Failed to sync CloudKit attachments (zone_key): {}", e),
+            })?;
+        let (_assets, response) = container
+            .perform(
+                &CloudKitSession::new(),
+                FetchRecordChangesOperation::new(zone_id.clone(), token, &ALL_ASSETS),
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to sync CloudKit attachments (perform): {}", e),
             })?;
 
-        let mut normalized = Vec::with_capacity(results.len());
-        let mut ford_cached = 0usize;
-        for (record_name, att_opt) in results {
-            let Some(att) = att_opt else { continue };
+        let status = response.status();
+        let next_token = response.sync_continuation_token().to_vec();
 
-            // Register this record's lqa Ford key into the cache. Uses
-            // upstream's own decrypted protection_info bytes — known good.
+        let mut normalized = Vec::with_capacity(response.change.len());
+        let mut ford_cached = 0usize;
+        for change in &response.change {
+            let identifier = match change.identifier.as_ref().and_then(|i| i.value.as_ref()) {
+                Some(v) => v.name().to_string(),
+                None => continue,
+            };
+            let record = match &change.record {
+                Some(r) => r,
+                None => continue,
+            };
+            if record.r#type.as_ref().and_then(|t| t.name.as_deref())
+                != Some(CloudAttachmentWithAvid::record_type())
+            {
+                continue;
+            }
+
+            let pcskey = match pcs_keys_for_record(record, &zone_key) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!("cloud_sync_attachments: PCS key derive failed for {}: {}", identifier, e);
+                    continue;
+                }
+            };
+
+            let att: CloudAttachmentWithAvid = match std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| {
+                    CloudAttachmentWithAvid::from_record_encrypted(&record.record_field, Some(&pcskey))
+                }),
+            ) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    warn!(
+                        "cloud_sync_attachments: skipping record {} (PCS decode panic)",
+                        identifier
+                    );
+                    continue;
+                }
+            };
+
+            let has_avid = att.avid.size.unwrap_or(0) > 0;
+
             let ford_key = att
                 .lqa
                 .protection_info
                 .as_ref()
                 .and_then(|p| p.protection_info.as_ref())
                 .cloned();
+            let avid_ford_key = att
+                .avid
+                .protection_info
+                .as_ref()
+                .and_then(|p| p.protection_info.as_ref())
+                .cloned();
+
+            // Register BOTH lqa and avid Ford keys into the wrapper cache
+            // immediately. Matches master's sync_attachments cache-population
+            // loop. Also propagated to Go's cache via the Go-side register.
             if let Some(ref k) = ford_key {
+                register_ford_key(k.clone());
+                ford_cached += 1;
+            }
+            if let Some(ref k) = avid_ford_key {
                 register_ford_key(k.clone());
                 ford_cached += 1;
             }
@@ -6076,17 +6197,11 @@ impl Client {
                 uti_type: att.cm.0.uti.clone(),
                 filename: att.cm.0.transfer_name.clone().or_else(|| att.cm.0.filename.clone()),
                 file_size: att.cm.0.total_bytes,
-                record_name,
+                record_name: identifier,
                 hide_attachment: att.cm.0.hide_attachment,
-                // has_avid is detected at download time via CloudAttachmentWithAvid.
-                // Sync-time detection isn't available via upstream's CloudAttachment
-                // which only declares `cm` + `lqa`. The Go-side download code will
-                // try the avid download path when metadata suggests it
-                // (hide_attachment == true is the primary indicator).
-                has_avid: false,
+                has_avid,
                 ford_key,
-                // avid Ford key is registered at download time, not sync time.
-                avid_ford_key: None,
+                avid_ford_key,
             });
         }
 
@@ -6191,8 +6306,22 @@ impl Client {
             register_ford_key(pi.clone());
         }
 
+        // Determine upfront whether this asset is Ford-encrypted by parsing
+        // the AuthorizeGetResponse body and checking if our file's
+        // wanted_chunks entry has a `ford_reference`. Only Ford-encrypted
+        // assets (typically videos) benefit from Ford dedup recovery —
+        // image attachments use V1 per-chunk encryption and DON'T have a
+        // Ford blob, so running recovery on them would brute-force cached
+        // keys against bytes that aren't Ford ciphertext (guaranteed to
+        // fail, pure wasted work).
+        //
+        // Master's retry was inside get_mmcs, scoped to the Ford container
+        // loop, so it naturally only fired on real Ford failures. The
+        // wrapper has to do this check explicitly.
+        let is_ford_asset = is_ford_encrypted_asset(&records.assets, &record.lqa);
+
         // Attempt 1 — get_assets with the record's own lqa, wrapped in
-        // catch_unwind so a Ford SIV panic falls through to recovery.
+        // catch_unwind so a panic doesn't take down the bridge.
         let shared = SharedWriter::new();
         let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
             vec![(&record.lqa, shared.clone())];
@@ -6207,17 +6336,35 @@ impl Client {
                 });
             }
             Err(_panic) => {
+                if !is_ford_asset {
+                    // Non-Ford asset (image / V1 per-chunk encryption) —
+                    // the panic is NOT a Ford dedup issue. Brute-forcing
+                    // cached keys can't help: there's no Ford blob, and
+                    // our cached keys are for Ford-encrypted records that
+                    // will never match. Return the panic as a terminal
+                    // error instead of burning retries.
+                    warn!(
+                        "cloud_download_attachment {}: non-Ford asset panic, skipping recovery (image or other V1-encrypted)",
+                        record_name
+                    );
+                    return Err(WrappedError::GenericError {
+                        msg: format!(
+                            "Failed to download CloudKit attachment {} (non-Ford panic, likely bundled_request_id or PCS issue)",
+                            record_name
+                        ),
+                    });
+                }
                 warn!(
-                    "cloud_download_attachment {}: SIV panic (likely Ford dedup), \
-                     attempting recovery with {} cached Ford keys",
+                    "cloud_download_attachment {}: Ford SIV panic, attempting recovery with {} cached Ford keys",
                     record_name,
                     ford_key_cache_size()
                 );
             }
         }
 
-        // Attempt 2 — Ford dedup recovery: iterate cached keys, mutate
-        // protection_info per attempt, re-try get_assets.
+        // Attempt 2 — Ford dedup recovery: iterate cached keys in parallel
+        // batches, mutate protection_info per attempt, re-try get_assets.
+        // Only reached when is_ford_asset == true.
         self.cloud_download_attachment_ford_recovery_with_record(
             container,
             records,
@@ -6744,51 +6891,81 @@ impl Client {
         // Try EVERY cached Ford key — that's the whole point of the
         // cross-batch dedup cache. The correct key for a dedup'd blob
         // might be from any earlier record on any device on the account,
-        // and we can't predict which one without trying. Iterate
-        // recency-first because Apple's MMCS dedup is chronologically
-        // local, so the correct key is most often from a record we saw
-        // recently — this makes the common case fast while still trying
-        // every key for deep dedup chains.
+        // and we can't predict which one without trying.
+        //
+        // Parallelism: fire N retries concurrently per batch. Each retry
+        // is a full container.get_assets call (~500ms HTTP round-trip),
+        // but running them in parallel lets a batch of N keys complete
+        // in roughly ONE round-trip of wall-clock time instead of N.
+        // For 913 cached keys at parallelism 20:
+        //   sequential: 913 × 500ms ≈ 7-8 minutes per failing record
+        //   parallel:   (913/20) × 500ms ≈ 23 seconds per failing record
+        // That's a ~20× speedup, under Go's 90s timeout, same correctness
+        // (every key still gets tried).
+        //
+        // Iterate recency-first because Apple's MMCS dedup is
+        // chronologically local — the correct key is most often from a
+        // record we saw recently, so the happy case wins in the first
+        // batch and we return without firing the rest.
+        //
+        // Tunable via RUSTPUSHGO_FORD_RETRY_PARALLEL env var.
+        const DEFAULT_PARALLEL: usize = 20;
+        let parallel: usize = std::env::var("RUSTPUSHGO_FORD_RETRY_PARALLEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_PARALLEL)
+            .max(1);
+
         let mut cached_keys = ford_key_cache_values();
         cached_keys.reverse();
         let total_cached = cached_keys.len();
 
         info!(
-            "Ford recovery {}: trying all {} cached keys (recency-first)",
-            record_name, total_cached
+            "Ford recovery {}: trying all {} cached keys ({} parallel, recency-first)",
+            record_name, total_cached, parallel
         );
 
-        for (idx, alt_key) in cached_keys.iter().enumerate() {
-            let mut record = base_record.clone();
-            if let Some(pi) = record.lqa.protection_info.as_mut() {
-                pi.protection_info = Some(alt_key.clone());
-            } else {
-                continue;
-            }
-
-            let shared = SharedWriter::new();
-            let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
-                vec![(&record.lqa, shared.clone())];
-
-            let fut = container.get_assets(&records.assets, assets_tuple);
-            let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
-            match result {
-                Ok(Ok(())) => {
-                    let bytes = shared.into_bytes();
-                    warn!(
-                        "Ford dedup recovery SUCCESS: record={} attempt={}/{} bytes={}",
-                        record_name,
-                        idx + 1,
-                        total_cached,
-                        bytes.len()
-                    );
-                    return Ok(bytes);
+        // Iterate in chunks of `parallel` keys. Fire all keys in a chunk
+        // concurrently via join_all. First success in the batch wins;
+        // remaining futures in that batch finish but their results are
+        // discarded. If no key in the batch works, advance to next batch.
+        for (batch_idx, chunk) in cached_keys.chunks(parallel).enumerate() {
+            let futures_iter = chunk.iter().enumerate().map(|(within_batch, alt_key)| {
+                let global_idx = batch_idx * parallel + within_batch + 1;
+                let mut record = base_record.clone();
+                if let Some(pi) = record.lqa.protection_info.as_mut() {
+                    pi.protection_info = Some(alt_key.clone());
                 }
-                Ok(Err(e)) => {
-                    debug!("Ford recovery attempt {} returned error: {}", idx + 1, e);
+                let shared = SharedWriter::new();
+                let shared_for_result = shared.clone();
+                let container = container.clone();
+                let assets_for_call = &records.assets;
+                async move {
+                    let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
+                        vec![(&record.lqa, shared)];
+                    let fut = container.get_assets(assets_for_call, assets_tuple);
+                    let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+                    (global_idx, result, shared_for_result)
                 }
-                Err(_panic) => {
-                    debug!("Ford recovery attempt {} panicked (wrong key, retrying)", idx + 1);
+            });
+
+            let results = futures::future::join_all(futures_iter).await;
+            for (global_idx, result, shared_for_result) in results {
+                match result {
+                    Ok(Ok(())) => {
+                        let bytes = shared_for_result.into_bytes();
+                        warn!(
+                            "Ford dedup recovery SUCCESS: record={} attempt={}/{} bytes={}",
+                            record_name, global_idx, total_cached, bytes.len()
+                        );
+                        return Ok(bytes);
+                    }
+                    Ok(Err(e)) => {
+                        debug!("Ford recovery attempt {} returned error: {}", global_idx, e);
+                    }
+                    Err(_panic) => {
+                        debug!("Ford recovery attempt {} panicked (wrong key)", global_idx);
+                    }
                 }
             }
         }
