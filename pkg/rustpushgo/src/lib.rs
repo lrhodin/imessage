@@ -1572,12 +1572,12 @@ impl WrappedTokenProvider {
             WrappedError::GenericError { msg: format!("Invalid MobileMe delegate plist: {}", e) }
         })?;
         // The serialized delegate is `{"tokens": {...}, "com.apple.mobileme": {...}}`.
-        // CardDAV URL lives at `com.apple.mobileme/com.apple.Dataclass.Contact/url`.
+        // CardDAV URL lives at `com.apple.mobileme/com.apple.Dataclass.Contacts/url`.
         let url = value
             .as_dictionary()
             .and_then(|d| d.get("com.apple.mobileme"))
             .and_then(|v| v.as_dictionary())
-            .and_then(|d| d.get("com.apple.Dataclass.Contact"))
+            .and_then(|d| d.get("com.apple.Dataclass.Contacts"))
             .and_then(|v| v.as_dictionary())
             .and_then(|d| d.get("url"))
             .and_then(|v| v.as_string())
