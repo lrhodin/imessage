@@ -841,7 +841,14 @@ impl WrappedTokenProvider {
     pub(crate) fn get_os_config(&self) -> Arc<dyn OSConfig> {
         self.os_config.clone()
     }
+}
 
+// Second uniffi-exported impl block: the iCloud Keychain clique methods that
+// were previously in the single uniffi block before I split out the internal
+// helpers above. These MUST be exported to Go so the bridge's login flow can
+// call them.
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedTokenProvider {
     /// List devices that have escrow bottles in the iCloud Keychain trust circle.
     /// Returns device info (name, model, serial, timestamp) for each bottle.
     /// Call this before join_keychain_clique_for_device to let the user choose.

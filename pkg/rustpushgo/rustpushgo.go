@@ -501,6 +501,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_cloud_supports_avid_download(uniffiStatus)
+		})
+		if checksum != 12325 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_supports_avid_download: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_cloud_sync_attachments(uniffiStatus)
 		})
 		if checksum != 29066 {
@@ -2168,6 +2177,15 @@ func (_self *Client) CloudFetchRecentMessages(sinceTimestampMs uint64, chatId *s
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
 		})
+}
+
+func (_self *Client) CloudSupportsAvidDownload() bool {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_rustpushgo_fn_method_client_cloud_supports_avid_download(
+			_pointer, _uniffiStatus)
+	}))
 }
 
 func (_self *Client) CloudSyncAttachments(continuationToken *string) (WrappedCloudSyncAttachmentsPage, error) {
@@ -7320,14 +7338,14 @@ type FfiConverterTypeWrappedError struct{}
 var FfiConverterTypeWrappedErrorINSTANCE = FfiConverterTypeWrappedError{}
 
 func (c FfiConverterTypeWrappedError) Lift(eb RustBufferI) error {
-	return LiftFromRustBuffer[error](c, eb)
+	return LiftFromRustBuffer[*WrappedError](c, eb)
 }
 
 func (c FfiConverterTypeWrappedError) Lower(value *WrappedError) RustBuffer {
 	return LowerIntoRustBuffer[*WrappedError](c, value)
 }
 
-func (c FfiConverterTypeWrappedError) Read(reader io.Reader) error {
+func (c FfiConverterTypeWrappedError) Read(reader io.Reader) *WrappedError {
 	errorID := readUint32(reader)
 
 	switch errorID {
@@ -7362,48 +7380,38 @@ const (
 )
 
 type concurrentHandleMap[T any] struct {
-	leftMap       map[uint64]*T
-	rightMap      map[*T]uint64
+	handles       map[uint64]T
 	currentHandle uint64
 	lock          sync.RWMutex
 }
 
 func newConcurrentHandleMap[T any]() *concurrentHandleMap[T] {
 	return &concurrentHandleMap[T]{
-		leftMap:  map[uint64]*T{},
-		rightMap: map[*T]uint64{},
+		handles: map[uint64]T{},
 	}
 }
 
-func (cm *concurrentHandleMap[T]) insert(obj *T) uint64 {
+func (cm *concurrentHandleMap[T]) insert(obj T) uint64 {
 	cm.lock.Lock()
 	defer cm.lock.Unlock()
 
-	if existingHandle, ok := cm.rightMap[obj]; ok {
-		return existingHandle
-	}
 	cm.currentHandle = cm.currentHandle + 1
-	cm.leftMap[cm.currentHandle] = obj
-	cm.rightMap[obj] = cm.currentHandle
+	cm.handles[cm.currentHandle] = obj
 	return cm.currentHandle
 }
 
-func (cm *concurrentHandleMap[T]) remove(handle uint64) bool {
+func (cm *concurrentHandleMap[T]) remove(handle uint64) {
 	cm.lock.Lock()
 	defer cm.lock.Unlock()
 
-	if val, ok := cm.leftMap[handle]; ok {
-		delete(cm.leftMap, handle)
-		delete(cm.rightMap, val)
-	}
-	return false
+	delete(cm.handles, handle)
 }
 
-func (cm *concurrentHandleMap[T]) tryGet(handle uint64) (*T, bool) {
+func (cm *concurrentHandleMap[T]) tryGet(handle uint64) (T, bool) {
 	cm.lock.RLock()
 	defer cm.lock.RUnlock()
 
-	val, ok := cm.leftMap[handle]
+	val, ok := cm.handles[handle]
 	return val, ok
 }
 
@@ -7421,7 +7429,7 @@ func (c *FfiConverterCallbackInterface[CallbackInterface]) Lift(handle uint64) C
 	if !ok {
 		panic(fmt.Errorf("no callback in handle map: %d", handle))
 	}
-	return *val
+	return val
 }
 
 func (c *FfiConverterCallbackInterface[CallbackInterface]) Read(reader io.Reader) CallbackInterface {
@@ -7429,7 +7437,7 @@ func (c *FfiConverterCallbackInterface[CallbackInterface]) Read(reader io.Reader
 }
 
 func (c *FfiConverterCallbackInterface[CallbackInterface]) Lower(value CallbackInterface) C.uint64_t {
-	return C.uint64_t(c.handleMap.insert(&value))
+	return C.uint64_t(c.handleMap.insert(value))
 }
 
 func (c *FfiConverterCallbackInterface[CallbackInterface]) Write(writer io.Writer, value CallbackInterface) {
@@ -8479,8 +8487,8 @@ func (_ FfiDestroyerMapStringString) Destroy(mapValue map[string]string) {
 }
 
 const (
-	uniffiRustFuturePollReady      C.int8_t = 0
-	uniffiRustFuturePollMaybeReady C.int8_t = 1
+	uniffiRustFuturePollReady      int8 = 0
+	uniffiRustFuturePollMaybeReady int8 = 1
 )
 
 func uniffiRustCallAsync(
@@ -8587,8 +8595,8 @@ func uniffiRustCallAsyncInner(
 	pollFunc func(*C.void, unsafe.Pointer, *C.RustCallStatus),
 	freeFunc func(*C.void, *C.RustCallStatus),
 ) (*C.void, error) {
-	pollResult := C.int8_t(-1)
-	waiter := make(chan C.int8_t, 1)
+	pollResult := int8(-1)
+	waiter := make(chan int8, 1)
 	chanHandle := cgo.NewHandle(waiter)
 
 	rustFuture, err := rustCallWithError(converter, func(status *C.RustCallStatus) *C.void {
@@ -8622,8 +8630,8 @@ func uniffiRustCallAsyncInner(
 //export uniffiFutureContinuationCallbackrustpushgo
 func uniffiFutureContinuationCallbackrustpushgo(ptr unsafe.Pointer, pollResult C.int8_t) {
 	doneHandle := *(*cgo.Handle)(ptr)
-	done := doneHandle.Value().((chan C.int8_t))
-	done <- pollResult
+	done := doneHandle.Value().((chan int8))
+	done <- int8(pollResult)
 }
 
 func uniffiInitContinuationCallback() {

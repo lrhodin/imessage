@@ -110,6 +110,11 @@ void* uniffi_rustpushgo_fn_method_client_cloud_fetch_recent_messages(
 	RustCallStatus* out_status
 );
 
+int8_t uniffi_rustpushgo_fn_method_client_cloud_supports_avid_download(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_cloud_sync_attachments(
 	void* ptr,
 	RustBuffer continuation_token,
@@ -1477,6 +1482,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_cloud_dump_chats_json(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_cloud_fetch_recent_messages(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_cloud_supports_avid_download(
 	RustCallStatus* out_status
 );
 
