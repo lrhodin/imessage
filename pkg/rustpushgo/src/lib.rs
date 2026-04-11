@@ -7199,6 +7199,18 @@ impl Client {
                 ford_cached += 1;
             }
 
+            // Per-record log at INFO so the exact aguids reaching Go can be
+            // grep'd. `grep cloud_sync_attachments: att` against the journal
+            // will list every aguid → record_name pair the bridge normalized.
+            // Missing a specific aguid from this list = CloudKit change feed
+            // isn't returning it, and the fix is not in the sync loop.
+            info!(
+                "cloud_sync_attachments: att guid={} record={} mime={:?} size={}",
+                att.cm.0.guid,
+                identifier,
+                att.cm.0.mime_type,
+                att.cm.0.total_bytes
+            );
             normalized.push(WrappedCloudAttachmentInfo {
                 guid: att.cm.0.guid.clone(),
                 mime_type: att.cm.0.mime_type.clone(),
