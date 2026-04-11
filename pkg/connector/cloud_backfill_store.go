@@ -465,6 +465,21 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 	if len(rows) == 0 {
 		return nil
 	}
+	// CloudKit can occasionally return duplicate GUID entries within a fetch
+	// window; keep only the newest row per GUID to make batch inserts idempotent.
+	rowsByGUID := make(map[string]cloudMessageRow, len(rows))
+	order := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.GUID == "" {
+			continue
+		}
+		if prev, ok := rowsByGUID[row.GUID]; !ok {
+			rowsByGUID[row.GUID] = row
+			order = append(order, row.GUID)
+		} else if row.TimestampMS >= prev.TimestampMS {
+			rowsByGUID[row.GUID] = row
+		}
+	}
 	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -504,7 +519,8 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 	defer stmt.Close()
 
 	nowMS := time.Now().UnixMilli()
-	for _, row := range rows {
+	for _, guid := range order {
+		row := rowsByGUID[guid]
 		_, err = stmt.ExecContext(ctx,
 			s.loginID, row.GUID, row.RecordName, row.CloudChatID, row.PortalID, row.TimestampMS,
 			row.Sender, row.IsFromMe, row.Text, row.Subject, row.Service, row.Deleted,
@@ -513,11 +529,22 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			nowMS, nowMS,
 		)
 		if err != nil {
+			if isUniqueConstraintErr(err) {
+				continue
+			}
 			return fmt.Errorf("failed to insert message %s: %w", row.GUID, err)
 		}
 	}
 
 	return tx.Commit()
+}
+
+func isUniqueConstraintErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "unique constraint") || strings.Contains(errText, "primary key")
 }
 
 // deleteMessageBatch soft-deletes individual messages by GUID (sets deleted=TRUE).

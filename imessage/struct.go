@@ -173,6 +173,8 @@ type Attachment struct {
 	triedMagic     bool
 }
 
+var userHomeDir = os.UserHomeDir
+
 func (attachment *Attachment) GetMimeType() string {
 	if attachment.MimeType == "" {
 		if attachment.triedMagic {
@@ -195,7 +197,7 @@ func (attachment *Attachment) GetFileName() string {
 
 func (attachment *Attachment) Read() ([]byte, error) {
 	if strings.HasPrefix(attachment.PathOnDisk, "~/") {
-		home, err := os.UserHomeDir()
+		home, err := userHomeDir()
 		if err != nil {
 			return nil, fmt.Errorf("failed to get home directory: %w", err)
 		}

@@ -1,15 +1,18 @@
-.idea
+# IDE / editor
+.idea/
+.vscode/
 
+# Config & runtime data (generated per-install)
 *.yaml
 !.pre-commit-config.yaml
 !example-config.yaml
 !example-registration.yaml
-
 *.session
 *.json
 *.db*
 *.log
 
+# Built binaries
 /mautrix-imessage
 /mautrix-imessage-v2
 /mautrix-imessage.app
@@ -19,6 +22,11 @@
 /data/
 /build/
 /bbctl
+
+# Local external worktrees / generated app workspace
+/third_party/rustpush-upstream/
+/openbubbles-app-rustpush/
+/rustpush-master/
 
 # Rust build artifacts
 librustpushgo.a

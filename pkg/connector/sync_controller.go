@@ -2356,6 +2356,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	}
 	ordered := make([]string, 0, len(portalInfos))
 	newestTSByPortal := make(map[string]int64, len(portalInfos))
+	forwardBackfillPortals := 0
 	alreadyQueued := 0
 	pendingDeleteSkipped := 0
 	groupDedupSkipped := 0
@@ -2423,6 +2424,11 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			alreadyQueued++
 			continue
 		}
+		portalKey := networkid.PortalKey{ID: networkid.PortalID(p.PortalID), Receiver: c.UserLogin.ID}
+		existingPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		if p.MessageCount > 0 && (existingPortal == nil || existingPortal.MXID == "") {
+			forwardBackfillPortals++
+		}
 		ordered = append(ordered, p.PortalID)
 	}
 	if pendingDeleteSkipped > 0 {
@@ -2447,11 +2453,19 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// If we set the counter AFTER the loop (StoreInt64 at the end), early
 	// decrements land on 0 (making it negative), then the Store overwrites
 	// those decrements with N, leaving the counter stuck at the number of
-	// early completions rather than reaching 0.  Setting it up-front to
-	// len(ordered) ensures every decrement is counted correctly.
+	// early completions rather than reaching 0. Setting it up-front ensures
+	// every decrement is counted correctly.
+	//
+	// Count ONLY portals that actually have message history. Chat-only portals
+	// still get ChatResync events so rooms are created, but GetChatInfo sets
+	// CanBackfill=false for them, so bridgev2 never calls FetchMessages(Forward)
+	// and they must not hold the APNs buffer open.
 	if !c.isCloudSyncDone() {
-		atomic.StoreInt64(&c.pendingInitialBackfills, int64(len(ordered)))
-		log.Debug().Int("count", len(ordered)).Msg("Set pendingInitialBackfills for APNs buffer hold")
+		atomic.StoreInt64(&c.pendingInitialBackfills, int64(forwardBackfillPortals))
+		log.Debug().
+			Int("count", forwardBackfillPortals).
+			Int("chat_only_or_existing", len(ordered)-forwardBackfillPortals).
+			Msg("Set pendingInitialBackfills for APNs buffer hold")
 	}
 
 	created := 0
@@ -2508,7 +2522,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		Dur("elapsed", time.Since(portalStart)).
 		Msg("Finished queuing portals from cloud sync")
 
-	// pendingInitialBackfills was already set to len(ordered) BEFORE the loop
+	// pendingInitialBackfills was already set BEFORE the loop
 	// so that early-completing FetchMessages(Forward=true) calls are counted
 	// correctly (see comment above the loop).  Nothing more to do here.
 

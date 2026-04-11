@@ -466,12 +466,40 @@ func (c *IMClient) sendGhostReadReceipt(
 		return
 	}
 
-	// Step 3: Look up the target message's Matrix event ID in the bridge DB.
-	msg, err := c.Main.Bridge.DB.Message.GetLastPartByID(ctx, portalKey.Receiver, makeMessageID(guid))
-	if err != nil || msg == nil || msg.HasFakeMXID() {
+	// Step 3: Look up the target message in the bridge DB and ensure we target
+	// the same room as the portal to avoid "target event in different room".
+	dbMessages, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portalKey.Receiver, makeMessageID(guid))
+	if err != nil || len(dbMessages) == 0 {
 		log.Debug().Err(err).Str("portal_id", string(portalKey.ID)).Str("guid", guid).
 			Msg("Target message not in bridge DB, falling back to QueueRemoteEvent with ReadUpTo")
 		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
+		return
+	}
+	targetMsg := dbMessages[0]
+	for _, candidate := range dbMessages {
+		if candidate.HasFakeMXID() {
+			continue
+		}
+		if candidate.Room.ID == portalKey.ID && candidate.Room.Receiver == portalKey.Receiver {
+			targetMsg = candidate
+			break
+		}
+	}
+	if targetMsg == nil || targetMsg.HasFakeMXID() {
+		log.Debug().
+			Str("portal_id", string(portalKey.ID)).
+			Str("guid", guid).
+			Msg("No usable Matrix event ID for ghost read receipt, falling back to QueueRemoteEvent")
+		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
+		return
+	}
+	if targetMsg.Room.ID != portalKey.ID || targetMsg.Room.Receiver != portalKey.Receiver {
+		log.Debug().
+			Str("portal_id", string(portalKey.ID)).
+			Str("target_room_portal", string(targetMsg.Room.ID)).
+			Str("guid", guid).
+			Msg("Skipping direct ghost read receipt due to portal/target room mismatch")
+		c.queueGhostReceiptFallback(ghostUserID, targetMsg.Room, guid, readTime)
 		return
 	}
 
@@ -489,8 +517,8 @@ func (c *IMClient) sendGhostReadReceipt(
 		"ts": readTime.UnixMilli(),
 	}
 	req := &mautrix.ReqSetReadMarkers{
-		Read:                 msg.MXID,
-		FullyRead:            msg.MXID,
+		Read:                 targetMsg.MXID,
+		FullyRead:            targetMsg.MXID,
 		BeeperReadExtra:      extraData,
 		BeeperFullyReadExtra: extraData,
 	}
@@ -499,7 +527,7 @@ func (c *IMClient) sendGhostReadReceipt(
 	})
 	if err != nil {
 		log.Warn().Err(err).Str("portal_id", string(portalKey.ID)).
-			Stringer("event_id", msg.MXID).
+			Stringer("event_id", targetMsg.MXID).
 			Msg("SetBeeperInboxState failed for ghost, falling back to QueueRemoteEvent")
 		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
 		return
@@ -508,7 +536,7 @@ func (c *IMClient) sendGhostReadReceipt(
 	log.Info().
 		Str("portal_id", string(portalKey.ID)).
 		Str("guid", guid).
-		Stringer("event_id", msg.MXID).
+		Stringer("event_id", targetMsg.MXID).
 		Int64("read_time_ms", readTime.UnixMilli()).
 		Str("read_time", readTime.UTC().Format(time.RFC3339)).
 		Msg("Set ghost read receipt via SetBeeperInboxState with correct timestamp")
@@ -3343,6 +3371,17 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 		}
 	}
 resolved:
+	if msg.Uuid != "" {
+		if msgPortal := c.resolvePortalByTargetMessage(log, msg.Uuid); msgPortal.ID != "" &&
+			(msgPortal.ID != portalKey.ID || msgPortal.Receiver != portalKey.Receiver) {
+			log.Debug().
+				Str("uuid", msg.Uuid).
+				Str("old_portal", string(portalKey.ID)).
+				Str("resolved_portal", string(msgPortal.ID)).
+				Msg("Resolved read receipt portal via target message UUID")
+			portalKey = msgPortal
+		}
+	}
 
 	readTime := time.UnixMilli(int64(msg.TimestampMs))
 	sender := c.makeEventSender(msg.Sender)
