@@ -1352,6 +1352,7 @@ async fn join_keychain_with_bottles(
 
     'stability: loop {
         let mut joined_any = false;
+        let mut probe_succeeded = false;
         let mut last_joined_meta: Option<(String, String)> = None;
 
         for &i in &indices {
@@ -1368,6 +1369,7 @@ async fn join_keychain_with_bottles(
                     );
                     match finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone(), per_bottle_probe_attempts).await {
                         Ok(()) => {
+                            probe_succeeded = true;
                             break; // probe passed, go to stability check
                         }
                         Err(e) => {
@@ -1393,8 +1395,13 @@ async fn join_keychain_with_bottles(
             });
         }
 
-        // If no bottle's probe succeeded, try an extended probe
-        if !keychain.is_in_clique().await {
+        // The CloudKit decrypt probe already verified clique membership
+        // (sync_keychain internally checks is_in_clique). Calling is_in_clique()
+        // again here triggers another sync_trust() → Cuttlefish fetchChanges,
+        // which can transiently fail to include us and reset our local state.
+        // Skip this check when the probe already confirmed membership; the
+        // stability loop below catches any subsequent exclusion.
+        if !probe_succeeded && !keychain.is_in_clique().await {
             if rejoin_attempt >= MAX_REJOIN_ATTEMPTS {
                 return Err(WrappedError::GenericError {
                     msg: format!("Excluded from clique after {} rejoin attempts. Last error: {}", rejoin_attempt, last_err)
