@@ -6905,18 +6905,42 @@ impl Client {
         let mut ford_cached = 0usize;
         let mut refreshed_zone_key_config = false;
         let mut pcs_skipped = 0usize;
+        // Silent drop path counters. These three `continue`s used to produce
+        // no logs at all, making it impossible to tell from the outside
+        // whether a missing attachment was (a) never in the change feed, (b)
+        // a tombstone (deletion), or (c) a different record type. Always
+        // summarized at the end of the sync page.
+        let mut no_identifier = 0usize;
+        let mut no_record_tombstone = 0usize;
+        let mut wrong_type = 0usize;
         for change in &response.change {
             let identifier = match change.identifier.as_ref().and_then(|i| i.value.as_ref()) {
                 Some(v) => v.name().to_string(),
-                None => continue,
+                None => {
+                    no_identifier += 1;
+                    continue;
+                }
             };
             let record = match &change.record {
                 Some(r) => r,
-                None => continue,
+                None => {
+                    // CloudKit change feed returns identifier without a record
+                    // body when the record has been deleted. The deletion
+                    // applies to the zone regardless of record type, so we log
+                    // the record_name to help correlate with any missing
+                    // attachments in the bridge.
+                    no_record_tombstone += 1;
+                    info!(
+                        "cloud_sync_attachments: tombstone (deleted record) {}",
+                        identifier
+                    );
+                    continue;
+                }
             };
             if record.r#type.as_ref().and_then(|t| t.name.as_deref())
                 != Some(CloudAttachmentWithAvid::record_type())
             {
+                wrong_type += 1;
                 continue;
             }
 
@@ -7044,9 +7068,14 @@ impl Client {
         }
 
         info!(
-            "cloud_sync_attachments: {} attachments normalized, {} Ford keys cached",
+            "cloud_sync_attachments: {} normalized, {} ford_cached, {} pcs_skipped, {} no_id, {} tombstones, {} wrong_type, {} total_change_entries",
             normalized.len(),
-            ford_cached
+            ford_cached,
+            pcs_skipped,
+            no_identifier,
+            no_record_tombstone,
+            wrong_type,
+            response.change.len()
         );
 
         Ok(WrappedCloudSyncAttachmentsPage {
