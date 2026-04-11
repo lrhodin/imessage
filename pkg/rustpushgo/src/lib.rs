@@ -6085,6 +6085,7 @@ impl Client {
         use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, ALL_ASSETS};
         use rustpush::cloud_messages::MESSAGES_SERVICE;
         use rustpush::cloudkit_proto::CloudKitRecord as _;
+        use rustpush::PushError;
 
         let token = decode_continuation_token(continuation_token)?;
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
@@ -6105,7 +6106,7 @@ impl Client {
             msg: format!("Failed to sync CloudKit attachments (get_container): {}", e),
         })?;
         let zone_id = container.private_zone("attachmentManateeZone".to_string());
-        let zone_key = container
+        let mut zone_key = container
             .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
             .await
             .map_err(|e| WrappedError::GenericError {
@@ -6126,6 +6127,8 @@ impl Client {
 
         let mut normalized = Vec::with_capacity(response.change.len());
         let mut ford_cached = 0usize;
+        let mut refreshed_zone_key_config = false;
+        let mut pcs_skipped = 0usize;
         for change in &response.change {
             let identifier = match change.identifier.as_ref().and_then(|i| i.value.as_ref()) {
                 Some(v) => v.name().to_string(),
@@ -6141,12 +6144,71 @@ impl Client {
                 continue;
             }
 
-            let pcskey = match pcs_keys_for_record(record, &zone_key) {
-                Ok(k) => k,
-                Err(e) => {
-                    warn!("cloud_sync_attachments: PCS key derive failed for {}: {}", identifier, e);
-                    continue;
+            // Master's PCS-record-key-missing refresh retry pattern:
+            // when `pcs_keys_for_record` returns PCSRecordKeyMissing, the
+            // zone encryption config is likely stale (a new key was
+            // rotated after our cache was seeded). Clear the zone config
+            // cache, re-fetch, and retry once. For other PCS-related
+            // errors (ShareKeyNotFound, DecryptionKeyNotFound,
+            // MasterKeyNotFound), gracefully skip the record with a warn.
+            // Without this, my sync was silently skipping records whose
+            // Ford keys master would have recovered — producing gaps in
+            // the cache that showed up as "all cached keys exhausted"
+            // failures during Ford dedup recovery.
+            let pcskey_opt = match pcs_keys_for_record(record, &zone_key) {
+                Ok(k) => Some(k),
+                Err(PushError::PCSRecordKeyMissing) if !refreshed_zone_key_config => {
+                    info!("cloud_sync_attachments: PCSRecordKeyMissing for {}, refreshing zone config", identifier);
+                    container.clear_cache_zone_encryption_config(&zone_id).await;
+                    refreshed_zone_key_config = true;
+                    match container
+                        .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                        .await
+                    {
+                        Ok(new_key) => {
+                            zone_key = new_key;
+                            match pcs_keys_for_record(record, &zone_key) {
+                                Ok(k) => Some(k),
+                                Err(e) => {
+                                    pcs_skipped += 1;
+                                    warn!(
+                                        "cloud_sync_attachments: PCS key still missing after refresh for {}: {}",
+                                        identifier, e
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("cloud_sync_attachments: zone config refresh failed: {}", e);
+                            None
+                        }
+                    }
                 }
+                Err(err)
+                    if matches!(
+                        err,
+                        PushError::PCSRecordKeyMissing
+                            | PushError::ShareKeyNotFound(_)
+                            | PushError::DecryptionKeyNotFound(_)
+                            | PushError::MasterKeyNotFound
+                    ) =>
+                {
+                    pcs_skipped += 1;
+                    warn!(
+                        "cloud_sync_attachments: skipping {} due to PCS key error: {}",
+                        identifier, err
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!("cloud_sync_attachments: unexpected PCS error for {}: {}", identifier, e);
+                    None
+                }
+            };
+            let pcskey = match pcskey_opt {
+                Some(k) => k,
+                None => continue,
             };
 
             let att: CloudAttachmentWithAvid = match std::panic::catch_unwind(
