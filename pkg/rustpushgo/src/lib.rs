@@ -4815,30 +4815,38 @@ impl Client {
             cloudkit, keychain.clone(),
         ));
 
-        let prewarm_enabled = std::env::var("RUSTPUSHGO_CLOUD_PREWARM")
-            .map(|v| {
-                let v = v.to_ascii_lowercase();
-                v == "1" || v == "true" || v == "yes" || v == "on"
-            })
-            .unwrap_or(false);
-
-        // Optional best-effort prewarm for CloudKit record/key caches.
-        // Useful when running against forks that don't expose warm_zone_keys().
-        if prewarm_enabled {
-            info!("Cloud client init: running optional prewarm shim");
-            if let Err(e) = cloud_messages.sync_chats(None).await {
-                warn!("Cloud client init: chat zone prewarm failed (non-fatal): {}", e);
-            }
-            if let Err(e) = cloud_messages.sync_messages(None).await {
-                warn!("Cloud client init: message zone prewarm failed (non-fatal): {}", e);
-            }
-            if let Err(e) = cloud_messages.sync_attachments(None).await {
-                warn!("Cloud client init: attachment zone prewarm failed (non-fatal): {}", e);
+        // Step 3: Pre-warm PCS zone key cache with sync_keychain=false.
+        //
+        // get_zone_encryption_config_sev() is called lazily throughout the sync
+        // paths (attachments, chats, messages). With sync_keychain=true (the
+        // default), each first call per zone triggers sync_keychain →
+        // is_in_clique() → sync_trust() → Cuttlefish fetchChanges, which can
+        // apply a self-exclusion from another device and return NotInClique.
+        //
+        // By pre-warming here (right after our own sync_keychain_with_retries
+        // already ran), we populate the container's in-memory zone key cache
+        // with sync_keychain=false. All subsequent lazy calls find the key in
+        // cache and skip the sync_keychain call entirely.
+        {
+            use rustpush::cloud_messages::MESSAGES_SERVICE;
+            match cloud_messages.get_container().await {
+                Ok(container) => {
+                    for zone_name in &["messageManateeZone", "chatManateeZone", "attachmentManateeZone"] {
+                        let zone_id = container.private_zone(zone_name.to_string());
+                        match container.get_zone_encryption_config_sev(
+                            &[(zone_id, None)],
+                            &keychain,
+                            &MESSAGES_SERVICE,
+                            false,
+                        ).await {
+                            Ok(_) => info!("Cloud client init: pre-warmed PCS zone key for {}", zone_name),
+                            Err(e) => warn!("Cloud client init: zone key prewarm for {} failed (non-fatal): {}", zone_name, e),
+                        }
+                    }
+                }
+                Err(e) => warn!("Cloud client init: container fetch for zone prewarm failed (non-fatal): {}", e),
             }
         }
-
-        // Step 3: The current fork API doesn't expose an explicit warm_zone_keys()
-        // helper. sync/count calls below will populate container caches lazily.
 
         // Step 4: Log server-side record counts for diagnostics.
         match cloud_messages.count_records().await {
