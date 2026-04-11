@@ -2294,21 +2294,25 @@ pub trait UpdateUsersCallback: Send + Sync {
 #[uniffi::export]
 pub fn init_logger() {
     if std::env::var("RUST_LOG").is_err() {
-        // Default log filter: INFO for most modules, but silence the two
-        // chatty upstream modules that flood stdout on every APNs
-        // heartbeat / every mutex lock and make interactive prompts
-        // (Apple ID login) unreadable:
-        //   * rustpush::util — `DebugMutex`/`DebugRwLock` lock/unlock
-        //     tracing, fires on every lock-release.
-        //   * rustpush::aps — APNs keepalive/send loop tracing
-        //     ("Sending", "Attempting to send", "Updating topics",
-        //     "Updated"), fires every few seconds during steady state.
+        // Default log filter: silence the entire `rustpush` crate at WARN
+        // (upstream OpenBubbles has ~80+ info! sites across mmcs, cloudkit,
+        // keychain, cloud_messages, pcs, aps, util, statuskit, findmy, and
+        // more — vastly more chatty than master's vendored tree). Keep our
+        // own `rustpushgo` wrapper at INFO so Ford recovery messages,
+        // relay wiring, and other wrapper-level diagnostics surface.
         //
-        // Override with RUST_LOG=info,rustpush::util=info,rustpush::aps=info
-        // (or RUST_LOG=debug) when debugging connection/mutex issues.
+        // The Go-side bridge (`component=imessage`, `component=cloud_sync`,
+        // etc.) writes through zerolog and is unaffected — those logs come
+        // through at whatever level the Go bridge is configured for.
+        //
+        // If you need to debug rustpush internals, override at invocation
+        // time with e.g.:
+        //   RUST_LOG=info,rustpush=info          # all rustpush info logs
+        //   RUST_LOG=info,rustpush::icloud=debug # deep cloudkit/mmcs/pcs
+        //   RUST_LOG=debug                       # everything
         std::env::set_var(
             "RUST_LOG",
-            "info,rustpush::util=warn,rustpush::aps=warn",
+            "warn,rustpush=warn,rustpushgo=info",
         );
     }
     let _ = pretty_env_logger::try_init();
