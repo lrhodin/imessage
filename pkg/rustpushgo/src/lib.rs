@@ -2294,14 +2294,22 @@ pub trait UpdateUsersCallback: Send + Sync {
 #[uniffi::export]
 pub fn init_logger() {
     if std::env::var("RUST_LOG").is_err() {
-        // Match master's default log level, but silence upstream's
-        // `DebugMutex`/`DebugRwLock` instrumentation from rustpush::util.
-        // Cameron added that for mutex-contention debugging and it logs
-        // at `info!` level on every lock/unlock, which floods stdout and
-        // makes interactive prompts (Apple ID login) unreadable. Users
-        // who want the mutex trace can still set RUST_LOG=debug or
-        // RUST_LOG=info,rustpush::util=info manually.
-        std::env::set_var("RUST_LOG", "info,rustpush::util=warn");
+        // Default log filter: INFO for most modules, but silence the two
+        // chatty upstream modules that flood stdout on every APNs
+        // heartbeat / every mutex lock and make interactive prompts
+        // (Apple ID login) unreadable:
+        //   * rustpush::util — `DebugMutex`/`DebugRwLock` lock/unlock
+        //     tracing, fires on every lock-release.
+        //   * rustpush::aps — APNs keepalive/send loop tracing
+        //     ("Sending", "Attempting to send", "Updating topics",
+        //     "Updated"), fires every few seconds during steady state.
+        //
+        // Override with RUST_LOG=info,rustpush::util=info,rustpush::aps=info
+        // (or RUST_LOG=debug) when debugging connection/mutex issues.
+        std::env::set_var(
+            "RUST_LOG",
+            "info,rustpush::util=warn,rustpush::aps=warn",
+        );
     }
     let _ = pretty_env_logger::try_init();
 
