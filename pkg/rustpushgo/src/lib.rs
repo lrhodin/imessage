@@ -6031,110 +6031,44 @@ impl Client {
         &self,
         continuation_token: Option<String>,
     ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
-        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, ALL_ASSETS};
-        use rustpush::cloud_messages::MESSAGES_SERVICE;
-        use rustpush::cloudkit_proto::CloudKitRecord as _;
-
         let token = decode_continuation_token(continuation_token)?;
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
 
-        // Hand-rolled version of upstream's `sync_attachments` that parses
-        // records as `CloudAttachmentWithAvid` so we see the `avid` field
-        // (Live Photo MOV companion). Same HTTP call, same record type
-        // ("attachment"), same PCS decryption pipeline — only the Rust
-        // type we decode into changes.
+        // Use upstream's own `sync_attachments` — same code path master
+        // went through via its vendored tree. This is battle-tested: same
+        // PCS decryption, same record parsing, same Ford key extraction.
+        // The hand-rolled version had a subtle drift that produced cached
+        // bytes that didn't match what MMCS expected, causing every Ford
+        // recovery to brute-force through invalid keys.
         //
-        // Uses ALL_ASSETS (not NO_ASSETS) to match master's
-        // `sync_records_with_assets::<CloudAttachment>("attachmentManateeZone",
-        //  continuation_token, &ALL_ASSETS)` call. With NO_ASSETS the record
-        // fields came back with `protection_info.protection_info` truncated
-        // or missing — every cached Ford key was garbage, so every Ford SIV
-        // retry failed. ALL_ASSETS preserves the PCS-encrypted
-        // protection_info bytes so `from_record_encrypted` produces the real
-        // 32-byte Ford key we register into the cache.
-        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
-            msg: format!("Failed to sync CloudKit attachments (get_container): {}", e),
-        })?;
-        let zone_id = container.private_zone("attachmentManateeZone".to_string());
-        let zone_key = container
-            .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+        // avid detection / avid Ford key registration happens at download
+        // time in `cloud_download_attachment` (which uses our local
+        // CloudAttachmentWithAvid type) so we still get Live Photo support
+        // — it's just driven by the download path instead of sync.
+        let (next_token, results, status) = cloud_messages
+            .sync_attachments(token)
             .await
             .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to sync CloudKit attachments (zone_key): {}", e),
-            })?;
-        let (_assets, response) = container
-            .perform(
-                &CloudKitSession::new(),
-                FetchRecordChangesOperation::new(zone_id.clone(), token, &ALL_ASSETS),
-            )
-            .await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to sync CloudKit attachments (perform): {}", e),
+                msg: format!("Failed to sync CloudKit attachments: {}", e),
             })?;
 
-        let status = response.status();
-        let next_token = response.sync_continuation_token().to_vec();
+        let mut normalized = Vec::with_capacity(results.len());
+        let mut ford_cached = 0usize;
+        for (record_name, att_opt) in results {
+            let Some(att) = att_opt else { continue };
 
-        let mut normalized = Vec::with_capacity(response.change.len());
-        for change in &response.change {
-            let identifier = match change
-                .identifier
-                .as_ref()
-                .and_then(|i| i.value.as_ref())
-            {
-                Some(v) => v.name().to_string(),
-                None => continue,
-            };
-            let record = match &change.record {
-                Some(r) => r,
-                None => continue, // deleted tombstone
-            };
-            if record.r#type.as_ref().and_then(|t| t.name.as_deref()) != Some(CloudAttachmentWithAvid::record_type()) {
-                continue;
-            }
-
-            // Derive the per-record PCS encryptor from the zone key (same
-            // two-step PCS decryption upstream uses in sync_records).
-            let pcskey = match pcs_keys_for_record(record, &zone_key) {
-                Ok(k) => k,
-                Err(e) => {
-                    warn!("cloud_sync_attachments: PCS key derive failed for {}: {}", identifier, e);
-                    continue;
-                }
-            };
-
-            // Wrap PCS field decode in catch_unwind (same pattern as the
-            // other PCS-reaching call sites in this wrapper) because
-            // malformed PCS fields can panic inside upstream.
-            let att: CloudAttachmentWithAvid = match std::panic::catch_unwind(
-                std::panic::AssertUnwindSafe(|| {
-                    CloudAttachmentWithAvid::from_record_encrypted(&record.record_field, Some(&pcskey))
-                }),
-            ) {
-                Ok(parsed) => parsed,
-                Err(_) => {
-                    warn!(
-                        "cloud_sync_attachments: skipping record {} (PCS decode panic)",
-                        identifier
-                    );
-                    continue;
-                }
-            };
-
-            let has_avid = att.avid.size.unwrap_or(0) > 0;
-
+            // Register this record's lqa Ford key into the cache. Uses
+            // upstream's own decrypted protection_info bytes — known good.
             let ford_key = att
                 .lqa
                 .protection_info
                 .as_ref()
                 .and_then(|p| p.protection_info.as_ref())
                 .cloned();
-            let avid_ford_key = att
-                .avid
-                .protection_info
-                .as_ref()
-                .and_then(|p| p.protection_info.as_ref())
-                .cloned();
+            if let Some(ref k) = ford_key {
+                register_ford_key(k.clone());
+                ford_cached += 1;
+            }
 
             normalized.push(WrappedCloudAttachmentInfo {
                 guid: att.cm.0.guid.clone(),
@@ -6142,13 +6076,25 @@ impl Client {
                 uti_type: att.cm.0.uti.clone(),
                 filename: att.cm.0.transfer_name.clone().or_else(|| att.cm.0.filename.clone()),
                 file_size: att.cm.0.total_bytes,
-                record_name: identifier,
+                record_name,
                 hide_attachment: att.cm.0.hide_attachment,
-                has_avid,
+                // has_avid is detected at download time via CloudAttachmentWithAvid.
+                // Sync-time detection isn't available via upstream's CloudAttachment
+                // which only declares `cm` + `lqa`. The Go-side download code will
+                // try the avid download path when metadata suggests it
+                // (hide_attachment == true is the primary indicator).
+                has_avid: false,
                 ford_key,
-                avid_ford_key,
+                // avid Ford key is registered at download time, not sync time.
+                avid_ford_key: None,
             });
         }
+
+        info!(
+            "cloud_sync_attachments: {} attachments normalized, {} Ford keys cached",
+            normalized.len(),
+            ford_cached
+        );
 
         Ok(WrappedCloudSyncAttachmentsPage {
             continuation_token: encode_continuation_token(next_token),
@@ -6785,13 +6731,6 @@ impl Client {
     ) -> Result<Vec<u8>, WrappedError> {
         use futures::FutureExt;
 
-        let cached_keys = ford_key_cache_values();
-        info!(
-            "Ford recovery {}: trying {} cached keys",
-            record_name,
-            cached_keys.len()
-        );
-
         if base_record.lqa.bundled_request_id.is_none() {
             warn!(
                 "Ford recovery {}: lqa.bundled_request_id is None, skipping recovery",
@@ -6802,7 +6741,37 @@ impl Client {
             });
         }
 
-        for (idx, alt_key) in cached_keys.iter().enumerate() {
+        // Cap brute-force retries. Each iteration is a full
+        // `container.get_assets` call which re-runs the MMCS fetch over
+        // HTTP (~200-500ms per attempt). Without a cap, 913 cached keys
+        // would take 3-8 minutes per failing record, making backfill
+        // take hours. MAX_RETRIES is tuned for typical dedup chain depth:
+        // Apple's MMCS dedup is chronologically local, so if the right
+        // key isn't in the first N tries (iterated recency-first), it's
+        // almost certainly not in the cache at all and more retries
+        // just burn bandwidth. Override via RUSTPUSHGO_FORD_RETRY_LIMIT
+        // if you need aggressive recovery.
+        const DEFAULT_MAX_RETRIES: usize = 20;
+        let max_retries: usize = std::env::var("RUSTPUSHGO_FORD_RETRY_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_RETRIES);
+
+        // Iterate in REVERSE (most recently registered keys first). Dedup
+        // targets tend to be recent because MMCS dedups blob content
+        // across a rolling window of uploads, so the correct key is
+        // usually from a record we saw recently.
+        let mut cached_keys = ford_key_cache_values();
+        cached_keys.reverse();
+        let total_cached = cached_keys.len();
+        let attempt_limit = max_retries.min(total_cached);
+
+        info!(
+            "Ford recovery {}: trying up to {} keys (recency-first, out of {} cached)",
+            record_name, attempt_limit, total_cached
+        );
+
+        for (idx, alt_key) in cached_keys.iter().take(attempt_limit).enumerate() {
             let mut record = base_record.clone();
             if let Some(pi) = record.lqa.protection_info.as_mut() {
                 pi.protection_info = Some(alt_key.clone());
@@ -6823,7 +6792,7 @@ impl Client {
                         "Ford dedup recovery SUCCESS: record={} attempt={}/{} bytes={}",
                         record_name,
                         idx + 1,
-                        cached_keys.len(),
+                        attempt_limit,
                         bytes.len()
                     );
                     return Ok(bytes);
@@ -6838,15 +6807,13 @@ impl Client {
         }
 
         warn!(
-            "Ford dedup recovery FAILED: record={} tried={} all cached keys exhausted",
-            record_name,
-            cached_keys.len()
+            "Ford dedup recovery FAILED: record={} tried={}/{} cached keys — giving up",
+            record_name, attempt_limit, total_cached
         );
         Err(WrappedError::GenericError {
             msg: format!(
-                "Ford dedup recovery for {}: all {} cached keys failed SIV decrypt",
-                record_name,
-                cached_keys.len()
+                "Ford dedup recovery for {}: {}/{} cached keys failed SIV decrypt (retry cap)",
+                record_name, attempt_limit, total_cached
             ),
         })
     }
