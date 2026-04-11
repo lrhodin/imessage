@@ -8,7 +8,10 @@ DATA_DIR    ?= $(HOME)/.local/share/mautrix-imessage
 UNAME_S     := $(shell uname -s)
 
 RUST_LIB    := librustpushgo.a
-RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' 2>/dev/null)
+RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' -o -name '*.m' -o -name '*.h' 2>/dev/null) \
+               pkg/rustpushgo/build.rs \
+               $(shell find nac-validation/src -name '*.rs' -o -name '*.m' -o -name '*.h' 2>/dev/null) \
+               nac-validation/build.rs
 # rustpush source root (default: upstream worktree checkout).
 # Override at invocation time, e.g.:
 #   make RUSTPUSH_DIR=rustpush-master build
