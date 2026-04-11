@@ -156,6 +156,13 @@ type IMClient struct {
 	// Cloud backfill local cache store.
 	cloudStore *cloudBackfillStore
 
+	// Ford key cache — reimplementation of the 94f7b8e Ford cross-batch
+	// deduplication fix in Go. Populated aggressively during CloudKit
+	// attachment sync from every record's `lqa.protection_info` (and
+	// `avid.protection_info` for Live Photos), consulted on download to
+	// recover from MMCS dedup key mismatches. See pkg/connector/ford_cache.go.
+	fordCache *FordKeyCache
+
 	// Chat.db backfill (macOS with Full Disk Access only)
 	chatDB *chatDB
 

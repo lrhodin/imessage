@@ -1093,6 +1093,10 @@ void* uniffi_rustpushgo_fn_func_create_local_macos_config_with_device_id(
 	RustCallStatus* out_status
 );
 
+uint64_t uniffi_rustpushgo_fn_func_ford_key_cache_size(
+	RustCallStatus* out_status
+);
+
 void uniffi_rustpushgo_fn_func_init_logger(
 	RustCallStatus* out_status
 );
@@ -1113,6 +1117,11 @@ void* uniffi_rustpushgo_fn_func_new_client(
 	RustBuffer token_provider,
 	uint64_t message_callback,
 	uint64_t update_users_callback,
+	RustCallStatus* out_status
+);
+
+void uniffi_rustpushgo_fn_func_register_ford_key(
+	RustBuffer key,
 	RustCallStatus* out_status
 );
 
@@ -1445,6 +1454,10 @@ uint16_t uniffi_rustpushgo_checksum_func_create_local_macos_config_with_device_i
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_func_ford_key_cache_size(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_func_init_logger(
 	RustCallStatus* out_status
 );
@@ -1454,6 +1467,10 @@ uint16_t uniffi_rustpushgo_checksum_func_login_start(
 );
 
 uint16_t uniffi_rustpushgo_checksum_func_new_client(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_func_register_ford_key(
 	RustCallStatus* out_status
 );
 

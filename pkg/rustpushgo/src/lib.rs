@@ -54,6 +54,76 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
 }
 
 // ============================================================================
+// Ford key cache (wrapper-level reimplementation of the 94f7b8e fix)
+// ============================================================================
+//
+// CloudKit videos are Ford-encrypted: each record carries a 32-byte Ford key
+// in `lqa.protection_info.protection_info`, and MMCS deduplicates identical
+// content at the storage layer. When the same video is uploaded twice, MMCS
+// returns ONE encrypted blob encrypted with the original uploader's key — so
+// the second record's own Ford key cannot SIV-decrypt it, and upstream
+// rustpush's `get_mmcs` panics on the `.unwrap()` of the SIV result.
+//
+// This cache holds every Ford key the bridge has ever seen (populated during
+// CloudKit attachment sync). On a SIV panic during download, the wrapper
+// catches the panic and retries `container.get_assets(...)` with each cached
+// key in turn by mutating `Asset.protection_info.protection_info` before the
+// call. This matches the semantics of the original in-rustpush fix without
+// touching upstream source.
+
+fn ford_key_cache() -> &'static std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Register a Ford key in the process-wide cache so that a later deduplicated
+/// download can recover from an SIV decrypt failure. Key is indexed by
+/// `fordChecksum = 0x01 || SHA1(key)`. Idempotent; no-op for empty input.
+#[uniffi::export]
+pub fn register_ford_key(key: Vec<u8>) {
+    if key.is_empty() {
+        return;
+    }
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(&key);
+    let sha = hasher.finalize();
+    let mut checksum = Vec::with_capacity(1 + sha.len());
+    checksum.push(0x01);
+    checksum.extend_from_slice(&sha);
+    let mut cache = match ford_key_cache().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if cache.insert(checksum, key).is_some() {
+        return;
+    }
+    let size = cache.len();
+    drop(cache);
+    debug!("register_ford_key: cached Ford key for dedup fallback (size={})", size);
+}
+
+/// Number of Ford keys currently cached. Diagnostic only.
+#[uniffi::export]
+pub fn ford_key_cache_size() -> u64 {
+    let cache = match ford_key_cache().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.len() as u64
+}
+
+/// Snapshot of all cached Ford keys, used by the download recovery path.
+fn ford_key_cache_values() -> Vec<Vec<u8>> {
+    let cache = match ford_key_cache().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.values().cloned().collect()
+}
+
+// ============================================================================
 // Wrapper types
 // ============================================================================
 
@@ -1448,6 +1518,18 @@ pub struct WrappedCloudAttachmentInfo {
     /// Whether this attachment record has a Live Photo video in its `avid` asset field.
     /// When true, use cloud_download_attachment_avid to get the MOV instead of the HEIC.
     pub has_avid: bool,
+    /// PCS-decrypted `lqa.protection_info` bytes — for Ford-encrypted videos,
+    /// this is the raw 32-byte Ford key used to decrypt per-chunk keys from
+    /// the MMCS Ford metadata blob. None for attachments without Ford
+    /// encryption (images use V1 per-chunk keys in the MMCS chunk metadata).
+    ///
+    /// Exposed so the Go-side Ford key cache can pre-populate during sync
+    /// and fall back to cached keys on MMCS cross-batch dedup. See
+    /// `pkg/connector/ford_cache.go`.
+    pub ford_key: Option<Vec<u8>>,
+    /// PCS-decrypted `avid.protection_info` bytes — the Live Photo MOV
+    /// companion's Ford key. Same semantics as `ford_key`.
+    pub avid_ford_key: Option<Vec<u8>>,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -5786,6 +5868,27 @@ impl Client {
                 let has_avid = att.avid.size.unwrap_or(0) > 0;
                 #[cfg(not(feature = "rustpush-avid-download"))]
                 let has_avid = false;
+
+                // Extract the PCS-decrypted Ford keys from `lqa.protection_info`
+                // (and `avid.protection_info` for Live Photos) so Go can
+                // pre-populate the Ford key cache. Images (V1 per-chunk
+                // encryption) have no protection_info Ford key — None.
+                let ford_key = att
+                    .lqa
+                    .protection_info
+                    .as_ref()
+                    .and_then(|p| p.protection_info.as_ref())
+                    .cloned();
+                #[cfg(feature = "rustpush-avid-download")]
+                let avid_ford_key = att
+                    .avid
+                    .protection_info
+                    .as_ref()
+                    .and_then(|p| p.protection_info.as_ref())
+                    .cloned();
+                #[cfg(not(feature = "rustpush-avid-download"))]
+                let avid_ford_key: Option<Vec<u8>> = None;
+
                 normalized.push(WrappedCloudAttachmentInfo {
                     guid: att.cm.guid.clone(),
                     mime_type: att.cm.mime_type.clone(),
@@ -5795,6 +5898,8 @@ impl Client {
                     record_name,
                     hide_attachment: att.cm.hide_attachment,
                     has_avid,
+                    ford_key,
+                    avid_ford_key,
                 });
             }
             // Deleted attachments are simply not included
@@ -5810,23 +5915,66 @@ impl Client {
 
     /// Download an attachment from CloudKit by its record name.
     /// Returns the raw file bytes.
+    ///
+    /// # Ford dedup recovery
+    ///
+    /// First tries upstream's `download_attachment`. If that path panics
+    /// (which happens when MMCS serves a deduplicated Ford blob encrypted
+    /// with a different record's key — the `.unwrap()` at the top of
+    /// `get_mmcs`'s SIV decrypt), the panic is caught here and the wrapper
+    /// retries manually by iterating cached Ford keys. For each cached key,
+    /// we fetch the record, mutate `lqa.protection_info.protection_info` to
+    /// inject the candidate key, and call `container.get_assets(...)`
+    /// directly. This matches the 94f7b8e fix's semantics without touching
+    /// upstream rustpush source.
     pub async fn cloud_download_attachment(
         &self,
         record_name: String,
     ) -> Result<Vec<u8>, WrappedError> {
+        use futures::FutureExt;
+
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
 
-        // download_attachment consumes the writer via into_values().
-        // Use a SharedWriter so we can recover the written bytes after the call.
+        // Attempt 1 — normal upstream path, wrapped in catch_unwind so a
+        // Ford SIV panic doesn't take down the bridge.
         let shared = SharedWriter::new();
         let mut files = HashMap::new();
         files.insert(record_name.clone(), shared.clone());
-        cloud_messages.download_attachment(files).await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to download CloudKit attachment {}: {}", record_name, e),
-            })?;
-        Ok(shared.into_bytes())
+        let fut = cloud_messages.download_attachment(files);
+        let wrapped = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+
+        match wrapped {
+            Ok(Ok(())) => return Ok(shared.into_bytes()),
+            Ok(Err(e)) => {
+                // Real error (network, auth, etc.) — not a Ford SIV panic.
+                return Err(WrappedError::GenericError {
+                    msg: format!("Failed to download CloudKit attachment {}: {}", record_name, e),
+                });
+            }
+            Err(_panic) => {
+                warn!(
+                    "cloud_download_attachment {}: SIV panic (likely Ford dedup), \
+                     attempting recovery with {} cached Ford keys",
+                    record_name,
+                    ford_key_cache_size()
+                );
+            }
+        }
+
+        // Attempt 2 — Ford dedup recovery. Hand-rolled path that fetches
+        // the CloudAttachment record, injects a cached Ford key into
+        // `Asset.protection_info.protection_info`, and calls
+        // `container.get_assets(...)` directly. `get_assets` extracts the
+        // Ford key from that exact field and passes it into `get_mmcs` as
+        // the 4th element of the files tuple (see upstream
+        // `cloudkit.rs::get_assets`), so mutating protection_info is how we
+        // inject an override without touching rustpush source.
+        self.cloud_download_attachment_ford_recovery(&cloud_messages, &record_name).await
     }
+
+    // Ford recovery helper lives in a separate non-uniffi impl block below
+    // (`impl WrappedClient { ford_recovery_download ... }`) — it takes
+    // non-FFI reference types and uniffi can't codegen wrappers for it.
 
     /// Whether this build supports CloudKit avid (Live Photo MOV) downloads.
     /// This is explicit so callers can branch behavior instead of probing by error text.
@@ -6242,6 +6390,119 @@ impl Client {
         if let Some(h) = handle.take() {
             h.abort();
         }
+    }
+}
+
+// Non-uniffi-exported helpers on `Client`. Methods here take reference types
+// (like `&CloudMessagesClient<...>` or `&str`) that uniffi can't generate FFI
+// wrappers for, so they live in a plain impl block that the FFI codegen
+// ignores.
+impl Client {
+    /// Ford dedup recovery path: fetch the CloudAttachment record, iterate
+    /// over every cached Ford key, mutate `Asset.protection_info` per attempt,
+    /// and retry `container.get_assets(...)` wrapped in `catch_unwind` until
+    /// one candidate SIV-decrypts cleanly. Matches the 94f7b8e fix's
+    /// cross-batch recovery semantics without modifying upstream rustpush.
+    async fn cloud_download_attachment_ford_recovery(
+        &self,
+        cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>,
+        record_name: &str,
+    ) -> Result<Vec<u8>, WrappedError> {
+        use futures::FutureExt;
+        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
+        use rustpush::cloud_messages::{CloudAttachment, MESSAGES_SERVICE};
+
+        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
+            msg: format!("Ford recovery: get_container failed: {e}"),
+        })?;
+        let zone = container.private_zone("attachmentManateeZone".to_string());
+        let zone_key = container
+            .get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Ford recovery: get_zone_encryption_config failed: {e}"),
+            })?;
+
+        let invoke = container
+            .perform_operations(
+                &CloudKitSession::new(),
+                &FetchRecordOperation::many(&ALL_ASSETS, &zone, &[record_name.to_string()]),
+                IsolationLevel::Operation,
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Ford recovery: perform_operations failed: {e}"),
+            })?;
+        let records = FetchedRecords::new(&invoke);
+        let base_record: CloudAttachment = records.get_record(record_name, Some(&zone_key));
+
+        // Register the record's own key in case sync hasn't touched it yet
+        // (e.g. direct download of a just-arrived attachment).
+        if let Some(pi) = base_record
+            .lqa
+            .protection_info
+            .as_ref()
+            .and_then(|p| p.protection_info.as_ref())
+        {
+            register_ford_key(pi.clone());
+        }
+
+        let cached_keys = ford_key_cache_values();
+        info!(
+            "Ford recovery {}: trying {} cached keys",
+            record_name,
+            cached_keys.len()
+        );
+
+        for (idx, alt_key) in cached_keys.iter().enumerate() {
+            // Clone per attempt so we can mutate `protection_info`
+            // independently and retry cleanly on panic.
+            let mut record = base_record.clone();
+            if let Some(pi) = record.lqa.protection_info.as_mut() {
+                pi.protection_info = Some(alt_key.clone());
+            } else {
+                continue;
+            }
+
+            let shared = SharedWriter::new();
+            let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
+                vec![(&record.lqa, shared.clone())];
+
+            let fut = container.get_assets(&records.assets, assets_tuple);
+            let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+            match result {
+                Ok(Ok(())) => {
+                    info!(
+                        "Ford SIV succeeded with cached key (dedup resolved, attempt {}/{})",
+                        idx + 1,
+                        cached_keys.len()
+                    );
+                    return Ok(shared.into_bytes());
+                }
+                Ok(Err(e)) => {
+                    debug!("Ford recovery attempt {} returned error: {}", idx + 1, e);
+                }
+                Err(_panic) => {
+                    debug!(
+                        "Ford recovery attempt {} panicked (wrong key, retrying)",
+                        idx + 1
+                    );
+                }
+            }
+        }
+
+        warn!(
+            "Ford recovery {}: all {} cached keys failed",
+            record_name,
+            cached_keys.len()
+        );
+        Err(WrappedError::GenericError {
+            msg: format!(
+                "Ford dedup recovery for {}: all {} cached keys failed SIV decrypt",
+                record_name,
+                cached_keys.len()
+            ),
+        })
     }
 }
 

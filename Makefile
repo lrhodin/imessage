@@ -17,9 +17,11 @@ RUSTPUSH_DIR ?= third_party/rustpush-upstream
 #   fork (default): clone cameronaaron/rustpush which has all bridge-compat
 #                   fixes already applied — no runtime patching needed.
 #   upstream:       clone raw OpenBubbles/rustpush (no patches; for testing only).
-RUSTPUSH_SOURCE ?= fork
-RUSTPUSH_FORK_URL ?= https://github.com/cameronaaron/rustpush.git
-RUSTPUSH_FORK_REF ?= imessage-bridge-compat
+# Pinned OpenBubbles/rustpush commit. Edit this file manually to bump, then
+# test locally before committing. The Makefile reads the SHA on build and
+# checks out that exact commit — no auto-bump, no branch drift, no fork refs.
+RUSTPUSH_PIN_FILE := third_party/rustpush-upstream.sha
+RUSTPUSH_PIN      := $(shell cat $(RUSTPUSH_PIN_FILE) 2>/dev/null)
 RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(RUSTPUSH_DIR)/apple-private-apis $(RUSTPUSH_DIR)/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(RUSTPUSH_DIR)/open-absinthe/build.rs)
 CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
 GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
@@ -153,23 +155,23 @@ ensure-rustpush-source:
 			done; \
 		fi; \
 	elif [ "$(RUSTPUSH_DIR)" = "third_party/rustpush-upstream" ]; then \
+		if [ -z "$(RUSTPUSH_PIN)" ]; then \
+			echo "error: $(RUSTPUSH_PIN_FILE) is missing or empty — required to pin rustpush SHA" >&2; exit 1; \
+		fi; \
 		if [ ! -d third_party/rustpush-upstream/.git ]; then \
-			echo "Cloning rustpush source..."; \
+			echo "Cloning OpenBubbles/rustpush at pinned SHA $(RUSTPUSH_PIN)..."; \
 			mkdir -p third_party; \
-			if [ "$(RUSTPUSH_SOURCE)" = "fork" ]; then \
-				git clone $(RUSTPUSH_FORK_URL) third_party/rustpush-upstream; \
-			else \
-				git clone $(UPSTREAM_REPO) third_party/rustpush-upstream; \
-			fi; \
+			git clone $(UPSTREAM_REPO) third_party/rustpush-upstream; \
+			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN); \
 			git -C third_party/rustpush-upstream submodule sync --recursive; \
 			git -C third_party/rustpush-upstream submodule update --init --recursive; \
 		fi; \
-		if [ "$(RUSTPUSH_SOURCE)" = "fork" ]; then \
-			echo "Refreshing rustpush from fork $(RUSTPUSH_FORK_URL) ($(RUSTPUSH_FORK_REF))..."; \
-			git -C third_party/rustpush-upstream remote set-url origin $(RUSTPUSH_FORK_URL); \
+		current=$$(git -C third_party/rustpush-upstream rev-parse HEAD 2>/dev/null || echo none); \
+		if [ "$$current" != "$(RUSTPUSH_PIN)" ]; then \
+			echo "Checking out pinned rustpush SHA $(RUSTPUSH_PIN) (was $$current)..."; \
+			git -C third_party/rustpush-upstream remote set-url origin $(UPSTREAM_REPO); \
 			git -C third_party/rustpush-upstream fetch --all --tags --prune; \
-			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_FORK_REF); \
-			git -C third_party/rustpush-upstream pull --ff-only origin $(RUSTPUSH_FORK_REF); \
+			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN); \
 			git -C third_party/rustpush-upstream submodule sync --recursive; \
 			git -C third_party/rustpush-upstream submodule update --init --recursive; \
 		fi; \

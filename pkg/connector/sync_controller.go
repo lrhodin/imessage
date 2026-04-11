@@ -1457,6 +1457,28 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 				RecordName: att.RecordName,
 				HasAvid:    att.HasAvid,
 			}
+
+			// Populate the Ford key cache from this record's
+			// PCS-decrypted protection_info. Mirrors the sync-side
+			// half of the 94f7b8e Ford dedup fix — every video's
+			// Ford key is available for future cross-batch lookup,
+			// regardless of upload order. Registered on BOTH the
+			// Go cache (used by Go-side lookups and tests) AND the
+			// wrapper's process-wide cache (used by the Ford
+			// recovery path inside cloud_download_attachment when
+			// an SIV panic is caught).
+			if att.FordKey != nil {
+				if c.fordCache != nil {
+					c.fordCache.Register(*att.FordKey)
+				}
+				rustpushgo.RegisterFordKey(*att.FordKey)
+			}
+			if att.AvidFordKey != nil {
+				if c.fordCache != nil {
+					c.fordCache.Register(*att.AvidFordKey)
+				}
+				rustpushgo.RegisterFordKey(*att.AvidFordKey)
+			}
 		}
 
 		prev := ptrStringOr(token, "")

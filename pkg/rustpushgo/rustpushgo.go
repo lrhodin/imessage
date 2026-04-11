@@ -411,6 +411,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_func_ford_key_cache_size(uniffiStatus)
+		})
+		if checksum != 25806 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_func_ford_key_cache_size: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_func_init_logger(uniffiStatus)
 		})
 		if checksum != 38755 {
@@ -434,6 +443,15 @@ func uniffiCheckChecksums() {
 		if checksum != 28402 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_func_new_client: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_func_register_ford_key(uniffiStatus)
+		})
+		if checksum != 34188 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_func_register_ford_key: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -6199,6 +6217,8 @@ type WrappedCloudAttachmentInfo struct {
 	RecordName     string
 	HideAttachment bool
 	HasAvid        bool
+	FordKey        *[]byte
+	AvidFordKey    *[]byte
 }
 
 func (r *WrappedCloudAttachmentInfo) Destroy() {
@@ -6210,6 +6230,8 @@ func (r *WrappedCloudAttachmentInfo) Destroy() {
 	FfiDestroyerString{}.Destroy(r.RecordName)
 	FfiDestroyerBool{}.Destroy(r.HideAttachment)
 	FfiDestroyerBool{}.Destroy(r.HasAvid)
+	FfiDestroyerOptionalBytes{}.Destroy(r.FordKey)
+	FfiDestroyerOptionalBytes{}.Destroy(r.AvidFordKey)
 }
 
 type FfiConverterTypeWrappedCloudAttachmentInfo struct{}
@@ -6230,6 +6252,8 @@ func (c FfiConverterTypeWrappedCloudAttachmentInfo) Read(reader io.Reader) Wrapp
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalBytesINSTANCE.Read(reader),
+		FfiConverterOptionalBytesINSTANCE.Read(reader),
 	}
 }
 
@@ -6246,6 +6270,8 @@ func (c FfiConverterTypeWrappedCloudAttachmentInfo) Write(writer io.Writer, valu
 	FfiConverterStringINSTANCE.Write(writer, value.RecordName)
 	FfiConverterBoolINSTANCE.Write(writer, value.HideAttachment)
 	FfiConverterBoolINSTANCE.Write(writer, value.HasAvid)
+	FfiConverterOptionalBytesINSTANCE.Write(writer, value.FordKey)
+	FfiConverterOptionalBytesINSTANCE.Write(writer, value.AvidFordKey)
 }
 
 type FfiDestroyerTypeWrappedCloudAttachmentInfo struct{}
@@ -8713,6 +8739,12 @@ func CreateLocalMacosConfigWithDeviceId(deviceId string) (*WrappedOsConfig, erro
 	}
 }
 
+func FordKeyCacheSize() uint64 {
+	return FfiConverterUint64INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint64_t {
+		return C.uniffi_rustpushgo_fn_func_ford_key_cache_size(_uniffiStatus)
+	}))
+}
+
 func InitLogger() {
 	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
 		C.uniffi_rustpushgo_fn_func_init_logger(_uniffiStatus)
@@ -8762,6 +8794,13 @@ func NewClient(connection *WrappedApsConnection, users *WrappedIdsUsers, identit
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_pointer(unsafe.Pointer(rustFuture), status)
 		})
+}
+
+func RegisterFordKey(key []byte) {
+	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_rustpushgo_fn_func_register_ford_key(rustBufferToC(FfiConverterBytesINSTANCE.Lower(key)), _uniffiStatus)
+		return false
+	})
 }
 
 func RestoreTokenProvider(config *WrappedOsConfig, connection *WrappedApsConnection, username string, hashedPasswordHex string, pet string, spdBase64 string) (*WrappedTokenProvider, error) {
