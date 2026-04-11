@@ -2,9 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, refactor]
   pull_request:
-    branches: [master]
+    branches: [master, refactor]
+  # Manual trigger — useful when bumping third_party/rustpush-upstream.sha
+  # locally and wanting to re-run the full verify pipeline on a branch
+  # without pushing a test commit.
+  workflow_dispatch: {}
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -86,8 +90,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             pkg/rustpushgo/target
-          key: cargo-macos-arm64-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-macos-arm64-${{ hashFiles('**/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
           restore-keys: cargo-macos-arm64-
+
+      - name: Verify pinned rustpush SHA file
+        run: |
+          PIN_FILE=third_party/rustpush-upstream.sha
+          if [ ! -f "$PIN_FILE" ]; then
+            echo "::error::$PIN_FILE is missing — refactor branch requires a pinned OpenBubbles/rustpush SHA"
+            exit 1
+          fi
+          PIN=$(tr -d '[:space:]' < "$PIN_FILE")
+          if [ -z "$PIN" ]; then
+            echo "::error::$PIN_FILE is empty"
+            exit 1
+          fi
+          echo "Pinned rustpush SHA: $PIN"
 
       - name: Build
         run: make build
@@ -143,8 +161,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             pkg/rustpushgo/target
-          key: cargo-linux-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-linux-${{ hashFiles('**/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
           restore-keys: cargo-linux-
+
+      - name: Verify pinned rustpush SHA file
+        run: |
+          PIN_FILE=third_party/rustpush-upstream.sha
+          if [ ! -f "$PIN_FILE" ]; then
+            echo "::error::$PIN_FILE is missing — refactor branch requires a pinned OpenBubbles/rustpush SHA"
+            exit 1
+          fi
+          PIN=$(tr -d '[:space:]' < "$PIN_FILE")
+          if [ -z "$PIN" ]; then
+            echo "::error::$PIN_FILE is empty"
+            exit 1
+          fi
+          echo "Pinned rustpush SHA: $PIN"
 
       - name: Build
         run: make build
