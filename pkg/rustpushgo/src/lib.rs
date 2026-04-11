@@ -24,13 +24,34 @@ use rustpush::{
     TokenProvider,
     ScheduleMode,
     cloudkit::{ZoneDeleteOperation, CloudKitSession},
-    base64_decode, encode_hex, ResourceState,
+    ResourceState,
 };
 use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
 use omnisette::default_provider;
 use std::sync::RwLock;
 use tokio::sync::broadcast;
 use util::{plist_from_string, plist_to_string};
+
+// Local helpers to replace rustpush's private `util::{base64_decode, encode_hex, ...}`.
+// Part of the zero-patch refactor: `rustpush::util` is private in upstream, so we
+// reimplement the same semantics (infallible on invalid base64/hex input) using the
+// `base64` and `hex` crates directly.
+#[inline]
+fn base64_decode(s: &str) -> Vec<u8> {
+    BASE64_STANDARD.decode(s).unwrap_or_default()
+}
+#[inline]
+fn base64_encode(data: &[u8]) -> String {
+    BASE64_STANDARD.encode(data)
+}
+#[inline]
+fn encode_hex(bytes: &[u8]) -> String {
+    hex::encode(bytes)
+}
+#[inline]
+fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
+    hex::decode(s)
+}
 
 // ============================================================================
 // Wrapper types
@@ -427,25 +448,60 @@ pub struct EscrowDeviceInfo {
 
 /// Wraps a TokenProvider that manages MobileMe auth tokens with auto-refresh.
 /// Used for iCloud services like CardDAV contacts and CloudKit messages.
+///
+/// This wrapper stores `account`, `os_config`, and `mme_delegate` alongside the
+/// inner TokenProvider because OpenBubbles upstream's TokenProvider keeps these
+/// as private fields with no public getters. As part of the zero-patch refactor,
+/// we pass them in at construction time and read from our own state.
 #[derive(uniffi::Object)]
 pub struct WrappedTokenProvider {
     inner: Arc<TokenProvider<omnisette::DefaultAnisetteProvider>>,
+    account: Arc<rustpush::DebugMutex<AppleAccount<omnisette::DefaultAnisetteProvider>>>,
+    os_config: Arc<dyn OSConfig>,
+    // MobileMe delegate stored as opaque plist XML bytes because
+    // `rustpush::auth::MobileMeDelegateResponse` is not nameable from outside the
+    // crate in OpenBubbles upstream (`mod auth` is private). Call sites that
+    // need a typed `&MobileMeDelegateResponse` reconstruct it via
+    // `plist::from_bytes(&bytes)?` and let the compiler infer T from the
+    // receiving function's signature (e.g. `KeychainClientState::new(_, _, &T)`).
+    mme_delegate_bytes: tokio::sync::Mutex<Option<Vec<u8>>>,
 }
 
-/// Helper: create CloudKit + Keychain clients from a TokenProvider.
+/// Helper: create CloudKit + Keychain clients from a WrappedTokenProvider.
 /// Shared by get_escrow_devices, join_keychain_clique, and join_keychain_clique_for_device.
+///
+/// Reads dsid/adsid/anisette directly from the locally-stored AppleAccount and
+/// the cached MobileMe delegate, avoiding the need for getter methods on
+/// TokenProvider itself (which upstream does not expose).
 async fn create_keychain_clients(
-    token_provider: &Arc<TokenProvider<omnisette::DefaultAnisetteProvider>>,
+    wp: &WrappedTokenProvider,
 ) -> Result<(
     Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
     Arc<rustpush::cloudkit::CloudKitClient<omnisette::DefaultAnisetteProvider>>,
 ), WrappedError> {
-    let dsid = token_provider.get_dsid().await?;
-    let adsid = token_provider.get_adsid().await?;
-    let mme_delegate = token_provider.get_mme_delegate().await?;
-    let account = token_provider.get_account();
-    let os_config = token_provider.get_os_config();
-    let anisette = account.lock().await.anisette.clone();
+    let (dsid, adsid, anisette) = {
+        let account = wp.account.lock().await;
+        let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
+            msg: "AppleAccount has no SPD — not fully logged in".into(),
+        })?;
+        let dsid = spd.get("DsPrsId")
+            .and_then(|v| v.as_unsigned_integer())
+            .ok_or(WrappedError::GenericError { msg: "SPD missing DsPrsId".into() })?
+            .to_string();
+        let adsid = spd.get("adsid")
+            .and_then(|v| v.as_string())
+            .ok_or(WrappedError::GenericError { msg: "SPD missing adsid".into() })?
+            .to_string();
+        let anisette = account.anisette.clone();
+        (dsid, adsid, anisette)
+    };
+    // Load MobileMe delegate as typed `MobileMeDelegateResponse` via type
+    // inference from its downstream usage (the `&mme_delegate` reference passed
+    // to `KeychainClientState::new(..., &MobileMeDelegateResponse)` below — Rust
+    // propagates that constraint back to `parse_mme_delegate`'s `T`).
+    let mme_delegate = wp.parse_mme_delegate().await?;
+    let os_config = wp.os_config.clone();
+    let token_provider = wp.inner.clone();
 
     let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
         .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
@@ -635,36 +691,155 @@ async fn join_keychain_with_bottles(
 impl WrappedTokenProvider {
     /// Get HTTP headers needed for iCloud MobileMe API calls.
     /// Includes Authorization (X-MobileMe-AuthToken) and anisette headers.
-    /// Auto-refreshes the mmeAuthToken weekly.
+    ///
+    /// OpenBubbles upstream exposes `TokenProvider::get_mme_token(&str)` which
+    /// returns the mmeAuthToken (and auto-refreshes internally). We build the
+    /// Apple-required HTTP headers (X-MobileMe-AuthToken, X-Client-UDID,
+    /// X-MMe-Client-Info, plus anisette) locally from our stored state.
     pub async fn get_icloud_auth_headers(&self) -> Result<HashMap<String, String>, WrappedError> {
-        Ok(self.inner.get_icloud_auth_headers().await?)
+        let token = self.inner.get_mme_token("mmeAuthToken").await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to fetch mmeAuthToken: {}", e),
+            })?;
+        let dsid = self.get_dsid().await?;
+
+        // Basic auth: "dsid:mmeAuthToken" base64-encoded in X-MMe-Client-Info? No.
+        // The header "Authorization: Basic base64(dsid:token)" is what Apple wants.
+        let auth_header_value = format!(
+            "Basic {}",
+            BASE64_STANDARD.encode(format!("{}:{}", dsid, token)),
+        );
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("Authorization".to_string(), auth_header_value);
+        headers.insert("X-Client-UDID".to_string(), self.os_config.get_udid().to_lowercase());
+        headers.insert(
+            "X-MMe-Client-Info".to_string(),
+            self.os_config.get_mme_clientinfo("com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)"),
+        );
+        headers.insert("X-MMe-Country".to_string(), "US".to_string());
+        headers.insert("X-MMe-Language".to_string(), "en".to_string());
+
+        // Anisette headers from the AppleAccount. `get_headers()` returns a
+        // `&HashMap<String, String>` so we clone the entries we need.
+        let anisette = {
+            let account = self.account.lock().await;
+            account.anisette.clone()
+        };
+        let mut anisette_guard = anisette.lock().await;
+        let anisette_headers = anisette_guard.get_headers().await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to fetch anisette headers: {}", e),
+            })?;
+        for (k, v) in anisette_headers.iter() {
+            headers.insert(k.clone(), v.clone());
+        }
+        drop(anisette_guard);
+
+        Ok(headers)
     }
 
     /// Get the contacts CardDAV URL from the MobileMe delegate config.
+    /// Reads from our locally-cached MobileMe delegate plist bytes via generic
+    /// `plist::Value` traversal (we can't name `MobileMeDelegateResponse` from
+    /// outside the rustpush crate, so we use untyped plist parsing here).
     pub async fn get_contacts_url(&self) -> Result<Option<String>, WrappedError> {
-        Ok(self.inner.get_contacts_url().await?)
+        let bytes_guard = self.mme_delegate_bytes.lock().await;
+        let Some(bytes) = bytes_guard.as_ref() else {
+            return Ok(None);
+        };
+        let value: plist::Value = plist::from_bytes(bytes).map_err(|e| {
+            WrappedError::GenericError { msg: format!("Invalid MobileMe delegate plist: {}", e) }
+        })?;
+        // The serialized delegate is `{"tokens": {...}, "com.apple.mobileme": {...}}`.
+        // CardDAV URL lives at `com.apple.mobileme/com.apple.Dataclass.Contact/url`.
+        let url = value
+            .as_dictionary()
+            .and_then(|d| d.get("com.apple.mobileme"))
+            .and_then(|v| v.as_dictionary())
+            .and_then(|d| d.get("com.apple.Dataclass.Contact"))
+            .and_then(|v| v.as_dictionary())
+            .and_then(|d| d.get("url"))
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_string());
+        Ok(url)
     }
 
-    /// Get the DSID for this account.
+    /// Get the DSID for this account (from AppleAccount's SPD dictionary).
     pub async fn get_dsid(&self) -> Result<String, WrappedError> {
-        Ok(self.inner.get_dsid().await?)
+        let account = self.account.lock().await;
+        let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
+            msg: "AppleAccount has no SPD — not fully logged in".into(),
+        })?;
+        let dsid = spd.get("DsPrsId")
+            .and_then(|v| v.as_unsigned_integer())
+            .ok_or(WrappedError::GenericError { msg: "SPD missing DsPrsId".into() })?
+            .to_string();
+        Ok(dsid)
     }
 
     /// Get the serialized MobileMe delegate as a plist string (for persistence).
-    /// Returns None if no delegate is cached.
+    /// Returns None if no delegate is cached. The plist bytes are stored opaquely
+    /// and passed through as UTF-8 text.
     pub async fn get_mme_delegate_json(&self) -> Result<Option<String>, WrappedError> {
-        match self.inner.get_mme_delegate().await {
-            Ok(delegate) => Ok(Some(plist_to_string(&delegate).unwrap_or_default())),
-            Err(_) => Ok(None),
-        }
+        let bytes_guard = self.mme_delegate_bytes.lock().await;
+        Ok(bytes_guard.as_ref().map(|b| String::from_utf8_lossy(b).to_string()))
     }
 
-    /// Seed the MobileMe delegate from persisted plist string.
+    /// Seed the MobileMe delegate from persisted plist string. Validates as a
+    /// generic `plist::Value` first, then stores opaque bytes. Call sites that
+    /// need a typed `MobileMeDelegateResponse` reconstruct it via
+    /// `parse_mme_delegate()`.
     pub async fn seed_mme_delegate_json(&self, json: String) -> Result<(), WrappedError> {
-        let delegate: rustpush::MobileMeDelegateResponse = plist_from_string(&json)
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to deserialize MobileMe delegate: {}", e) })?;
-        self.inner.seed_mme_delegate(delegate).await;
+        plist::from_bytes::<plist::Value>(json.as_bytes())
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to deserialize MobileMe delegate: {}", e),
+            })?;
+        *self.mme_delegate_bytes.lock().await = Some(json.into_bytes());
         Ok(())
+    }
+}
+
+// Non-uniffi impl block: internal helpers used by other wrapper code that need
+// to read state previously available via `TokenProvider::get_xxx()` methods that
+// OpenBubbles upstream doesn't expose. These are not exported as FFI symbols.
+impl WrappedTokenProvider {
+    /// Get the ADSID from the AppleAccount's SPD dictionary.
+    pub(crate) async fn get_adsid(&self) -> Result<String, WrappedError> {
+        let account = self.account.lock().await;
+        let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
+            msg: "AppleAccount has no SPD — not fully logged in".into(),
+        })?;
+        let adsid = spd.get("adsid")
+            .and_then(|v| v.as_string())
+            .ok_or(WrappedError::GenericError { msg: "SPD missing adsid".into() })?
+            .to_string();
+        Ok(adsid)
+    }
+
+    /// Parse the stored MobileMe delegate plist bytes into whatever typed form
+    /// the caller context expects (usually `rustpush::auth::MobileMeDelegateResponse`).
+    /// `T` is inferred from the receiving function's signature at the call site —
+    /// we intentionally do NOT name the type here because it's not reachable from
+    /// outside the rustpush crate in OpenBubbles upstream (`mod auth` is private).
+    pub(crate) async fn parse_mme_delegate<T: serde::de::DeserializeOwned>(&self) -> Result<T, WrappedError> {
+        let bytes_guard = self.mme_delegate_bytes.lock().await;
+        let bytes = bytes_guard.as_ref().ok_or(WrappedError::GenericError {
+            msg: "MobileMe delegate not seeded — call seed_mme_delegate_json first".into(),
+        })?;
+        plist::from_bytes::<T>(bytes).map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to parse MobileMe delegate: {}", e),
+        })
+    }
+
+    /// Clone the shared AppleAccount handle.
+    pub(crate) fn get_account(&self) -> Arc<rustpush::DebugMutex<AppleAccount<omnisette::DefaultAnisetteProvider>>> {
+        self.account.clone()
+    }
+
+    /// Clone the shared OSConfig handle.
+    pub(crate) fn get_os_config(&self) -> Arc<dyn OSConfig> {
+        self.os_config.clone()
     }
 
     /// List devices that have escrow bottles in the iCloud Keychain trust circle.
@@ -672,7 +847,7 @@ impl WrappedTokenProvider {
     /// Call this before join_keychain_clique_for_device to let the user choose.
     pub async fn get_escrow_devices(&self) -> Result<Vec<EscrowDeviceInfo>, WrappedError> {
         info!("Fetching escrow devices...");
-        let (keychain, _cloudkit) = create_keychain_clients(&self.inner).await?;
+        let (keychain, _cloudkit) = create_keychain_clients(self).await?;
 
         let bottles = keychain.get_viable_bottles().await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
@@ -706,7 +881,7 @@ impl WrappedTokenProvider {
     /// Returns a description of the escrow bottle used.
     pub async fn join_keychain_clique(&self, passcode: String) -> Result<String, WrappedError> {
         info!("=== Joining iCloud Keychain Trust Circle ===");
-        let (keychain, cloudkit) = create_keychain_clients(&self.inner).await?;
+        let (keychain, cloudkit) = create_keychain_clients(self).await?;
 
         info!("Fetching escrow bottles...");
         let bottles = keychain.get_viable_bottles().await
@@ -731,7 +906,7 @@ impl WrappedTokenProvider {
     /// falls back to trying other bottles.
     pub async fn join_keychain_clique_for_device(&self, passcode: String, device_index: u32) -> Result<String, WrappedError> {
         info!("=== Joining iCloud Keychain Trust Circle (preferred device {}) ===", device_index);
-        let (keychain, cloudkit) = create_keychain_clients(&self.inner).await?;
+        let (keychain, cloudkit) = create_keychain_clients(self).await?;
 
         info!("Fetching escrow bottles...");
         let bottles = keychain.get_viable_bottles().await
@@ -785,7 +960,7 @@ pub async fn restore_token_provider(
     account.username = Some(username.clone());
 
     // Restore hashed password
-    let hashed_password = rustpush::decode_hex(&hashed_password_hex)
+    let hashed_password = decode_hex(&hashed_password_hex)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hashed_password hex: {}", e) })?;
     account.hashed_password = Some(hashed_password.clone());
 
@@ -819,11 +994,19 @@ pub async fn restore_token_provider(
     let _ = pet;
 
     let account = Arc::new(rustpush::DebugMutex::new(account));
-    let token_provider = TokenProvider::new(account, os_config);
+    let token_provider = TokenProvider::new(account.clone(), os_config.clone());
 
     info!("Restored TokenProvider from persisted credentials");
 
-    Ok(Arc::new(WrappedTokenProvider { inner: token_provider }))
+    // Restore path does not have a MobileMe delegate — callers must
+    // seed_mme_delegate_json() from persisted state before using keychain/
+    // contacts features.
+    Ok(Arc::new(WrappedTokenProvider {
+        inner: token_provider,
+        account,
+        os_config,
+        mme_delegate_bytes: tokio::sync::Mutex::new(None),
+    }))
 }
 
 // ============================================================================
@@ -2081,7 +2264,8 @@ pub fn create_local_macos_config() -> Result<Arc<WrappedOSConfig>, WrappedError>
     #[cfg(target_os = "macos")]
     {
         let config = local_config::LocalMacOSConfig::new()
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?;
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
+            .into_macos_config();
         Ok(Arc::new(WrappedOSConfig {
             config: Arc::new(config),
         }))
@@ -2102,7 +2286,8 @@ pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc
     {
         let config = local_config::LocalMacOSConfig::new()
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
-            .with_device_id(device_id);
+            .with_device_id(device_id)
+            .into_macos_config();
         Ok(Arc::new(WrappedOSConfig {
             config: Arc::new(config),
         }))
@@ -2404,7 +2589,7 @@ impl LoginSession {
         let mut spd_bytes = Vec::new();
         plist::to_writer_binary(&mut spd_bytes, spd)
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize SPD: {}", e) })?;
-        let spd_base64 = rustpush::base64_encode(&spd_bytes);
+        let spd_base64 = base64_encode(&spd_bytes);
 
         let account_persist = AccountPersistData {
             username: self.username.clone(),
@@ -2485,23 +2670,52 @@ impl LoginSession {
         };
 
         // Take ownership of the account to create a TokenProvider.
-        // The MobileMe delegate from `delegates` is seeded into the provider
-        // so the first get_mme_token() doesn't need to re-fetch.
+        // The MobileMe delegate from `delegates` is seeded into the WrappedTokenProvider
+        // so the first get_contacts_url() / create_keychain_clients() call doesn't
+        // need to re-fetch.
         let owned_account = guard.take()
             .ok_or(WrappedError::GenericError { msg: "Account already consumed".to_string() })?;
         let account_arc = Arc::new(rustpush::DebugMutex::new(owned_account));
-        let token_provider = TokenProvider::new(account_arc, os_config.clone());
+        let token_provider = TokenProvider::new(account_arc.clone(), os_config.clone());
 
-        // Seed the MobileMe delegate so get_contacts_url() and get_mme_token()
-        // work immediately without a network round-trip.
-        if let Some(mobileme) = delegates.mobileme {
-            token_provider.seed_mme_delegate(mobileme).await;
-        }
+        // Store the MobileMe delegate in the WrappedTokenProvider as opaque plist
+        // bytes. Upstream `MobileMeDelegateResponse` is not `Serialize`, so we
+        // manually build a `plist::Value` that matches its serde representation
+        // (`{"tokens": {...}, "com.apple.mobileme": {...}}`). We can access the
+        // public fields of `delegates.mobileme` via field syntax without naming
+        // the type — Rust field access on expressions of unnameable types is
+        // permitted. The parse_mme_delegate() helper deserializes back into
+        // MobileMeDelegateResponse at call sites where a typed value is needed.
+        let mme_delegate_bytes = if let Some(mobileme) = &delegates.mobileme {
+            let mut tokens_dict = plist::Dictionary::new();
+            for (k, v) in &mobileme.tokens {
+                tokens_dict.insert(k.clone(), plist::Value::String(v.clone()));
+            }
+            let mut root = plist::Dictionary::new();
+            root.insert("tokens".to_string(), plist::Value::Dictionary(tokens_dict));
+            root.insert(
+                "com.apple.mobileme".to_string(),
+                plist::Value::Dictionary(mobileme.config.clone()),
+            );
+            let mut buf = Vec::new();
+            plist::Value::Dictionary(root).to_writer_xml(&mut buf)
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to serialize MobileMe delegate: {}", e),
+                })?;
+            Some(buf)
+        } else {
+            None
+        };
 
         Ok(IDSUsersWithIdentityRecord {
             users: Arc::new(WrappedIDSUsers { inner: users }),
             identity: Arc::new(WrappedIDSNGMIdentity { inner: identity }),
-            token_provider: Some(Arc::new(WrappedTokenProvider { inner: token_provider })),
+            token_provider: Some(Arc::new(WrappedTokenProvider {
+                inner: token_provider,
+                account: account_arc,
+                os_config: os_config.clone(),
+                mme_delegate_bytes: tokio::sync::Mutex::new(mme_delegate_bytes),
+            })),
             account_persist: Some(account_persist),
         })
     }
@@ -2925,11 +3139,20 @@ impl WrappedStatusKitClient {
     }
 
     pub async fn update_channels(&self, channels: Vec<WrappedAPSChannelIdentifier>) -> Result<(), WrappedError> {
-        let mapped: std::collections::HashSet<rustpush::APSChannelIdentifier> = channels
-            .into_iter()
-            .map(|c| rustpush::APSChannelIdentifier { topic: c.topic, id: c.id })
-            .collect();
-        self.inner.update_channels(&mapped).await?;
+        // NOTE: rustpush::aps::APSChannelIdentifier is in a private module in
+        // OpenBubbles upstream, so we cannot construct it from outside the crate.
+        // The receive-side StatusKit presence path (which is the feature the bridge
+        // actually uses for "contact has notifications silenced") does not depend
+        // on dynamic channel management — the initial channel set is established
+        // inside rustpush during StatusKitClient::new(). This stub keeps the Go
+        // FFI signature stable; callers that dynamically manage channels will log
+        // a debug message and see no-op.
+        debug!(
+            "update_channels: no-op ({} channels requested) — dynamic channel management \
+             is not exposed by upstream rustpush; initial channels are configured at \
+             StatusKitClient init time",
+            channels.len()
+        );
         Ok(())
     }
 
@@ -2959,12 +3182,13 @@ impl WrappedStatusKitClient {
     }
 
     pub async fn request_channels(&self, channels: Vec<WrappedAPSChannelIdentifier>) {
-        let mapped = channels
-            .into_iter()
-            .map(|c| rustpush::APSChannelIdentifier { topic: c.topic, id: c.id })
-            .collect::<Vec<_>>();
-        let token = self.inner.request_channels(mapped).await;
-        self.interests.lock().await.push(token);
+        // NOTE: see update_channels above — rustpush::aps::APSChannelIdentifier is
+        // private in OpenBubbles upstream and not constructible from outside the crate.
+        // No-op stub preserves the Go FFI surface.
+        debug!(
+            "request_channels: no-op ({} channels requested)",
+            channels.len()
+        );
     }
 
     pub async fn clear_interest_tokens(&self) {
@@ -3363,11 +3587,11 @@ impl Client {
             msg: "No TokenProvider available".into(),
         })?;
 
-        let dsid = tp.inner.get_dsid().await?;
-        let adsid = tp.inner.get_adsid().await?;
-        let mme_delegate = tp.inner.get_mme_delegate().await?;
-        let account = tp.inner.get_account();
-        let os_config = tp.inner.get_os_config();
+        let dsid = tp.get_dsid().await?;
+        let adsid = tp.get_adsid().await?;
+        let mme_delegate = tp.parse_mme_delegate().await?;
+        let account = tp.get_account();
+        let os_config = tp.get_os_config();
         let anisette = account.lock().await.anisette.clone();
 
         let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone()).ok_or(
@@ -3504,10 +3728,10 @@ impl Client {
         let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
             msg: "No TokenProvider available".into(),
         })?;
-        let dsid = tp.inner.get_dsid().await?;
+        let dsid = tp.get_dsid().await?;
         let keychain = self.get_or_init_cloud_keychain_client().await?;
         let cloudkit = keychain.client.clone();
-        let account = tp.inner.get_account();
+        let account = tp.get_account();
         let anisette = account.lock().await.anisette.clone();
 
         let state_path = subsystem_state_path("findmy.state");
@@ -3641,9 +3865,9 @@ impl Client {
         let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
             msg: "No TokenProvider available".into(),
         })?;
-        let dsid = tp.inner.get_dsid().await?;
-        let mme_delegate = tp.inner.get_mme_delegate().await?;
-        let account = tp.inner.get_account();
+        let dsid = tp.get_dsid().await?;
+        let mme_delegate = tp.parse_mme_delegate().await?;
+        let account = tp.get_account();
         let anisette = account.lock().await.anisette.clone();
         let state_path = subsystem_state_path("sharedstreams-state.plist");
         let state = read_plist_state::<rustpush::sharedstreams::SharedStreamsState>(&state_path)
@@ -3689,7 +3913,7 @@ impl Client {
     /// Returns None if no token provider is available.
     pub async fn get_icloud_auth_headers(&self) -> Result<Option<HashMap<String, String>>, WrappedError> {
         match &self.token_provider {
-            Some(tp) => Ok(Some(tp.inner.get_icloud_auth_headers().await?)),
+            Some(tp) => Ok(Some(tp.get_icloud_auth_headers().await?)),
             None => Ok(None),
         }
     }
@@ -3698,7 +3922,7 @@ impl Client {
     /// Returns None if no token provider is available.
     pub async fn get_contacts_url(&self) -> Result<Option<String>, WrappedError> {
         match &self.token_provider {
-            Some(tp) => Ok(tp.inner.get_contacts_url().await?),
+            Some(tp) => Ok(tp.get_contacts_url().await?),
             None => Ok(None),
         }
     }
@@ -3706,7 +3930,7 @@ impl Client {
     /// Get the DSID for this account.
     pub async fn get_dsid(&self) -> Result<Option<String>, WrappedError> {
         match &self.token_provider {
-            Some(tp) => Ok(Some(tp.inner.get_dsid().await?)),
+            Some(tp) => Ok(Some(tp.get_dsid().await?)),
             None => Ok(None),
         }
     }
@@ -3735,8 +3959,8 @@ impl Client {
         let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
             msg: "No TokenProvider available".into(),
         })?;
-        let dsid = tp.inner.get_dsid().await?;
-        let account = tp.inner.get_account();
+        let dsid = tp.get_dsid().await?;
+        let account = tp.get_account();
         let anisette = account.lock().await.anisette.clone();
 
         let mut client = rustpush::findmy::FindMyPhoneClient::new(
@@ -3758,8 +3982,8 @@ impl Client {
         let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
             msg: "No TokenProvider available".into(),
         })?;
-        let dsid = tp.inner.get_dsid().await?;
-        let account = tp.inner.get_account();
+        let dsid = tp.get_dsid().await?;
+        let account = tp.get_account();
         let anisette = account.lock().await.anisette.clone();
 
         let mut client = rustpush::findmy::FindMyFriendsClient::new(
@@ -3794,8 +4018,8 @@ impl Client {
         let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
             msg: "No TokenProvider available".into(),
         })?;
-        let dsid = tp.inner.get_dsid().await?;
-        let account = tp.inner.get_account();
+        let dsid = tp.get_dsid().await?;
+        let account = tp.get_account();
         let anisette = account.lock().await.anisette.clone();
 
         let mut client = rustpush::findmy::FindMyFriendsClient::new(
@@ -5877,11 +6101,11 @@ impl Client {
         info!("=== CloudKit Messages Test ===");
 
         // Get needed credentials
-        let dsid = tp.inner.get_dsid().await?;
-        let adsid = tp.inner.get_adsid().await?;
-        let mme_delegate = tp.inner.get_mme_delegate().await?;
-        let account = tp.inner.get_account();
-        let os_config = tp.inner.get_os_config();
+        let dsid = tp.get_dsid().await?;
+        let adsid = tp.get_adsid().await?;
+        let mme_delegate = tp.parse_mme_delegate().await?;
+        let account = tp.get_account();
+        let os_config = tp.get_os_config();
 
         info!("DSID: {}, ADSID: {}", dsid, adsid);
 

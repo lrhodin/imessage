@@ -1,23 +1,28 @@
-//! LocalMacOSConfig — An OSConfig implementation that reads hardware info from IOKit
-//! and uses our local NAC crate for validation data generation.
+//! LocalMacOSConfig — reads hardware info from IOKit and constructs an
+//! `rustpush::macos::MacOSConfig` ready for use as an `Arc<dyn OSConfig>`.
 //!
-//! This replaces the need for:
-//! - open-absinthe (FairPlay-based NAC, requires SIP disabled or relay)
-//! - A registration relay server
+//! ## Design note (zero-patch refactor)
 //!
-//! Instead, it uses AAAbsintheContext from AppleAccount.framework (which works
-//! with SIP enabled on any Mac) for NAC, and reads real hardware identifiers
-//! from IOKit for IDS registration.
+//! Previously this module implemented `OSConfig` directly and used our native
+//! `nac-validation` crate (AAAbsintheContext via AppleAccount.framework) for
+//! validation data generation, bypassing open-absinthe on macOS.
+//!
+//! That implementation cannot compile against OpenBubbles upstream rustpush
+//! because `OSConfig::build_activation_info` returns `rustpush::activation::
+//! ActivationInfo`, and `mod activation` is private in upstream — the type is
+//! not nameable from outside the rustpush crate. Writing an external OSConfig
+//! impl is therefore impossible without patching upstream.
+//!
+//! Workaround: construct `rustpush::macos::MacOSConfig` (upstream's public
+//! OSConfig impl) and populate its `HardwareConfig` from IOKit data. macOS
+//! validation then runs through upstream's open-absinthe path instead of our
+//! native nac-validation path. The `nac-validation` crate remains available
+//! as a standalone utility for future direct use but is not wired into
+//! OSConfig at this layer.
 
-use std::collections::HashMap;
 use std::ffi::CStr;
-use std::time::{Duration, SystemTime};
 
-use async_trait::async_trait;
-use plist::{Dictionary, Value};
 use uuid::Uuid;
-
-use rustpush::{ActivationInfo, APSState, DebugMeta, LoginClientInfo, OSConfig, PushError, RegisterMeta};
 
 // FFI for hardware_info.m
 #[repr(C)]
@@ -163,151 +168,49 @@ impl LocalMacOSConfig {
         }
         self
     }
-}
 
-#[async_trait]
-impl OSConfig for LocalMacOSConfig {
-    fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo {
-        ActivationInfo {
-            activation_randomness: Uuid::new_v4().to_string().to_uppercase(),
-            activation_state: "Unactivated",
-            build_version: self.hw.os_build_num.clone(),
-            device_cert_request: csr.into(),
-            device_class: "MacOS".to_string(),
-            product_type: self.hw.product_name.clone(),
-            product_version: self.hw.os_version.clone(),
-            serial_number: self.hw.serial_number.clone(),
-            unique_device_id: self.device_id.clone(),
-        }
-    }
+    /// Consume this LocalMacOSConfig and produce a `rustpush::macos::MacOSConfig`
+    /// that implements `OSConfig` via upstream's open-absinthe NAC path.
+    ///
+    /// NOTE: This drops our previous custom OSConfig impl (which called
+    /// `nac-validation::generate_validation_data()` natively via AAAbsintheContext).
+    /// That path is architecturally blocked against OpenBubbles upstream because
+    /// `OSConfig::build_activation_info` returns a type from the private `mod
+    /// activation`, which external crates cannot name. See the module doc comment.
+    ///
+    /// HardwareConfig's `_enc` fields (platform_serial_number_enc, platform_uuid_enc,
+    /// root_disk_uuid_enc) are left empty — upstream's ValidationCtx only inserts
+    /// them if present, and the unicorn NAC emulator derives them from plaintext
+    /// on the fly when possible.
+    pub fn into_macos_config(self) -> rustpush::macos::MacOSConfig {
+        // `rustpush::macos::HardwareConfig` is re-exported from `open_absinthe::nac`.
+        // Default-init and populate only the plaintext fields we have from IOKit;
+        // leave encryption/obfuscation fields empty.
+        let hw_config = rustpush::macos::HardwareConfig {
+            product_name: self.hw.product_name.clone(),
+            io_mac_address: self.hw.mac_address,
+            platform_serial_number: self.hw.serial_number.clone(),
+            platform_uuid: self.hw.platform_uuid.clone(),
+            root_disk_uuid: self.hw.root_disk_uuid.clone(),
+            board_id: self.hw.board_id.clone(),
+            os_build_num: self.hw.os_build_num.clone(),
+            platform_serial_number_enc: Vec::new(),
+            platform_uuid_enc: Vec::new(),
+            root_disk_uuid_enc: Vec::new(),
+            rom: self.hw.rom.clone(),
+            rom_enc: Vec::new(),
+            mlb: self.hw.mlb.clone(),
+            mlb_enc: Vec::new(),
+        };
 
-    fn get_udid(&self) -> String {
-        self.device_id.clone()
-    }
-
-    fn get_normal_ua(&self, item: &str) -> String {
-        let part = self.icloud_ua.split_once(char::is_whitespace).unwrap().0;
-        format!("{item} {part}")
-    }
-
-    fn get_aoskit_version(&self) -> String {
-        self.aoskit_version.clone()
-    }
-
-    fn get_mme_clientinfo(&self, for_item: &str) -> String {
-        format!(
-            "<{}> <macOS;{};{}> <{}>",
-            self.hw.product_name, self.hw.os_version, self.hw.os_build_num, for_item
-        )
-    }
-
-    fn get_version_ua(&self) -> String {
-        format!(
-            "[macOS,{},{},{}]",
-            self.hw.os_version, self.hw.os_build_num, self.hw.product_name
-        )
-    }
-
-    fn get_activation_device(&self) -> String {
-        "MacOS".to_string()
-    }
-
-    fn get_device_uuid(&self) -> String {
-        self.device_id.clone()
-    }
-
-    fn get_device_name(&self) -> String {
-        format!("Mac-{}", self.hw.serial_number)
-    }
-
-    async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
-        // Use our local NAC crate (AAAbsintheContext) instead of open-absinthe/relay
-        nac_validation::generate_validation_data()
-            .map_err(|e| PushError::IoError(std::io::Error::other(
-                format!("NAC validation failed: {}", e),
-            )))
-    }
-
-    fn get_protocol_version(&self) -> u32 {
-        self.protocol_version
-    }
-
-    fn get_register_meta(&self) -> RegisterMeta {
-        RegisterMeta {
-            hardware_version: self.hw.product_name.clone(),
-            os_version: format!("macOS,{},{}", self.hw.os_version, self.hw.os_build_num),
-            software_version: self.hw.os_build_num.clone(),
-        }
-    }
-
-    fn get_debug_meta(&self) -> DebugMeta {
-        DebugMeta {
-            user_version: self.hw.os_version.clone(),
-            hardware_version: self.hw.product_name.clone(),
-            serial_number: self.hw.serial_number.clone(),
-        }
-    }
-
-    fn get_gsa_hardware_headers(&self) -> HashMap<String, String> {
-        [
-            ("X-Apple-I-MLB", self.hw.mlb.as_str()),
-            ("X-Apple-I-ROM", &encode_hex(&self.hw.rom)),
-            ("X-Apple-I-SRL-NO", &self.hw.serial_number),
-        ]
-        .into_iter()
-        .map(|(a, b)| (a.to_string(), b.to_string()))
-        .collect()
-    }
-
-    fn get_serial_number(&self) -> String {
-        self.hw.serial_number.clone()
-    }
-
-    fn get_login_url(&self) -> &'static str {
-        "https://setup.icloud.com/setup/prefpane/loginDelegates"
-    }
-
-    fn get_private_data(&self) -> Dictionary {
-        let apple_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(978307200);
-        Dictionary::from_iter([
-            ("ap", Value::String("0".to_string())),
-            (
-                "d",
-                Value::String(format!(
-                    "{:.6}",
-                    apple_epoch.elapsed().unwrap().as_secs_f64()
-                )),
-            ),
-            ("dt", Value::Integer(1.into())),
-            ("gt", Value::String("0".to_string())),
-            ("h", Value::String("1".to_string())),
-            ("m", Value::String("0".to_string())),
-            ("p", Value::String("0".to_string())),
-            ("pb", Value::String(self.hw.os_build_num.clone())),
-            ("pn", Value::String("macOS".to_string())),
-            ("pv", Value::String(self.hw.os_version.clone())),
-            ("s", Value::String("0".to_string())),
-            ("t", Value::String("0".to_string())),
-            (
-                "u",
-                Value::String(self.device_id.clone().to_uppercase()),
-            ),
-            ("v", Value::String("1".to_string())),
-        ])
-    }
-
-    fn get_gsa_config(&self, push: &APSState, require_mac: bool) -> LoginClientInfo {
-        LoginClientInfo {
-            ak_context_type: "imessage".to_string(),
-            client_app_name: "Messages".to_string(),
-            client_bundle_id: "com.apple.MobileSMS".to_string(),
-            mme_client_info_akd: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.akd/1.0)", require_mac),
-            mme_client_info: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)", require_mac),
-            akd_user_agent: format!("akd/1.0 CFNetwork/1568.100.1 Darwin/{}", self.hw.darwin_version),
-            browser_user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)".to_string(),
-            hardware_headers: self.get_gsa_hardware_headers(),
-            push_token: push.token.map(|i| encode_hex(&i).to_uppercase()),
-            update_account_bundle_id: self.get_adi_mme_info("com.apple.AppleAccount/1.0 (com.apple.systempreferences.AppleIDSettings/1)", require_mac),
+        rustpush::macos::MacOSConfig {
+            inner: hw_config,
+            version: self.hw.os_version.clone(),
+            protocol_version: self.protocol_version,
+            device_id: self.device_id.clone(),
+            icloud_ua: self.icloud_ua.clone(),
+            aoskit_version: self.aoskit_version.clone(),
+            udid: Some(self.device_id.clone()),
         }
     }
 }
