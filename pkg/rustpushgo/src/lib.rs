@@ -6177,21 +6177,85 @@ impl Client {
         record_name: String,
     ) -> Result<Vec<u8>, WrappedError> {
         use futures::FutureExt;
+        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
 
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
 
-        // Attempt 1 — normal upstream path, wrapped in catch_unwind so a
-        // Ford SIV panic doesn't take down the bridge.
+        // Hand-rolled mirror of upstream's `download_attachment` that
+        // replicates master's Ford-registration-before-get_assets pattern:
+        //
+        //   1. perform_operations(FetchRecordOperation::many(ALL_ASSETS))
+        //   2. parse records as CloudAttachmentWithAvid (lqa + avid)
+        //   3. register BOTH lqa.protection_info and avid.protection_info
+        //      Ford keys into the wrapper cache BEFORE get_assets runs
+        //   4. call container.get_assets(&records.assets, &record.lqa)
+        //
+        // This ensures that every attachment download contributes its
+        // record's own Ford keys to the cache even if sync never reached
+        // this record yet (new attachments, cross-device dedup where the
+        // source record hasn't been synced). Matches master's behavior
+        // at rustpush/src/imessage/cloud_messages.rs:download_attachment.
+        //
+        // Wrapped in catch_unwind so any SIV panic deep in get_mmcs (Ford
+        // dedup with a key not yet in the cache) falls through to
+        // `cloud_download_attachment_ford_recovery` for brute-force retry.
+        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
+            msg: format!("cloud_download_attachment {}: get_container: {e}", record_name),
+        })?;
+        let zone = container.private_zone("attachmentManateeZone".to_string());
+        let zone_key = container
+            .get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("cloud_download_attachment {}: zone key: {e}", record_name),
+            })?;
+
+        let invoke = container
+            .perform_operations(
+                &CloudKitSession::new(),
+                &FetchRecordOperation::many(&ALL_ASSETS, &zone, &[record_name.clone()]),
+                IsolationLevel::Operation,
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("cloud_download_attachment {}: perform_operations: {e}", record_name),
+            })?;
+        let records = FetchedRecords::new(&invoke);
+        let record: CloudAttachmentWithAvid = records.get_record(&record_name, Some(&zone_key));
+
+        // Register this record's Ford keys (lqa + avid) into the cache
+        // BEFORE the get_assets call — matches master's download_attachment
+        // behavior so the fordChecksum / brute-force fallback always has
+        // at least the current record's keys available.
+        if let Some(pi) = record
+            .lqa
+            .protection_info
+            .as_ref()
+            .and_then(|p| p.protection_info.as_ref())
+        {
+            register_ford_key(pi.clone());
+        }
+        if let Some(pi) = record
+            .avid
+            .protection_info
+            .as_ref()
+            .and_then(|p| p.protection_info.as_ref())
+        {
+            register_ford_key(pi.clone());
+        }
+
+        // Attempt 1 — get_assets with the record's own lqa, wrapped in
+        // catch_unwind so a Ford SIV panic falls through to recovery.
         let shared = SharedWriter::new();
-        let mut files = HashMap::new();
-        files.insert(record_name.clone(), shared.clone());
-        let fut = cloud_messages.download_attachment(files);
+        let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
+            vec![(&record.lqa, shared.clone())];
+        let fut = container.get_assets(&records.assets, assets_tuple);
         let wrapped = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
 
         match wrapped {
             Ok(Ok(())) => return Ok(shared.into_bytes()),
             Ok(Err(e)) => {
-                // Real error (network, auth, etc.) — not a Ford SIV panic.
                 return Err(WrappedError::GenericError {
                     msg: format!("Failed to download CloudKit attachment {}: {}", record_name, e),
                 });
@@ -6206,15 +6270,15 @@ impl Client {
             }
         }
 
-        // Attempt 2 — Ford dedup recovery. Hand-rolled path that fetches
-        // the CloudAttachment record, injects a cached Ford key into
-        // `Asset.protection_info.protection_info`, and calls
-        // `container.get_assets(...)` directly. `get_assets` extracts the
-        // Ford key from that exact field and passes it into `get_mmcs` as
-        // the 4th element of the files tuple (see upstream
-        // `cloudkit.rs::get_assets`), so mutating protection_info is how we
-        // inject an override without touching rustpush source.
-        self.cloud_download_attachment_ford_recovery(&cloud_messages, &record_name).await
+        // Attempt 2 — Ford dedup recovery: iterate cached keys, mutate
+        // protection_info per attempt, re-try get_assets.
+        self.cloud_download_attachment_ford_recovery_with_record(
+            container,
+            records,
+            record,
+            &record_name,
+        )
+        .await
     }
 
     // Ford recovery helper lives in a separate non-uniffi impl block below
@@ -6708,11 +6772,91 @@ impl Client {
 // wrappers for, so they live in a plain impl block that the FFI codegen
 // ignores.
 impl Client {
+    /// Ford dedup recovery using an already-fetched record + FetchedRecords.
+    /// This variant is called by `cloud_download_attachment` after its first
+    /// `get_assets` attempt panics — it reuses the existing record/assets
+    /// instead of re-fetching, which saves a CloudKit round-trip per download.
+    async fn cloud_download_attachment_ford_recovery_with_record(
+        &self,
+        container: Arc<rustpush::cloudkit::CloudKitOpenContainer<'static, omnisette::DefaultAnisetteProvider>>,
+        records: rustpush::cloudkit::FetchedRecords,
+        base_record: CloudAttachmentWithAvid,
+        record_name: &str,
+    ) -> Result<Vec<u8>, WrappedError> {
+        use futures::FutureExt;
+
+        let cached_keys = ford_key_cache_values();
+        info!(
+            "Ford recovery {}: trying {} cached keys",
+            record_name,
+            cached_keys.len()
+        );
+
+        if base_record.lqa.bundled_request_id.is_none() {
+            warn!(
+                "Ford recovery {}: lqa.bundled_request_id is None, skipping recovery",
+                record_name
+            );
+            return Err(WrappedError::GenericError {
+                msg: format!("Ford dedup recovery for {}: lqa asset has no bundled_request_id", record_name),
+            });
+        }
+
+        for (idx, alt_key) in cached_keys.iter().enumerate() {
+            let mut record = base_record.clone();
+            if let Some(pi) = record.lqa.protection_info.as_mut() {
+                pi.protection_info = Some(alt_key.clone());
+            } else {
+                continue;
+            }
+
+            let shared = SharedWriter::new();
+            let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
+                vec![(&record.lqa, shared.clone())];
+
+            let fut = container.get_assets(&records.assets, assets_tuple);
+            let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+            match result {
+                Ok(Ok(())) => {
+                    let bytes = shared.into_bytes();
+                    warn!(
+                        "Ford dedup recovery SUCCESS: record={} attempt={}/{} bytes={}",
+                        record_name,
+                        idx + 1,
+                        cached_keys.len(),
+                        bytes.len()
+                    );
+                    return Ok(bytes);
+                }
+                Ok(Err(e)) => {
+                    debug!("Ford recovery attempt {} returned error: {}", idx + 1, e);
+                }
+                Err(_panic) => {
+                    debug!("Ford recovery attempt {} panicked (wrong key, retrying)", idx + 1);
+                }
+            }
+        }
+
+        warn!(
+            "Ford dedup recovery FAILED: record={} tried={} all cached keys exhausted",
+            record_name,
+            cached_keys.len()
+        );
+        Err(WrappedError::GenericError {
+            msg: format!(
+                "Ford dedup recovery for {}: all {} cached keys failed SIV decrypt",
+                record_name,
+                cached_keys.len()
+            ),
+        })
+    }
+
     /// Ford dedup recovery path: fetch the CloudAttachment record, iterate
     /// over every cached Ford key, mutate `Asset.protection_info` per attempt,
     /// and retry `container.get_assets(...)` wrapped in `catch_unwind` until
     /// one candidate SIV-decrypts cleanly. Matches the 94f7b8e fix's
     /// cross-batch recovery semantics without modifying upstream rustpush.
+    #[allow(dead_code)]
     async fn cloud_download_attachment_ford_recovery(
         &self,
         cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>,
