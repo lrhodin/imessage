@@ -124,6 +124,32 @@ fn ford_key_cache_values() -> Vec<Vec<u8>> {
 }
 
 // ============================================================================
+// NAC relay config (Apple Silicon hardware keys that can't run in the
+// x86-64 unicorn emulator on Linux)
+// ============================================================================
+//
+// Some hardware keys (especially those extracted from Apple Silicon Macs)
+// cannot be driven by the local unicorn x86-64 NAC emulator. For those
+// users, `extract-key` embeds a `nac_relay_url` + bearer token +
+// (optional) TLS cert fingerprint into the hardware-key JSON blob.
+//
+// At runtime, `_create_config_from_hardware_key_inner` calls
+// `register_nac_relay` to stash those values here, then forwards them
+// into `open_absinthe::nac::set_relay_config` so open-absinthe's
+// `ValidationCtx::new()` can use the relay's 3-step NAC protocol
+// instead of running the emulator. This mirrors the macOS Local NAC
+// wiring (where open-absinthe's Native variant delegates to
+// `nac-validation`) — same integration pattern, just over HTTPS to a
+// Mac running `tools/nac-relay`.
+
+/// Register a NAC relay so open-absinthe's `ValidationCtx::new()` routes
+/// validation data through the relay's 3-step endpoints instead of the
+/// local unicorn emulator.
+fn register_nac_relay(url: String, token: Option<String>, cert_fp: Option<String>) {
+    open_absinthe::nac::set_relay_config(url, token, cert_fp);
+}
+
+// ============================================================================
 // Local CloudKit record type that understands the `avid` field.
 // ============================================================================
 //
@@ -2444,52 +2470,93 @@ pub fn create_config_from_hardware_key_with_device_id(base64_key: String, device
 fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<String>) -> Result<Arc<WrappedOSConfig>, WrappedError> {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use rustpush::macos::{MacOSConfig, HardwareConfig};
+    use serde::Deserialize;
+
+    // Local wire-compatible struct: upstream MacOSConfig only has
+    // inner/version/protocol_version/device_id/icloud_ua/aoskit_version/udid.
+    // Our hardware-key JSON contract (shipped to existing users) ALSO carries
+    // nac_relay_url/relay_token/relay_cert_fp for the Apple Silicon relay
+    // path. Parsing into upstream MacOSConfig would drop the relay fields,
+    // so we parse into a local struct that holds everything and then split.
+    #[derive(Deserialize)]
+    struct FullHardwareKey {
+        #[serde(default)]
+        inner: Option<HardwareConfig>,
+        #[serde(default)]
+        version: Option<String>,
+        #[serde(default)]
+        protocol_version: Option<u32>,
+        #[serde(default)]
+        device_id: Option<String>,
+        #[serde(default)]
+        icloud_ua: Option<String>,
+        #[serde(default)]
+        aoskit_version: Option<String>,
+        #[serde(default)]
+        udid: Option<String>,
+        // NAC relay fields (Apple Silicon hw keys that can't be driven by
+        // the unicorn x86-64 emulator). When set, these are stashed into
+        // wrapper-level static state via register_nac_relay() for the
+        // open-absinthe ValidationCtx Relay variant to consume.
+        #[serde(default)]
+        nac_relay_url: Option<String>,
+        #[serde(default)]
+        relay_token: Option<String>,
+        #[serde(default)]
+        relay_cert_fp: Option<String>,
+    }
 
     // Strip whitespace/newlines that chat clients may insert when pasting
     let clean_key: String = base64_key.chars().filter(|c| !c.is_whitespace()).collect();
     let json_bytes = STANDARD.decode(&clean_key)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
 
-    // Try full MacOSConfig first (from extract-key tool), fall back to bare HardwareConfig.
-    // We prefer the OS version/build metadata from the extracted key so our
-    // registration body matches a real Mac as closely as possible.
+    // Try parsing as FullHardwareKey first (extract-key tool output, may be
+    // the full MacOSConfig-shaped blob with relay fields). Fall back to
+    // bare HardwareConfig for legacy keys that are just the hw blob.
     let (hw, version, protocol_version, icloud_ua, aoskit_version, nac_relay_url, relay_token, relay_cert_fp) =
-        if let Ok(full) = serde_json::from_slice::<MacOSConfig>(&json_bytes) {
-            let version = if !full.version.trim().is_empty() {
-                full.version
+        if let Ok(full) = serde_json::from_slice::<FullHardwareKey>(&json_bytes) {
+            if let Some(hw) = full.inner {
+                let version = full.version
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "13.6.4".to_string());
+                let protocol_version = full.protocol_version
+                    .filter(|v| *v != 0)
+                    .unwrap_or(1660);
+                // get_normal_ua() expects icloud_ua to contain whitespace so
+                // it can split out the "com.apple.iCloudHelper/..." prefix.
+                let icloud_ua = full.icloud_ua
+                    .filter(|v| v.split_once(char::is_whitespace).is_some())
+                    .unwrap_or_else(|| "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string());
+                let aoskit_version = full.aoskit_version
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string());
+                (
+                    hw,
+                    version,
+                    protocol_version,
+                    icloud_ua,
+                    aoskit_version,
+                    full.nac_relay_url,
+                    full.relay_token,
+                    full.relay_cert_fp,
+                )
             } else {
-                "13.6.4".to_string()
-            };
-            let protocol_version = if full.protocol_version != 0 {
-                full.protocol_version
-            } else {
-                1660
-            };
-
-            // get_normal_ua() expects icloud_ua to contain whitespace so it can
-            // split out the "com.apple.iCloudHelper/..." prefix.
-            let icloud_ua = if full.icloud_ua.split_once(char::is_whitespace).is_some() {
-                full.icloud_ua
-            } else {
-                "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string()
-            };
-
-            let aoskit_version = if !full.aoskit_version.trim().is_empty() {
-                full.aoskit_version
-            } else {
-                "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string()
-            };
-
-            (
-                full.inner,
-                version,
-                protocol_version,
-                icloud_ua,
-                aoskit_version,
-                full.nac_relay_url,
-                full.relay_token,
-                full.relay_cert_fp,
-            )
+                // JSON parsed as FullHardwareKey but has no `inner` field —
+                // retry as bare HardwareConfig.
+                let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
+                    .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
+                (
+                    hw,
+                    "13.6.4".to_string(),
+                    1660,
+                    "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string(),
+                    "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+                    None,
+                    None,
+                    None,
+                )
+            }
         } else {
             let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
                 .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
@@ -2519,6 +2586,26 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
     }
     let device_id = hw_uuid;
 
+    // Stash the NAC relay config in wrapper-level static state so the
+    // open-absinthe Relay variant can consume it. If no relay URL is set,
+    // ValidationCtx falls through to the unicorn x86-64 emulator path
+    // (works for Intel Mac hardware keys).
+    if let Some(ref url) = nac_relay_url {
+        register_nac_relay(url.clone(), relay_token.clone(), relay_cert_fp.clone());
+        log::info!(
+            "NAC relay configured: {} (token={}, cert_fp={})",
+            url,
+            if relay_token.is_some() { "set" } else { "none" },
+            if relay_cert_fp.is_some() { "set" } else { "none" }
+        );
+    } else {
+        // Legacy blobs without a relay URL use the local x86-64 emulator.
+        let _ = relay_token;
+        let _ = relay_cert_fp;
+    }
+
+    // Build upstream's MacOSConfig with only the fields it has — relay
+    // fields live in wrapper state, not on the OSConfig.
     let config = MacOSConfig {
         inner: hw,
         version,
@@ -2527,11 +2614,8 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
         icloud_ua,
         aoskit_version,
         // Avoid panics in codepaths that expect a UDID (Find My, CloudKit, etc).
-        // On macOS, using the device UUID is sufficient.
+        // Using the device UUID is sufficient.
         udid: Some(device_id),
-        nac_relay_url,
-        relay_token,
-        relay_cert_fp,
     };
 
     Ok(Arc::new(WrappedOSConfig {
