@@ -62,10 +62,6 @@ fn c_data_to_vec(ptr: *mut u8, len: usize) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
 /// Hardware info read from IOKit.
 #[derive(Debug, Clone)]
 pub struct HardwareInfo {

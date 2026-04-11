@@ -14,6 +14,20 @@ sha1 = "0.10"
 rand = "0.8"
 log = "0.4"
 
+# Optional: native NAC via AAAbsintheContext (macOS 13+).
+# When the `native-nac` feature is enabled AND the build target is macOS,
+# `ValidationCtx::new()` eagerly computes the validation data via
+# `nac_validation::generate_validation_data()` (AppleAccount.framework's
+# AAAbsintheContext), caches it, and returns it from `sign()` — bypassing
+# the unicorn XNU emulator entirely. `key_establishment()` becomes a no-op.
+#
+# nac-validation is a standalone workspace member (depends on libc + thiserror
+# + cc only — no rustpush, no open-absinthe), so this dep direction does NOT
+# create a cycle. The path reaches the repo-root `nac-validation/` from the
+# built copy of this crate at `third_party/rustpush-upstream/open-absinthe/`.
+[target.'cfg(target_os = "macos")'.dependencies]
+nac-validation = { path = "../../../nac-validation", optional = true }
+
 [dev-dependencies]
 plist = "1.7"
 ureq = { version = "2.9", features = ["native-tls"] }
@@ -25,3 +39,4 @@ path = "src/bin/enrich_hw_key.rs"
 
 [features]
 serde = []
+native-nac = ["dep:nac-validation"]

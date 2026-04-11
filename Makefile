@@ -183,6 +183,18 @@ ensure-rustpush-source:
 				   third_party/rustpush-upstream/certs/fairplay/$$name.pem; \
 			done; \
 		fi; \
+		if [ -d rustpush/open-absinthe ] && [ -f rustpush/open-absinthe/Cargo.toml ]; then \
+			echo "Overlaying our open-absinthe (Local NAC wiring) onto $(RUSTPUSH_DIR)/open-absinthe..."; \
+			rm -rf third_party/rustpush-upstream/open-absinthe; \
+			cp -R rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe; \
+		fi; \
+		if [ -d rustpush/apple-private-apis ] && [ -f rustpush/apple-private-apis/Cargo.toml ]; then \
+			if [ ! -f third_party/rustpush-upstream/apple-private-apis/icloud-auth/Cargo.toml ]; then \
+				echo "Overlaying apple-private-apis from vendored copy..."; \
+				rm -rf third_party/rustpush-upstream/apple-private-apis; \
+				cp -R rustpush/apple-private-apis third_party/rustpush-upstream/apple-private-apis; \
+			fi; \
+		fi; \
 	fi
 
 $(RUST_LIB): ensure-rustpush-source $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES)

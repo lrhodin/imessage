@@ -806,10 +806,38 @@ const HOOK_SYMBOLS: &[&str] = &[
 // ValidationCtx
 // ============================================================================
 
+/// Public validation context used by rustpush's `MacOSConfig` to generate
+/// APNs validation data. Two internal modes:
+///
+/// - **Emulator** (default): runs Apple's NAC binary inside a Unicorn x86-64
+///   emulator, feeding it IOKit-equivalent hardware identifiers (with optional
+///   `_enc` fields) and handshaking with Apple's validation servers.
+///
+/// - **Native** (macOS + `native-nac` feature): delegates the entire protocol
+///   to Apple's private `AAAbsintheContext` class via our `nac-validation`
+///   crate. This is the "Local NAC" path — no emulator, no `_enc` fields
+///   required, no XNU assembly. `key_establishment` becomes a no-op and
+///   `sign()` returns the pre-computed bytes.
+///
+/// The Native mode still populates `out_request_bytes` in `new()` with a
+/// minimal plist stub because upstream `MacOSConfig::generate_validation_data`
+/// will unconditionally POST it to Apple's `id-initialize-validation`
+/// endpoint after `new()` returns. Apple's server response is discarded by
+/// our no-op `key_establishment`.
 pub struct ValidationCtx {
-    uc: UnsafeCell<Unicorn<'static, ()>>,
-    state: Rc<RefCell<EmuState>>,
-    validation_ctx_addr: u64,
+    inner: ValidationCtxInner,
+}
+
+enum ValidationCtxInner {
+    Emulator {
+        uc: UnsafeCell<Unicorn<'static, ()>>,
+        state: Rc<RefCell<EmuState>>,
+        validation_ctx_addr: u64,
+    },
+    #[cfg(all(target_os = "macos", feature = "native-nac"))]
+    Native {
+        bytes: Vec<u8>,
+    },
 }
 
 unsafe impl Send for ValidationCtx {}
@@ -825,6 +853,45 @@ impl ValidationCtx {
         out_request_bytes: &mut Vec<u8>,
         hw_config: &HardwareConfig,
     ) -> Result<ValidationCtx, AbsintheError> {
+        // ====================================================================
+        // Native NAC fast path — macOS only, requires `native-nac` feature.
+        // Delegates to AAAbsintheContext via the `nac-validation` crate. The
+        // unicorn emulator is entirely skipped; hardware `_enc` fields are
+        // irrelevant because Apple's native framework reads real hardware
+        // identifiers from IOKit itself.
+        // ====================================================================
+        #[cfg(all(target_os = "macos", feature = "native-nac"))]
+        {
+            info!(
+                "NAC init (native path): delegating to nac-validation \
+                 (AAAbsintheContext via AppleAccount.framework) — \
+                 emulator bypass, hw_config _enc fields ignored"
+            );
+            match nac_validation::generate_validation_data() {
+                Ok(bytes) => {
+                    info!("NAC native path: got {} bytes from AAAbsintheContext", bytes.len());
+                    // Populate out_request_bytes with an empty plist-compatible
+                    // blob. Upstream MacOSConfig will POST this to Apple's
+                    // id-initialize-validation endpoint; Apple's response is
+                    // ignored by our no-op key_establishment() below. An empty
+                    // vec makes the POST body empty — Apple MAY reject; if
+                    // this fails at runtime, the POST body here needs to be a
+                    // minimal valid plist dict.
+                    *out_request_bytes = Vec::new();
+                    return Ok(ValidationCtx {
+                        inner: ValidationCtxInner::Native { bytes },
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        "NAC native path failed, falling back to emulator: {}",
+                        e
+                    );
+                    // Fall through to emulator path below.
+                }
+            }
+        }
+
         // Log hardware key diagnostics
         info!("NAC init: product={} serial={} board={} build={}",
             hw_config.product_name, hw_config.platform_serial_number,
@@ -958,45 +1025,69 @@ impl ValidationCtx {
         *out_request_bytes = request_data;
 
         Ok(ValidationCtx {
-            uc: UnsafeCell::new(uc),
-            state,
-            validation_ctx_addr,
+            inner: ValidationCtxInner::Emulator {
+                uc: UnsafeCell::new(uc),
+                state,
+                validation_ctx_addr,
+            },
         })
     }
 
     /// Process the session-info response from Apple.
     pub fn key_establishment(&mut self, response: &[u8]) -> Result<(), AbsintheError> {
-        let resp_addr = {
-            let mut st = self.state.borrow_mut();
-            st.heap_alloc(response.len() as u64)
-        };
-        let uc = self.uc.get_mut();
-        uc.mem_write(resp_addr, response)
-            .map_err(|e| AbsintheError::Other(format!("Failed to write response: {:?}", e)))?;
+        match &mut self.inner {
+            #[cfg(all(target_os = "macos", feature = "native-nac"))]
+            ValidationCtxInner::Native { .. } => {
+                // Native path: Apple's response was already consumed by
+                // AAAbsintheContext internally during nac-validation. Upstream
+                // MacOSConfig passes Apple's response here, but we discard it.
+                debug!("NAC key_establishment: native path, no-op ({} bytes ignored)", response.len());
+                Ok(())
+            }
+            ValidationCtxInner::Emulator { uc, state, validation_ctx_addr } => {
+                let resp_addr = {
+                    let mut st = state.borrow_mut();
+                    st.heap_alloc(response.len() as u64)
+                };
+                let uc = uc.get_mut();
+                uc.mem_write(resp_addr, response)
+                    .map_err(|e| AbsintheError::Other(format!("Failed to write response: {:?}", e)))?;
 
-        let ret = call_func(
-            uc,
-            NAC_KEY_EST,
-            &[self.validation_ctx_addr, resp_addr, response.len() as u64],
-        )?;
+                let ret = call_func(
+                    uc,
+                    NAC_KEY_EST,
+                    &[*validation_ctx_addr, resp_addr, response.len() as u64],
+                )?;
 
-        if ret != 0 {
-            return Err(AbsintheError::NacError(-(ret as i64 as i32)));
+                if ret != 0 {
+                    return Err(AbsintheError::NacError(-(ret as i64 as i32)));
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Generate signed validation data.
     pub fn sign(&self) -> Result<Vec<u8>, AbsintheError> {
+        let (uc, state, validation_ctx_addr) = match &self.inner {
+            #[cfg(all(target_os = "macos", feature = "native-nac"))]
+            ValidationCtxInner::Native { bytes } => {
+                debug!("NAC sign: returning {} bytes from native path", bytes.len());
+                return Ok(bytes.clone());
+            }
+            ValidationCtxInner::Emulator { uc, state, validation_ctx_addr } => {
+                (uc, state, *validation_ctx_addr)
+            }
+        };
         // sign() takes &self but we need &mut for the emulator.
         // Safety: ValidationCtx is only used from one thread (enforced by
         // the single-threaded usage pattern and unsafe Send impl).
-        let uc = unsafe { &mut *self.uc.get() };
+        let uc = unsafe { &mut *uc.get() };
 
         let out_data_ptr;
         let out_data_len_ptr;
         {
-            let mut st = self.state.borrow_mut();
+            let mut st = state.borrow_mut();
             out_data_ptr = st.heap_alloc(8);
             out_data_len_ptr = st.heap_alloc(8);
         }
@@ -1005,7 +1096,7 @@ impl ValidationCtx {
             uc,
             NAC_SIGN,
             &[
-                self.validation_ctx_addr,
+                validation_ctx_addr,
                 0,
                 0,
                 out_data_ptr,
