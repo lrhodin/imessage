@@ -5992,7 +5992,7 @@ impl Client {
         &self,
         continuation_token: Option<String>,
     ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
-        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, ALL_ASSETS};
         use rustpush::cloud_messages::MESSAGES_SERVICE;
         use rustpush::cloudkit_proto::CloudKitRecord as _;
 
@@ -6004,6 +6004,15 @@ impl Client {
         // (Live Photo MOV companion). Same HTTP call, same record type
         // ("attachment"), same PCS decryption pipeline — only the Rust
         // type we decode into changes.
+        //
+        // Uses ALL_ASSETS (not NO_ASSETS) to match master's
+        // `sync_records_with_assets::<CloudAttachment>("attachmentManateeZone",
+        //  continuation_token, &ALL_ASSETS)` call. With NO_ASSETS the record
+        // fields came back with `protection_info.protection_info` truncated
+        // or missing — every cached Ford key was garbage, so every Ford SIV
+        // retry failed. ALL_ASSETS preserves the PCS-encrypted
+        // protection_info bytes so `from_record_encrypted` produces the real
+        // 32-byte Ford key we register into the cache.
         let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
             msg: format!("Failed to sync CloudKit attachments (get_container): {}", e),
         })?;
@@ -6017,7 +6026,7 @@ impl Client {
         let (_assets, response) = container
             .perform(
                 &CloudKitSession::new(),
-                FetchRecordChangesOperation::new(zone_id.clone(), token, &NO_ASSETS),
+                FetchRecordChangesOperation::new(zone_id.clone(), token, &ALL_ASSETS),
             )
             .await
             .map_err(|e| WrappedError::GenericError {
