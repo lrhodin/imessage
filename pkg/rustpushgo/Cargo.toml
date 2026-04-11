@@ -24,6 +24,12 @@ uniffi = { version = "0.25.0", features = ["tokio"] }
 pretty_env_logger = "0.5.0"
 log = "0.4.20"
 rustpush = { path = "../../third_party/rustpush-upstream", default-features = false, features = ["macos-validation-data"] }
+# Direct path dep on cloudkit-proto so the `CloudKitRecord` derive macro (which
+# emits `cloudkit_proto::*` references in its generated code) can resolve the
+# crate name inside our wrapper. Without this, defining a local CloudKitRecord
+# type in lib.rs fails to compile because the derive expects the crate to be
+# importable by its literal name.
+cloudkit-proto = { path = "../../third_party/rustpush-upstream/cloudkit-proto", package = "cloudkit-proto" }
 keystore = { path = "../../third_party/rustpush-upstream/keystore" }
 plist = "1.7.0"
 serde = { version = "1.0", features = ["derive"] }

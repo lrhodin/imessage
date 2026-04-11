@@ -124,6 +124,37 @@ fn ford_key_cache_values() -> Vec<Vec<u8>> {
 }
 
 // ============================================================================
+// Local CloudKit record type that understands the `avid` field.
+// ============================================================================
+//
+// Upstream `rustpush::cloud_messages::CloudAttachment` only declares `cm` and
+// `lqa`, so parsed records drop the `avid` Asset (Live Photo MOV companion).
+// Our vendored fork added `pub avid: Asset` to support Live Photos.
+//
+// Instead of patching upstream, we define our own CloudKit record type with
+// the same `attachment` record ID and the same field names — CloudKit's
+// on-the-wire record format is schema-driven by field name, so a local
+// struct that derives `CloudKitRecord` with an extra `avid: Asset` field
+// parses the exact same server-side records and populates all three fields.
+// Upstream's original `CloudAttachment` still works wherever we don't need
+// the avid — this type is used anywhere we DO need it (attachment sync for
+// `has_avid` detection, Live Photo MOV download).
+
+// Imports the derive macro sees at its expansion site. The `CloudKitRecord`
+// derive emits references to `CloudKitEncryptor` unqualified, and to
+// `cloudkit_proto::*` by crate name — both need to resolve in our scope.
+use rustpush::cloudkit_derive::CloudKitRecord;
+use cloudkit_proto::{Asset, CloudKitEncryptor};
+
+#[derive(CloudKitRecord, Debug, Default, Clone)]
+#[cloudkit_record(type = "attachment", encrypted)]
+pub struct CloudAttachmentWithAvid {
+    pub cm: rustpush::cloud_messages::GZipWrapper<rustpush::cloud_messages::AttachmentMeta>,
+    pub lqa: Asset,
+    pub avid: Asset,
+}
+
+// ============================================================================
 // Wrapper types
 // ============================================================================
 
@@ -5849,60 +5880,127 @@ impl Client {
     /// Sync CloudKit attachment zone and return metadata for all attachments.
     /// Returns a page of attachment metadata (record_name → attachment info).
     /// Paginate with continuation_token until done == true.
+    ///
+    /// Parses records as our local `CloudAttachmentWithAvid` instead of
+    /// upstream's `CloudAttachment` so we get the `avid` field (Live Photo
+    /// MOV companion) without needing a rustpush patch. Same on-the-wire
+    /// record type ("attachment"), same PCS-encrypted record fields —
+    /// `cm`, `lqa`, and `avid` are decoded by the CloudKit field-name
+    /// matcher on our struct the same way they'd be on upstream's + an
+    /// extra field. Ford key registration uses both `lqa.protection_info`
+    /// AND `avid.protection_info`.
     pub async fn cloud_sync_attachments(
         &self,
         continuation_token: Option<String>,
     ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
+        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
+        use rustpush::cloudkit_proto::CloudKitRecord as _;
+
         let token = decode_continuation_token(continuation_token)?;
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
 
-        let (next_token, attachments, status) = cloud_messages.sync_attachments(token).await
+        // Hand-rolled version of upstream's `sync_attachments` that parses
+        // records as `CloudAttachmentWithAvid` so we see the `avid` field
+        // (Live Photo MOV companion). Same HTTP call, same record type
+        // ("attachment"), same PCS decryption pipeline — only the Rust
+        // type we decode into changes.
+        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to sync CloudKit attachments (get_container): {}", e),
+        })?;
+        let zone_id = container.private_zone("attachmentManateeZone".to_string());
+        let zone_key = container
+            .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+            .await
             .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to sync CloudKit attachments: {}", e),
+                msg: format!("Failed to sync CloudKit attachments (zone_key): {}", e),
+            })?;
+        let (_assets, response) = container
+            .perform(
+                &CloudKitSession::new(),
+                FetchRecordChangesOperation::new(zone_id.clone(), token, &NO_ASSETS),
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to sync CloudKit attachments (perform): {}", e),
             })?;
 
-        let mut normalized = Vec::with_capacity(attachments.len());
-        for (record_name, att_opt) in attachments {
-            if let Some(att) = att_opt {
-                #[cfg(feature = "rustpush-avid-download")]
-                let has_avid = att.avid.size.unwrap_or(0) > 0;
-                #[cfg(not(feature = "rustpush-avid-download"))]
-                let has_avid = false;
+        let status = response.status();
+        let next_token = response.sync_continuation_token().to_vec();
 
-                // Extract the PCS-decrypted Ford keys from `lqa.protection_info`
-                // (and `avid.protection_info` for Live Photos) so Go can
-                // pre-populate the Ford key cache. Images (V1 per-chunk
-                // encryption) have no protection_info Ford key — None.
-                let ford_key = att
-                    .lqa
-                    .protection_info
-                    .as_ref()
-                    .and_then(|p| p.protection_info.as_ref())
-                    .cloned();
-                #[cfg(feature = "rustpush-avid-download")]
-                let avid_ford_key = att
-                    .avid
-                    .protection_info
-                    .as_ref()
-                    .and_then(|p| p.protection_info.as_ref())
-                    .cloned();
-                #[cfg(not(feature = "rustpush-avid-download"))]
-                let avid_ford_key: Option<Vec<u8>> = None;
-
-                normalized.push(WrappedCloudAttachmentInfo {
-                    guid: att.cm.guid.clone(),
-                    mime_type: att.cm.mime_type.clone(),
-                    uti_type: att.cm.uti.clone(),
-                    filename: att.cm.transfer_name.clone().or_else(|| att.cm.filename.clone()),
-                    file_size: att.cm.total_bytes,
-                    record_name,
-                    hide_attachment: att.cm.hide_attachment,
-                    has_avid,
-                    ford_key,
-                    avid_ford_key,
-                });
+        let mut normalized = Vec::with_capacity(response.change.len());
+        for change in &response.change {
+            let identifier = match change
+                .identifier
+                .as_ref()
+                .and_then(|i| i.value.as_ref())
+            {
+                Some(v) => v.name().to_string(),
+                None => continue,
+            };
+            let record = match &change.record {
+                Some(r) => r,
+                None => continue, // deleted tombstone
+            };
+            if record.r#type.as_ref().and_then(|t| t.name.as_deref()) != Some(CloudAttachmentWithAvid::record_type()) {
+                continue;
             }
-            // Deleted attachments are simply not included
+
+            // Derive the per-record PCS encryptor from the zone key (same
+            // two-step PCS decryption upstream uses in sync_records).
+            let pcskey = match pcs_keys_for_record(record, &zone_key) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!("cloud_sync_attachments: PCS key derive failed for {}: {}", identifier, e);
+                    continue;
+                }
+            };
+
+            // Wrap PCS field decode in catch_unwind (same pattern as the
+            // other PCS-reaching call sites in this wrapper) because
+            // malformed PCS fields can panic inside upstream.
+            let att: CloudAttachmentWithAvid = match std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| {
+                    CloudAttachmentWithAvid::from_record_encrypted(&record.record_field, Some(&pcskey))
+                }),
+            ) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    warn!(
+                        "cloud_sync_attachments: skipping record {} (PCS decode panic)",
+                        identifier
+                    );
+                    continue;
+                }
+            };
+
+            let has_avid = att.avid.size.unwrap_or(0) > 0;
+
+            let ford_key = att
+                .lqa
+                .protection_info
+                .as_ref()
+                .and_then(|p| p.protection_info.as_ref())
+                .cloned();
+            let avid_ford_key = att
+                .avid
+                .protection_info
+                .as_ref()
+                .and_then(|p| p.protection_info.as_ref())
+                .cloned();
+
+            normalized.push(WrappedCloudAttachmentInfo {
+                guid: att.cm.0.guid.clone(),
+                mime_type: att.cm.0.mime_type.clone(),
+                uti_type: att.cm.0.uti.clone(),
+                filename: att.cm.0.transfer_name.clone().or_else(|| att.cm.0.filename.clone()),
+                file_size: att.cm.0.total_bytes,
+                record_name: identifier,
+                hide_attachment: att.cm.0.hide_attachment,
+                has_avid,
+                ford_key,
+                avid_ford_key,
+            });
         }
 
         Ok(WrappedCloudSyncAttachmentsPage {
@@ -5977,38 +6075,103 @@ impl Client {
     // non-FFI reference types and uniffi can't codegen wrappers for it.
 
     /// Whether this build supports CloudKit avid (Live Photo MOV) downloads.
-    /// This is explicit so callers can branch behavior instead of probing by error text.
+    /// Always true now — the wrapper hand-rolls the avid path using our
+    /// local `CloudAttachmentWithAvid` record type and `container.get_assets`,
+    /// so it doesn't depend on any rustpush cargo feature or patch.
     pub fn cloud_supports_avid_download(&self) -> bool {
-        cfg!(feature = "rustpush-avid-download")
+        true
     }
 
     /// Download the Live Photo video (avid asset) from a CloudKit attachment record.
-    /// Uses guarded compilation so wrappers can stay compatible across fork API drift.
+    ///
+    /// Upstream rustpush's `CloudAttachment` type doesn't have an `avid`
+    /// field, so we fetch the record using our local `CloudAttachmentWithAvid`
+    /// (which declares the same `attachment` CloudKit record type plus the
+    /// extra `avid: Asset` field), register the record's Ford keys into
+    /// the wrapper cache, and call `container.get_assets` with
+    /// `&record.avid` as the target asset. Wrapped in catch_unwind for
+    /// SIV panic safety, and falls through to `cloud_download_avid_ford_recovery`
+    /// if the initial attempt panics on a MMCS dedup SIV failure.
     pub async fn cloud_download_attachment_avid(
         &self,
         record_name: String,
     ) -> Result<Vec<u8>, WrappedError> {
-        #[cfg(feature = "rustpush-avid-download")]
-        {
-            let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        use futures::FutureExt;
+        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
 
-            let shared = SharedWriter::new();
-            let mut files = HashMap::new();
-            files.insert(record_name.clone(), shared.clone());
-            cloud_messages.download_attachment_avid(files).await
-                .map_err(|e| WrappedError::GenericError {
-                    msg: format!("Failed to download CloudKit attachment avid {}: {}", record_name, e),
-                })?;
-            return Ok(shared.into_bytes());
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
+            msg: format!("cloud_download_attachment_avid {}: get_container: {e}", record_name),
+        })?;
+        let zone = container.private_zone("attachmentManateeZone".to_string());
+        let zone_key = container
+            .get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("cloud_download_attachment_avid {}: zone key: {e}", record_name),
+            })?;
+
+        let invoke = container
+            .perform_operations(
+                &CloudKitSession::new(),
+                &FetchRecordOperation::many(&ALL_ASSETS, &zone, &[record_name.clone()]),
+                IsolationLevel::Operation,
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("cloud_download_attachment_avid {}: perform_operations: {e}", record_name),
+            })?;
+        let records = FetchedRecords::new(&invoke);
+        let base_record: CloudAttachmentWithAvid = records.get_record(&record_name, Some(&zone_key));
+
+        // Register this record's Ford keys (both lqa and avid) into the
+        // wrapper cache so recovery has visibility if the initial attempt
+        // panics on a dedup mismatch.
+        if let Some(pi) = base_record
+            .lqa
+            .protection_info
+            .as_ref()
+            .and_then(|p| p.protection_info.as_ref())
+        {
+            register_ford_key(pi.clone());
+        }
+        if let Some(pi) = base_record
+            .avid
+            .protection_info
+            .as_ref()
+            .and_then(|p| p.protection_info.as_ref())
+        {
+            register_ford_key(pi.clone());
         }
 
-        #[cfg(not(feature = "rustpush-avid-download"))]
-        Err(WrappedError::GenericError {
-            msg: format!(
-                "Avid download is not available in this build (feature rustpush-avid-download is disabled) for record {}",
-                record_name
-            ),
-        })
+        // Attempt 1 — record's own avid key.
+        let shared = SharedWriter::new();
+        let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
+            vec![(&base_record.avid, shared.clone())];
+        let fut = container.get_assets(&records.assets, assets_tuple);
+        let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+        match result {
+            Ok(Ok(())) => return Ok(shared.into_bytes()),
+            Ok(Err(e)) => {
+                return Err(WrappedError::GenericError {
+                    msg: format!("cloud_download_attachment_avid {}: get_assets: {e}", record_name),
+                });
+            }
+            Err(_panic) => {
+                warn!(
+                    "cloud_download_attachment_avid {}: SIV panic, attempting Ford recovery \
+                     with {} cached keys",
+                    record_name,
+                    ford_key_cache_size()
+                );
+            }
+        }
+
+        // Attempt 2+ — Ford dedup recovery, same pattern as
+        // cloud_download_attachment_ford_recovery but targets record.avid.
+        self.cloud_download_avid_ford_recovery(container, &records, base_record, &record_name)
+            .await
     }
 
     /// Download a group photo from CloudKit by the chat's record name.
@@ -6499,6 +6662,76 @@ impl Client {
         Err(WrappedError::GenericError {
             msg: format!(
                 "Ford dedup recovery for {}: all {} cached keys failed SIV decrypt",
+                record_name,
+                cached_keys.len()
+            ),
+        })
+    }
+
+    /// Ford dedup recovery for the Live Photo MOV (`avid`) asset. Same
+    /// algorithm as `cloud_download_attachment_ford_recovery` but operates
+    /// on `record.avid` instead of `record.lqa`. Takes an already-fetched
+    /// `CloudAttachmentWithAvid` and `FetchedRecords` so we don't re-hit
+    /// the CloudKit record endpoint per attempt.
+    async fn cloud_download_avid_ford_recovery(
+        &self,
+        container: Arc<rustpush::cloudkit::CloudKitOpenContainer<'static, omnisette::DefaultAnisetteProvider>>,
+        records: &rustpush::cloudkit::FetchedRecords,
+        base_record: CloudAttachmentWithAvid,
+        record_name: &str,
+    ) -> Result<Vec<u8>, WrappedError> {
+        use futures::FutureExt;
+
+        let cached_keys = ford_key_cache_values();
+        info!(
+            "Ford recovery (avid) {}: trying {} cached keys",
+            record_name,
+            cached_keys.len()
+        );
+
+        for (idx, alt_key) in cached_keys.iter().enumerate() {
+            let mut record = base_record.clone();
+            if let Some(pi) = record.avid.protection_info.as_mut() {
+                pi.protection_info = Some(alt_key.clone());
+            } else {
+                continue;
+            }
+
+            let shared = SharedWriter::new();
+            let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
+                vec![(&record.avid, shared.clone())];
+
+            let fut = container.get_assets(&records.assets, assets_tuple);
+            let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+            match result {
+                Ok(Ok(())) => {
+                    info!(
+                        "Ford SIV succeeded with cached key (avid dedup resolved, attempt {}/{})",
+                        idx + 1,
+                        cached_keys.len()
+                    );
+                    return Ok(shared.into_bytes());
+                }
+                Ok(Err(e)) => {
+                    debug!("Ford avid recovery attempt {} returned error: {}", idx + 1, e);
+                }
+                Err(_panic) => {
+                    debug!(
+                        "Ford avid recovery attempt {} panicked (wrong key, retrying)",
+                        idx + 1
+                    );
+                }
+            }
+        }
+
+        warn!(
+            "Ford recovery (avid) {}: all {} cached keys failed",
+            record_name,
+            cached_keys.len()
+        );
+        Err(WrappedError::GenericError {
+            msg: format!(
+                "Ford dedup recovery (avid) for {}: all {} cached keys failed SIV decrypt",
                 record_name,
                 cached_keys.len()
             ),
