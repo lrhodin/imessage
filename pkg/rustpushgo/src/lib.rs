@@ -3087,8 +3087,7 @@ pub fn create_local_macos_config() -> Result<Arc<WrappedOSConfig>, WrappedError>
     #[cfg(target_os = "macos")]
     {
         let config = local_config::LocalMacOSConfig::new()
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
-            .into_macos_config();
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?;
         Ok(Arc::new(WrappedOSConfig {
             config: Arc::new(config),
         }))
@@ -3109,8 +3108,7 @@ pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc
     {
         let config = local_config::LocalMacOSConfig::new()
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
-            .with_device_id(device_id)
-            .into_macos_config();
+            .with_device_id(device_id);
         Ok(Arc::new(WrappedOSConfig {
             config: Arc::new(config),
         }))
@@ -7445,50 +7443,83 @@ impl Client {
             response.change.len()
         );
 
-        // QueryRecords fallback: on the final page, query attachmentManateeZone
-        // directly for all "attachment" records. FetchRecordChanges misses at least
-        // 4 live records for unknown reasons (confirmed: master also misses them,
-        // server returns same 895 regardless of newest_first/NO_ASSETS). QueryRecords
-        // queries current zone state independently of the change feed and may return
-        // records the feed omits. Any record not already in `normalized` is processed
-        // with the same PCS + cm/lqa/avid decode logic.
-        if status == 3 {
-            use rustpush::cloudkit::CloudKitOp;
-            use rustpush::cloudkit_proto;
+        Ok(WrappedCloudSyncAttachmentsPage {
+            continuation_token: encode_continuation_token(next_token),
+            status,
+            done: status == 3,
+            attachments: normalized,
+        })
+    }
 
-            struct RawQueryOp(cloudkit_proto::QueryRetrieveRequest);
-            impl CloudKitOp for RawQueryOp {
-                type Response = cloudkit_proto::QueryRetrieveResponse;
-                fn set_request(&self, output: &mut cloudkit_proto::RequestOperation) {
-                    output.query_retrieve_request = Some(self.0.clone());
-                }
-                fn retrieve_response(response: &cloudkit_proto::ResponseOperation) -> Self::Response {
-                    response.query_retrieve_response.clone().unwrap_or_default()
-                }
-                fn flow_control_key() -> &'static str { "CKDQueryOperation" }
-                fn link() -> &'static str { "https://gateway.icloud.com/ckdatabase/api/client/query/retrieve" }
-                fn operation() -> cloudkit_proto::operation::Type {
-                    cloudkit_proto::operation::Type::QueryRetrieveType
-                }
-                fn tags() -> bool { false }
+    /// QueryRecords fallback for attachmentManateeZone.
+    ///
+    /// FetchRecordChanges misses some live records — confirmed on both master and
+    /// refactor, same count regardless of newest_first/NO_ASSETS. QueryRecords
+    /// queries current zone state without relying on the change-feed token and
+    /// returns records the feed omits.
+    ///
+    /// Call once after the full cloud_sync_attachments loop completes, passing
+    /// the record_names of all attachments already collected from the change feed.
+    /// Returns only records NOT in known_record_names, processed with the same
+    /// PCS + cm/lqa/avid decode logic as cloud_sync_attachments.
+    pub async fn cloud_query_attachments_fallback(
+        &self,
+        known_record_names: Vec<String>,
+    ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
+        use rustpush::cloudkit::{pcs_keys_for_record, CloudKitOp, CloudKitSession, NO_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
+        use rustpush::pcs::{PCSShareProtection, PCSEncryptor};
+        use rustpush::PushError;
+        use rustpush::cloudkit_proto;
+
+        struct RawQueryOp(cloudkit_proto::QueryRetrieveRequest);
+        impl CloudKitOp for RawQueryOp {
+            type Response = cloudkit_proto::QueryRetrieveResponse;
+            fn set_request(&self, output: &mut cloudkit_proto::RequestOperation) {
+                output.query_retrieve_request = Some(self.0.clone());
             }
+            fn retrieve_response(response: &cloudkit_proto::ResponseOperation) -> Self::Response {
+                response.query_retrieve_response.clone().unwrap_or_default()
+            }
+            fn flow_control_key() -> &'static str { "CKDQueryOperation" }
+            fn link() -> &'static str { "https://gateway.icloud.com/ckdatabase/api/client/query/retrieve" }
+            fn operation() -> cloudkit_proto::operation::Type {
+                cloudkit_proto::operation::Type::QueryRetrieveType
+            }
+            fn tags() -> bool { false }
+        }
 
-            let seen_ids: std::collections::HashSet<String> = normalized.iter()
-                .map(|a| a.record_name.clone())
-                .collect();
+        let seen_ids: std::collections::HashSet<String> = known_record_names.into_iter().collect();
 
-            // Paginate QueryRecords until continuation_marker is empty.
-            // CloudKit typically returns ~200 records per page; with 875+
-            // attachment records we need multiple pages to cover all of them.
-            let mut qr_continuation: Option<Vec<u8>> = None;
-            let mut qr_extra = 0usize;
-            let mut qr_page = 0usize;
-            loop {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = match cloud_messages.get_container().await {
+            Ok(c) => c,
+            Err(e) => return Err(WrappedError::GenericError { msg: format!("cloud_query_attachments_fallback: get_container failed: {}", e) }),
+        };
+        let zone_id = container.private_zone("attachmentManateeZone".to_string());
+        let mut zone_key = match container
+            .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+            .await
+        {
+            Ok(k) => k,
+            Err(e) => return Err(WrappedError::GenericError { msg: format!("cloud_query_attachments_fallback: zone_key failed: {}", e) }),
+        };
+
+        let mut normalized: Vec<WrappedCloudAttachmentInfo> = Vec::new();
+        let mut pcs_skipped = 0usize;
+        let mut cm_decode_fail = 0usize;
+        let mut lqa_decode_fail = 0usize;
+        let mut ford_cached = 0usize;
+        let mut refreshed_zone_key_config = false;
+        let mut qr_continuation: Option<Vec<u8>> = None;
+        let mut qr_page = 0usize;
+
+        loop {
             qr_page += 1;
             let c = Arc::clone(&container);
             let z = zone_id.clone();
             let qr_cont = qr_continuation.clone();
-            let query_join = tokio::task::spawn(async move {
+            let join = tokio::task::spawn(async move {
                 c.perform(&CloudKitSession::new(), RawQueryOp(cloudkit_proto::QueryRetrieveRequest {
                     query: Some(cloudkit_proto::Query {
                         types: vec![cloudkit_proto::record::Type { name: Some("attachment".to_string()) }],
@@ -7503,24 +7534,21 @@ impl Client {
                 })).await
             }).await;
 
-            let qr = match query_join {
+            let qr = match join {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    warn!("cloud_sync_attachments: QueryRecords fallback page {} failed: {}", qr_page, e);
+                    warn!("cloud_query_attachments_fallback: page {} failed: {}", qr_page, e);
                     break;
                 }
                 Err(e) => {
-                    warn!("cloud_sync_attachments: QueryRecords fallback page {} panicked: {}", qr_page, e);
+                    warn!("cloud_query_attachments_fallback: page {} panicked: {}", qr_page, e);
                     break;
                 }
             };
-            let next_qr_marker = qr.continuation_marker.clone();
+            let next_marker = qr.continuation_marker.clone();
 
             for qresult in &qr.query_results {
-                let record = match &qresult.record {
-                    Some(r) => r,
-                    None => continue,
-                };
+                let record = match &qresult.record { Some(r) => r, None => continue };
                 let identifier = match record.record_identifier.as_ref()
                     .and_then(|i| i.value.as_ref())
                     .and_then(|v| v.name.as_deref())
@@ -7531,10 +7559,8 @@ impl Client {
                 if seen_ids.contains(&identifier) {
                     continue;
                 }
-                qr_extra += 1;
-                info!("cloud_sync_attachments: QueryRecords found extra record not in change feed: {}", identifier);
+                info!("cloud_query_attachments_fallback: new record not in change feed: {}", identifier);
 
-                // Process with same PCS + cm/lqa/avid logic as change feed loop.
                 let pcs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     pcs_keys_for_record(record, &zone_key)
                 }));
@@ -7549,29 +7575,19 @@ impl Client {
                             match fallback {
                                 Ok(Ok((pcs_keys, _))) => {
                                     let record_id = record.record_identifier.clone().expect("no record id");
-                                    info!("cloud_sync_attachments: qr fallback decrypt_with_keychain succeeded for {}", identifier);
                                     Some(PCSEncryptor { keys: pcs_keys, record_id })
                                 }
-                                Ok(Err(e)) => {
-                                    pcs_skipped += 1;
-                                    warn!("cloud_sync_attachments: qr pcs panic + fallback failed for {}: {}", identifier, e);
-                                    None
-                                }
-                                Err(_) => {
-                                    pcs_skipped += 1;
-                                    warn!("cloud_sync_attachments: qr pcs panic + fallback panicked for {}", identifier);
-                                    None
-                                }
+                                Ok(Err(e)) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: pcs panic + fallback failed for {}: {}", identifier, e); None }
+                                Err(_) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: pcs panic + fallback panicked for {}", identifier); None }
                             }
                         } else {
                             pcs_skipped += 1;
-                            warn!("cloud_sync_attachments: qr pcs_keys_for_record panicked for {} (no protection_info)", identifier);
+                            warn!("cloud_query_attachments_fallback: pcs panicked for {} (no protection_info)", identifier);
                             None
                         }
                     }
                     Ok(Ok(k)) => Some(k),
                     Ok(Err(PushError::PCSRecordKeyMissing)) if !refreshed_zone_key_config => {
-                        info!("cloud_sync_attachments: qr PCSRecordKeyMissing for {}, refreshing zone config", identifier);
                         container.clear_cache_zone_encryption_config(&zone_id).await;
                         refreshed_zone_key_config = true;
                         match container.get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE).await {
@@ -7580,17 +7596,13 @@ impl Client {
                                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pcs_keys_for_record(record, &zone_key))) {
                                     Err(_) => { pcs_skipped += 1; None }
                                     Ok(Ok(k)) => Some(k),
-                                    Ok(Err(e)) => { pcs_skipped += 1; warn!("cloud_sync_attachments: qr PCS still missing after refresh for {}: {}", identifier, e); None }
+                                    Ok(Err(e)) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: PCS still missing after refresh for {}: {}", identifier, e); None }
                                 }
                             }
-                            Err(e) => { warn!("cloud_sync_attachments: qr zone config refresh failed: {}", e); None }
+                            Err(e) => { warn!("cloud_query_attachments_fallback: zone config refresh failed: {}", e); None }
                         }
                     }
-                    Ok(Err(e)) => {
-                        pcs_skipped += 1;
-                        warn!("cloud_sync_attachments: qr PCS error for {}: {}", identifier, e);
-                        None
-                    }
+                    Ok(Err(e)) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: PCS error for {}: {}", identifier, e); None }
                 };
                 let pcskey = match pcskey_opt { Some(k) => k, None => continue };
 
@@ -7611,16 +7623,12 @@ impl Client {
                     })) {
                         Ok(Some(gzw)) => Some(gzw.0),
                         Ok(None) => None,
-                        Err(_panic) => { warn!("cloud_sync_attachments: qr {} cm decode panicked. fields={:?}", identifier, field_names); None }
+                        Err(_panic) => { warn!("cloud_query_attachments_fallback: {} cm decode panicked. fields={:?}", identifier, field_names); None }
                     },
                 };
                 let cm = match cm_opt {
                     Some(cm) => cm,
-                    None => {
-                        cm_decode_fail += 1;
-                        warn!("cloud_sync_attachments: qr skipping {} — cm missing/undecodable. fields={:?}", identifier, field_names);
-                        continue;
-                    }
+                    None => { cm_decode_fail += 1; warn!("cloud_query_attachments_fallback: skipping {} — cm missing/undecodable. fields={:?}", identifier, field_names); continue; }
                 };
 
                 let lqa_opt: Option<rustpush::cloudkit_proto::Asset> = match find_field("lqa") {
@@ -7630,7 +7638,7 @@ impl Client {
                     })) {
                         Ok(Some(asset)) => Some(asset),
                         Ok(None) => { lqa_decode_fail += 1; None }
-                        Err(_panic) => { lqa_decode_fail += 1; warn!("cloud_sync_attachments: qr {} lqa decode panicked", identifier); None }
+                        Err(_panic) => { lqa_decode_fail += 1; warn!("cloud_query_attachments_fallback: {} lqa decode panicked", identifier); None }
                     },
                 };
 
@@ -7640,7 +7648,7 @@ impl Client {
                         <rustpush::cloudkit_proto::Asset as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "avid")
                     })) {
                         Ok(parsed) => parsed,
-                        Err(_panic) => { warn!("cloud_sync_attachments: qr {} avid decode panicked", identifier); None }
+                        Err(_panic) => { warn!("cloud_query_attachments_fallback: {} avid decode panicked", identifier); None }
                     },
                 };
 
@@ -7652,7 +7660,7 @@ impl Client {
                 if let Some(ref k) = avid_ford_key { register_ford_key(k.clone()); ford_cached += 1; }
 
                 info!(
-                    "cloud_sync_attachments: qr att guid={} record={} mime={:?} size={} lqa_ok={} avid_ok={}",
+                    "cloud_query_attachments_fallback: att guid={} record={} mime={:?} size={} lqa_ok={} avid_ok={}",
                     cm.guid, identifier, cm.mime_type, cm.total_bytes, lqa_opt.is_some(), avid_asset.is_some(),
                 );
                 normalized.push(WrappedCloudAttachmentInfo {
@@ -7668,24 +7676,22 @@ impl Client {
                     avid_ford_key,
                 });
             }
-            // Advance pagination or stop.
-            match next_qr_marker {
+
+            match next_marker {
                 Some(m) if !m.is_empty() => { qr_continuation = Some(m); }
                 _ => break,
             }
-            } // end pagination loop
-
-            if qr_extra > 0 {
-                info!("cloud_sync_attachments: QueryRecords fallback added {} extra records across {} pages", qr_extra, qr_page);
-            } else {
-                info!("cloud_sync_attachments: QueryRecords fallback found no new records after {} pages (change feed was complete, or records are tombstoned)", qr_page);
-            }
         }
 
+        info!(
+            "cloud_query_attachments_fallback: {} new records across {} pages, {} pcs_skipped, {} cm_fail, {} lqa_fail, {} ford_cached",
+            normalized.len(), qr_page, pcs_skipped, cm_decode_fail, lqa_decode_fail, ford_cached
+        );
+
         Ok(WrappedCloudSyncAttachmentsPage {
-            continuation_token: encode_continuation_token(next_token),
-            status,
-            done: status == 3,
+            continuation_token: None,
+            status: 3,
+            done: true,
             attachments: normalized,
         })
     }

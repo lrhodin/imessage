@@ -1497,6 +1497,56 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 		}
 	}
 
+	// QueryRecords fallback: query attachmentManateeZone directly for records
+	// the FetchRecordChanges feed missed. Pass all record_names already in attMap
+	// so Rust only returns genuinely new records.
+	knownNames := make([]string, 0, len(attMap))
+	for _, row := range attMap {
+		knownNames = append(knownNames, row.RecordName)
+	}
+	if fallback, fallbackErr := safeCloudQueryAttachmentsFallback(c.client, knownNames); fallbackErr != nil {
+		log.Warn().Err(fallbackErr).Msg("CloudKit attachment QueryRecords fallback failed")
+	} else {
+		for _, att := range fallback.Attachments {
+			mime := ""
+			if att.MimeType != nil {
+				mime = *att.MimeType
+			}
+			uti := ""
+			if att.UtiType != nil {
+				uti = *att.UtiType
+			}
+			filename := ""
+			if att.Filename != nil {
+				filename = *att.Filename
+			}
+			attMap[att.Guid] = cloudAttachmentRow{
+				GUID:       att.Guid,
+				MimeType:   mime,
+				UTIType:    uti,
+				Filename:   filename,
+				FileSize:   att.FileSize,
+				RecordName: att.RecordName,
+				HasAvid:    att.HasAvid,
+			}
+			if att.FordKey != nil {
+				if c.fordCache != nil {
+					c.fordCache.Register(*att.FordKey)
+				}
+				rustpushgo.RegisterFordKey(*att.FordKey)
+			}
+			if att.AvidFordKey != nil {
+				if c.fordCache != nil {
+					c.fordCache.Register(*att.AvidFordKey)
+				}
+				rustpushgo.RegisterFordKey(*att.AvidFordKey)
+			}
+		}
+		if len(fallback.Attachments) > 0 {
+			log.Info().Int("count", len(fallback.Attachments)).Msg("CloudKit attachment QueryRecords fallback added records")
+		}
+	}
+
 	return attMap, token, nil
 }
 
@@ -1597,6 +1647,12 @@ func safeCloudSyncChats(client *rustpushgo.Client, token *string) (rustpushgo.Wr
 func safeCloudSyncAttachments(client *rustpushgo.Client, token *string) (rustpushgo.WrappedCloudSyncAttachmentsPage, error) {
 	return safeFFICall("CloudSyncAttachments", func() (rustpushgo.WrappedCloudSyncAttachmentsPage, error) {
 		return client.CloudSyncAttachments(token)
+	})
+}
+
+func safeCloudQueryAttachmentsFallback(client *rustpushgo.Client, knownRecordNames []string) (rustpushgo.WrappedCloudSyncAttachmentsPage, error) {
+	return safeFFICall("CloudQueryAttachmentsFallback", func() (rustpushgo.WrappedCloudSyncAttachmentsPage, error) {
+		return client.CloudQueryAttachmentsFallback(knownRecordNames)
 	})
 }
 
