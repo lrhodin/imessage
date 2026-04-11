@@ -1,28 +1,18 @@
-//! LocalMacOSConfig — reads hardware info from IOKit and constructs an
-//! `rustpush::macos::MacOSConfig` ready for use as an `Arc<dyn OSConfig>`.
+//! LocalMacOSConfig — reads hardware info from IOKit and produces a
+//! `rustpush::macos::MacOSConfig` via `into_macos_config()`.
 //!
-//! ## Design note (zero-patch refactor)
+//! `MacOSConfig` already implements `OSConfig` (inside the upstream crate where
+//! `ActivationInfo` is visible), so we don't need to re-implement `OSConfig` here.
+//! Our overlaid `rustpush/open-absinthe/src/nac.rs` provides the native NAC path
+//! (`AAAbsintheContext` via `nac-validation`) when the `native-nac` feature is on,
+//! so `MacOSConfig::generate_validation_data` automatically uses it.
 //!
-//! Previously this module implemented `OSConfig` directly and used our native
-//! `nac-validation` crate (AAAbsintheContext via AppleAccount.framework) for
-//! validation data generation, bypassing open-absinthe on macOS.
-//!
-//! That implementation cannot compile against OpenBubbles upstream rustpush
-//! because `OSConfig::build_activation_info` returns `rustpush::activation::
-//! ActivationInfo`, and `mod activation` is private in upstream — the type is
-//! not nameable from outside the rustpush crate. Writing an external OSConfig
-//! impl is therefore impossible without patching upstream.
-//!
-//! Workaround: construct `rustpush::macos::MacOSConfig` (upstream's public
-//! OSConfig impl) and populate its `HardwareConfig` from IOKit data. macOS
-//! validation then runs through upstream's open-absinthe path instead of our
-//! native nac-validation path. The `nac-validation` crate remains available
-//! as a standalone utility for future direct use but is not wired into
-//! OSConfig at this layer.
+//! _enc fields are left empty — the native NAC path reads hardware identifiers
+//! directly from IOKit and does not use them.
 
 use std::ffi::CStr;
 
-use uuid::Uuid;
+use rustpush::macos::{HardwareConfig, MacOSConfig};
 
 // FFI for hardware_info.m
 #[repr(C)]
@@ -98,7 +88,7 @@ impl HardwareInfo {
         let info = HardwareInfo {
             product_name: c_str_to_string(raw.product_name).unwrap_or_else(|| "Mac".to_string()),
             serial_number: c_str_to_string(raw.serial_number).unwrap_or_default(),
-            platform_uuid: c_str_to_string(raw.platform_uuid).unwrap_or_else(|| Uuid::new_v4().to_string()),
+            platform_uuid: c_str_to_string(raw.platform_uuid).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             board_id: c_str_to_string(raw.board_id).unwrap_or_default(),
             os_build_num: c_str_to_string(raw.os_build_num).unwrap_or_else(|| "25B78".to_string()),
             os_version: c_str_to_string(raw.os_version).unwrap_or_else(|| "26.1".to_string()),
@@ -114,8 +104,8 @@ impl HardwareInfo {
     }
 }
 
-/// Local macOS configuration for iMessage registration.
-/// Uses real hardware identifiers from IOKit and local NAC for validation.
+/// Local macOS configuration builder.
+/// Call `into_macos_config()` to get the `MacOSConfig` that implements `OSConfig`.
 #[derive(Clone)]
 pub struct LocalMacOSConfig {
     pub hw: HardwareInfo,
@@ -128,13 +118,11 @@ pub struct LocalMacOSConfig {
 impl LocalMacOSConfig {
     pub fn new() -> Result<Self, String> {
         let hw = HardwareInfo::read()?;
-        // Use the real hardware UUID as device ID — AAAbsintheContext
-        // embeds the real hardware UUID in validation data, so a random
-        // UUID would cause Apple to reject the registration (error 6001).
+        // Use the real hardware UUID — AAAbsintheContext embeds it in
+        // validation data, so a random UUID would cause Apple to reject
+        // the registration (error 6001).
         let device_id = hw.platform_uuid.to_uppercase();
 
-        // Build UA strings using the real Darwin version from this Mac
-        // instead of hardcoding values from a different macOS release.
         let darwin = &hw.darwin_version;
         let icloud_ua = format!(
             "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/{}",
@@ -165,48 +153,36 @@ impl LocalMacOSConfig {
         self
     }
 
-    /// Consume this LocalMacOSConfig and produce a `rustpush::macos::MacOSConfig`
-    /// that implements `OSConfig` via upstream's open-absinthe NAC path.
+    /// Convert to the upstream `MacOSConfig` that implements `OSConfig`.
     ///
-    /// NOTE: This drops our previous custom OSConfig impl (which called
-    /// `nac-validation::generate_validation_data()` natively via AAAbsintheContext).
-    /// That path is architecturally blocked against OpenBubbles upstream because
-    /// `OSConfig::build_activation_info` returns a type from the private `mod
-    /// activation`, which external crates cannot name. See the module doc comment.
-    ///
-    /// HardwareConfig's `_enc` fields (platform_serial_number_enc, platform_uuid_enc,
-    /// root_disk_uuid_enc) are left empty — upstream's ValidationCtx only inserts
-    /// them if present, and the unicorn NAC emulator derives them from plaintext
-    /// on the fly when possible.
-    pub fn into_macos_config(self) -> rustpush::macos::MacOSConfig {
-        // `rustpush::macos::HardwareConfig` is re-exported from `open_absinthe::nac`.
-        // Default-init and populate only the plaintext fields we have from IOKit;
-        // leave encryption/obfuscation fields empty.
-        let hw_config = rustpush::macos::HardwareConfig {
-            product_name: self.hw.product_name.clone(),
-            io_mac_address: self.hw.mac_address,
-            platform_serial_number: self.hw.serial_number.clone(),
-            platform_uuid: self.hw.platform_uuid.clone(),
-            root_disk_uuid: self.hw.root_disk_uuid.clone(),
-            board_id: self.hw.board_id.clone(),
-            os_build_num: self.hw.os_build_num.clone(),
-            platform_serial_number_enc: Vec::new(),
-            platform_uuid_enc: Vec::new(),
-            root_disk_uuid_enc: Vec::new(),
-            rom: self.hw.rom.clone(),
-            rom_enc: Vec::new(),
-            mlb: self.hw.mlb.clone(),
-            mlb_enc: Vec::new(),
-        };
-
-        rustpush::macos::MacOSConfig {
-            inner: hw_config,
-            version: self.hw.os_version.clone(),
+    /// `_enc` fields are empty — the native NAC path (our overlaid
+    /// `rustpush/open-absinthe/src/nac.rs`) reads hardware identifiers from
+    /// IOKit directly and does not use these fields.
+    pub fn into_macos_config(self) -> MacOSConfig {
+        MacOSConfig {
+            inner: HardwareConfig {
+                product_name: self.hw.product_name,
+                io_mac_address: self.hw.mac_address,
+                platform_serial_number: self.hw.serial_number,
+                platform_uuid: self.hw.platform_uuid,
+                root_disk_uuid: self.hw.root_disk_uuid,
+                board_id: self.hw.board_id,
+                os_build_num: self.hw.os_build_num,
+                // _enc fields empty — native NAC reads from IOKit internally
+                platform_serial_number_enc: vec![],
+                platform_uuid_enc: vec![],
+                root_disk_uuid_enc: vec![],
+                rom: self.hw.rom,
+                rom_enc: vec![],
+                mlb: self.hw.mlb,
+                mlb_enc: vec![],
+            },
+            version: self.hw.os_version,
             protocol_version: self.protocol_version,
             device_id: self.device_id.clone(),
-            icloud_ua: self.icloud_ua.clone(),
-            aoskit_version: self.aoskit_version.clone(),
-            udid: Some(self.device_id.clone()),
+            icloud_ua: self.icloud_ua,
+            aoskit_version: self.aoskit_version,
+            udid: Some(self.device_id),
         }
     }
 }

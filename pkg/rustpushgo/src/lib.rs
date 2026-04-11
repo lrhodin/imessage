@@ -3087,7 +3087,8 @@ pub fn create_local_macos_config() -> Result<Arc<WrappedOSConfig>, WrappedError>
     #[cfg(target_os = "macos")]
     {
         let config = local_config::LocalMacOSConfig::new()
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?;
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
+            .into_macos_config();
         Ok(Arc::new(WrappedOSConfig {
             config: Arc::new(config),
         }))
@@ -3108,7 +3109,8 @@ pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc
     {
         let config = local_config::LocalMacOSConfig::new()
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
-            .with_device_id(device_id);
+            .with_device_id(device_id)
+            .into_macos_config();
         Ok(Arc::new(WrappedOSConfig {
             config: Arc::new(config),
         }))
