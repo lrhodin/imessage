@@ -163,6 +163,7 @@ ensure-rustpush-source:
 			mkdir -p third_party; \
 			git clone $(UPSTREAM_REPO) third_party/rustpush-upstream; \
 			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN); \
+			git -C third_party/rustpush-upstream config url."https://github.com/".insteadOf "git@github.com:"; \
 			git -C third_party/rustpush-upstream submodule sync --recursive; \
 			git -C third_party/rustpush-upstream submodule update --init --recursive; \
 		fi; \
@@ -170,6 +171,7 @@ ensure-rustpush-source:
 		if [ "$$current" != "$(RUSTPUSH_PIN)" ]; then \
 			echo "Checking out pinned rustpush SHA $(RUSTPUSH_PIN) (was $$current)..."; \
 			git -C third_party/rustpush-upstream remote set-url origin $(UPSTREAM_REPO); \
+			git -C third_party/rustpush-upstream config url."https://github.com/".insteadOf "git@github.com:"; \
 			git -C third_party/rustpush-upstream fetch --all --tags --prune; \
 			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN); \
 			git -C third_party/rustpush-upstream submodule sync --recursive; \
