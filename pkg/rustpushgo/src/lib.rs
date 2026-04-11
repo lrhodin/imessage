@@ -2313,6 +2313,32 @@ pub fn init_logger() {
     }
     let _ = pretty_env_logger::try_init();
 
+    // Install a panic hook that silences upstream's `.unwrap()` panics at
+    // `rustpush/.../icloud/mmcs.rs` line 1113 (the Ford SIV decrypt) and
+    // the surrounding fetch/decrypt path. These panics are intentional —
+    // the wrapper's Ford dedup recovery loop in
+    // cloud_download_attachment_ford_recovery wraps each get_assets call
+    // in catch_unwind and brute-forces cached Ford keys until one decrypts
+    // successfully. Default Rust panic hook runs BEFORE catch_unwind
+    // catches, so each wrong-key attempt floods stderr with
+    //   thread '<unnamed>' panicked at mmcs.rs:1113:101
+    //   called `Result::unwrap()` on an `Err` value
+    // This hook silently drops those (the wrapper handles them) and
+    // falls through to the default hook for everything else — real
+    // panics from other modules still surface normally.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(loc) = info.location() {
+            let file = loc.file();
+            // Match any file path ending in `icloud/mmcs.rs` so we catch
+            // both fresh clones and workspace-qualified paths.
+            if file.ends_with("icloud/mmcs.rs") || file.ends_with("icloud\\mmcs.rs") {
+                return;
+            }
+        }
+        default_hook(info);
+    }));
+
     // Initialize the keystore with a file-backed software keystore.
     // This must be called before any rustpush operations (APNs connect, login, etc.).
     //
