@@ -3606,8 +3606,150 @@ impl LoginSession {
 // Attachment download helper
 // ============================================================================
 
+/// Fetch an iMessage MMCS `AuthorizeGetResponse` body via the APNs auth
+/// dance, without invoking upstream's `MMCSFile::get_attachment` (which
+/// calls the panic-prone `get_mmcs`).
+///
+/// This is the same protocol upstream rustpush uses at
+/// `third_party/rustpush-upstream/src/imessage/messages.rs` in
+/// `MMCSFile::get_attachment` up through line 1381, inlined into the
+/// wrapper so we can stop at the point where upstream would hand off to
+/// `get_mmcs` and instead route the bytes through
+/// `manual_ford::manual_ford_download_asset`.
+///
+/// Returns the raw response bytes — the caller decodes them as an
+/// `mmcsp::AuthorizeGetResponse` and runs them through the manual
+/// download.
+async fn fetch_imessage_mmcs_authorize_body(
+    mmcs: &rustpush::MMCSFile,
+    conn: &rustpush::APSConnectionResource,
+) -> Result<Vec<u8>, String> {
+    use futures::FutureExt;
+    use plist::Value;
+    use rand::Rng;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    struct RequestMMCSDownload {
+        #[serde(rename = "mO")]
+        object: String,
+        #[serde(rename = "mS")]
+        signature: plist::Data,
+        v: u64,
+        ua: String,
+        c: u64,
+        i: u32,
+        #[serde(rename = "cH")]
+        headers: String,
+        #[serde(rename = "mR")]
+        domain: String,
+        #[serde(rename = "cV")]
+        cv: u32,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct MMCSDownloadResponse {
+        #[serde(rename = "cB")]
+        response: plist::Data,
+        #[serde(rename = "mU")]
+        #[allow(dead_code)]
+        object: String,
+    }
+
+    // User agents / client info strings — must exactly match upstream's
+    // `MMCSFile::get_attachment` construction so the MMCS server accepts
+    // our auth request.
+    let mme_client_info = conn
+        .os_config
+        .get_mme_clientinfo("com.apple.icloud.content/1950.19 (com.apple.Messenger/1.0)");
+    let mini_ua = conn.os_config.get_version_ua();
+
+    // Strip the last `/{object}` segment from the URL to produce the
+    // MMCS domain — upstream does this to build the `mR` field.
+    let domain = mmcs.url.replace(&format!("/{}", &mmcs.object), "");
+
+    let msg_id: u32 = rand::thread_rng().gen();
+    let header = format!("x-mme-client-info:{}", mme_client_info);
+    let request_download = RequestMMCSDownload {
+        object: mmcs.object.to_string(),
+        c: 151,
+        ua: mini_ua,
+        headers: [
+            "x-apple-mmcs-proto-version:5.0",
+            "x-apple-mmcs-plist-sha256:fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=",
+            "x-apple-mmcs-plist-version:v1.0",
+            &header,
+            "",
+        ]
+        .join("\n"),
+        v: 8,
+        domain,
+        cv: 2,
+        i: msg_id,
+        signature: mmcs.signature.to_vec().into(),
+    };
+
+    // Encode as binary plist — same as upstream's `plist_to_bin`.
+    let mut binary = Vec::new();
+    plist::to_writer_binary(&mut binary, &request_download)
+        .map_err(|e| format!("plist encode: {e}"))?;
+
+    // Subscribe BEFORE send to avoid the race where the response arrives
+    // before the receiver is registered.
+    let recv = conn.subscribe().await;
+
+    conn.send_message("com.apple.madrid", binary, Some(msg_id))
+        .await
+        .map_err(|e| format!("APNs send_message: {e}"))?;
+
+    // Wait for a Notification on com.apple.madrid where `c == 151` and
+    // `i == msg_id`. Topic filtering is done by sha1-hash compare, which
+    // we can't easily replicate without `rustpush::util::sha1`, so we
+    // check the parsed payload fields directly and trust APNs routing
+    // to only deliver com.apple.madrid messages on this subscription.
+    let predicate = move |msg: rustpush::APSMessage| -> Option<Value> {
+        if let rustpush::APSMessage::Notification { payload, .. } = msg {
+            if let Ok(parsed) = plist::from_bytes::<Value>(&payload) {
+                let dict = parsed.as_dictionary()?;
+                let c = dict.get("c")?.as_unsigned_integer()?;
+                let i = dict.get("i")?.as_unsigned_integer()? as u32;
+                if c == 151 && i == msg_id {
+                    return Some(parsed);
+                }
+            }
+        }
+        None
+    };
+
+    // The `wait_for_timeout` future can in principle panic on malformed
+    // APNs messages (rustpush's aps internals have `unwrap`s). Wrap in
+    // catch_unwind so a panic here returns an Err instead of crashing
+    // the bridge.
+    let wait_fut = conn.wait_for_timeout(recv, predicate);
+    let reader = match std::panic::AssertUnwindSafe(wait_fut).catch_unwind().await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(format!("APNs wait_for_timeout: {e}")),
+        Err(_) => return Err("APNs wait_for_timeout panicked".to_string()),
+    };
+
+    let apns_response: MMCSDownloadResponse =
+        plist::from_value(&reader).map_err(|e| format!("plist decode response: {e}"))?;
+    let body: Vec<u8> = apns_response.response.into();
+    Ok(body)
+}
+
 /// Download any MMCS (non-inline) attachments from the message and convert them
 /// to inline data in the wrapped message, so the Go side can upload them to Matrix.
+///
+/// This function reimplements upstream's `MMCSFile::get_attachment` at
+/// the wrapper layer so we can use our V1+V2-capable
+/// `manual_ford_download_asset` instead of upstream's panicking
+/// `get_mmcs`. Master worked because Cameron's rustpush fork had the
+/// 94f7b8e Ford fix baked into `get_mmcs`; after the refactor's source
+/// swap to OpenBubbles upstream (which doesn't have the fix), calling
+/// `att.get_attachment` on V2-Ford or dedup'd records panics. Routing
+/// the bytes through the manual path gets us back to master's behavior
+/// without patching rustpush.
 async fn download_mmcs_attachments(
     wrapped: &mut WrappedMessage,
     msg_inst: &MessageInst,
@@ -3617,11 +3759,10 @@ async fn download_mmcs_attachments(
         let mut att_idx = 0;
         for indexed_part in &normal.parts.0 {
             if let MessagePart::Attachment(att) = &indexed_part.part {
-                if let AttachmentType::MMCS(_) = &att.a_type {
+                if let AttachmentType::MMCS(mmcs) = &att.a_type {
                     if att_idx < wrapped.attachments.len() {
-                        let mut buf: Vec<u8> = Vec::new();
-                        match att.get_attachment(conn, &mut buf, |_, _| {}).await {
-                            Ok(()) => {
+                        match download_one_mmcs_attachment(mmcs, conn, &att.name).await {
+                            Ok(buf) => {
                                 info!(
                                     "Downloaded MMCS attachment: {} ({} bytes)",
                                     att.name,
@@ -3631,7 +3772,10 @@ async fn download_mmcs_attachments(
                                 wrapped.attachments[att_idx].inline_data = Some(buf);
                             }
                             Err(e) => {
-                                error!("Failed to download MMCS attachment {}: {}", att.name, e);
+                                error!(
+                                    "Failed to download MMCS attachment {}: {}",
+                                    att.name, e
+                                );
                             }
                         }
                     }
@@ -3640,6 +3784,66 @@ async fn download_mmcs_attachments(
             }
         }
     }
+}
+
+/// Download one MMCS attachment via the wrapper-level path:
+/// APNs auth handshake → manual V1+V2 Ford-capable chunk decode →
+/// iMessage outer AES-256-CTR unwrap.
+///
+/// Equivalent to upstream's `MMCSFile::get_attachment` but bypasses the
+/// panicking `get_mmcs` call at its tail.
+///
+/// iMessage MMCS differs from CloudKit MMCS in one important way: the
+/// file bytes are additionally wrapped in an `IMessageContainer` layer
+/// (AES-256-CTR with `MMCSFile.key` and a zero nonce). Upstream handles
+/// this by passing a `WriteContainer` impl through to `get_mmcs` that
+/// decrypts during chunk writes. Since our manual path returns the
+/// assembled chunk plaintext without that hook, we apply the outer
+/// unwrap here as a post-processing step.
+async fn download_one_mmcs_attachment(
+    mmcs: &rustpush::MMCSFile,
+    conn: &rustpush::APSConnectionResource,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    // Step 1: APNs auth handshake → AuthorizeGetResponse body bytes.
+    let body = fetch_imessage_mmcs_authorize_body(mmcs, conn).await?;
+
+    // Step 2: decrypt via the same V1+V2-capable manual path used by
+    // CloudKit downloads. Pass an empty Ford key because iMessage MMCS
+    // chunk encryption uses the per-chunk `meta.encryption_key` field
+    // (V1 AES-128-CFB) — there's no outer Ford SIV layer on the iMessage
+    // side.
+    let user_agent = conn.os_config.get_normal_ua("IMTransferAgent/1000");
+    let chunked_plaintext = manual_ford::manual_ford_download_asset(
+        &body,
+        &mmcs.signature,
+        &[],
+        &user_agent,
+        name,
+    )
+    .await?;
+
+    // Step 3: iMessage outer unwrap — AES-256-CTR(mmcs.key, zero_iv)
+    // over the full assembled plaintext. This mirrors what upstream's
+    // `IMessageContainer` does on the write path during `get_mmcs`.
+    // Matches `third_party/rustpush-upstream/src/imessage/messages.rs`
+    // `IMessageContainer::new(&self.key, writer, true)` at line 1341.
+    if mmcs.key.len() != 32 {
+        return Err(format!(
+            "iMessage MMCS key has unexpected length {}: expected 32 for AES-256-CTR",
+            mmcs.key.len()
+        ));
+    }
+    let iv = [0u8; 16];
+    let unwrapped = openssl::symm::decrypt(
+        openssl::symm::Cipher::aes_256_ctr(),
+        &mmcs.key,
+        Some(&iv),
+        &chunked_plaintext,
+    )
+    .map_err(|e| format!("iMessage outer AES-256-CTR unwrap: {e}"))?;
+
+    Ok(unwrapped)
 }
 
 /// Download the group photo for an IconChange message via MMCS.
