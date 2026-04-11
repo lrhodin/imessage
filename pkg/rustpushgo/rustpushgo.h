@@ -78,6 +78,12 @@ void* uniffi_rustpushgo_fn_method_client_cloud_diag_full_count(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_cloud_diag_message_attributed_keys(
+	void* ptr,
+	RustBuffer record_names,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_cloud_download_attachment(
 	void* ptr,
 	RustBuffer record_name,
@@ -1485,6 +1491,10 @@ uint16_t uniffi_rustpushgo_checksum_func_restore_token_provider(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_cloud_diag_full_count(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_cloud_diag_message_attributed_keys(
 	RustCallStatus* out_status
 );
 
