@@ -2317,26 +2317,35 @@ pub fn init_logger() {
     }
     let _ = pretty_env_logger::try_init();
 
-    // Install a panic hook that silences upstream's `.unwrap()` panics at
-    // `rustpush/.../icloud/mmcs.rs` line 1113 (the Ford SIV decrypt) and
-    // the surrounding fetch/decrypt path. These panics are intentional —
-    // the wrapper's Ford dedup recovery loop in
-    // cloud_download_attachment_ford_recovery wraps each get_assets call
-    // in catch_unwind and brute-forces cached Ford keys until one decrypts
-    // successfully. Default Rust panic hook runs BEFORE catch_unwind
-    // catches, so each wrong-key attempt floods stderr with
+    // Install a panic hook that silences upstream's `.unwrap()` /
+    // `.expect()` panics inside the CloudKit download path. These panics
+    // are intentional — the wrapper's Ford dedup recovery loops wrap
+    // each get_assets / download_attachment call in catch_unwind and
+    // brute-force cached Ford keys until one decrypts successfully. The
+    // default Rust panic hook runs BEFORE catch_unwind catches, so each
+    // wrong-key attempt floods stderr with lines like
     //   thread '<unnamed>' panicked at mmcs.rs:1113:101
     //   called `Result::unwrap()` on an `Err` value
-    // This hook silently drops those (the wrapper handles them) and
-    // falls through to the default hook for everything else — real
-    // panics from other modules still surface normally.
+    //   thread '<unnamed>' panicked at cloudkit.rs:2075
+    //   No bundled asset!
+    // This hook silently drops panics from upstream's MMCS + CloudKit
+    // download code paths (all caught by the wrapper) and falls through
+    // to the default hook for everything else — real panics from other
+    // modules still surface normally.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Some(loc) = info.location() {
             let file = loc.file();
-            // Match any file path ending in `icloud/mmcs.rs` so we catch
-            // both fresh clones and workspace-qualified paths.
-            if file.ends_with("icloud/mmcs.rs") || file.ends_with("icloud\\mmcs.rs") {
+            // Match both Unix and Windows path separators. Files listed
+            // here are ones whose panics are intercepted by
+            // catch_unwind in pkg/rustpushgo/src/lib.rs download recovery.
+            let noisy = [
+                "icloud/mmcs.rs",
+                "icloud\\mmcs.rs",
+                "icloud/cloudkit.rs",
+                "icloud\\cloudkit.rs",
+            ];
+            if noisy.iter().any(|p| file.ends_with(p)) {
                 return;
             }
         }
@@ -6755,6 +6764,20 @@ impl Client {
             cached_keys.len()
         );
 
+        // Pre-flight: if the record's lqa has no bundled_request_id, upstream's
+        // `get_assets` would panic immediately at cloudkit.rs:2075 with "No
+        // bundled asset!" — no point iterating 900 keys. Bail out early with
+        // a clear error instead.
+        if base_record.lqa.bundled_request_id.is_none() {
+            warn!(
+                "Ford recovery {}: lqa.bundled_request_id is None (record not ALL_ASSETS-authorized?), skipping recovery",
+                record_name
+            );
+            return Err(WrappedError::GenericError {
+                msg: format!("Ford dedup recovery for {}: lqa asset has no bundled_request_id", record_name),
+            });
+        }
+
         for (idx, alt_key) in cached_keys.iter().enumerate() {
             // Clone per attempt so we can mutate `protection_info`
             // independently and retry cleanly on panic.
@@ -6773,12 +6796,15 @@ impl Client {
             let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
             match result {
                 Ok(Ok(())) => {
-                    info!(
-                        "Ford SIV succeeded with cached key (dedup resolved, attempt {}/{})",
+                    let bytes = shared.into_bytes();
+                    warn!(
+                        "Ford dedup recovery SUCCESS: record={} attempt={}/{} bytes={}",
+                        record_name,
                         idx + 1,
-                        cached_keys.len()
+                        cached_keys.len(),
+                        bytes.len()
                     );
-                    return Ok(shared.into_bytes());
+                    return Ok(bytes);
                 }
                 Ok(Err(e)) => {
                     debug!("Ford recovery attempt {} returned error: {}", idx + 1, e);
@@ -6793,7 +6819,7 @@ impl Client {
         }
 
         warn!(
-            "Ford recovery {}: all {} cached keys failed",
+            "Ford dedup recovery FAILED: record={} tried={} all cached keys exhausted",
             record_name,
             cached_keys.len()
         );
@@ -6843,12 +6869,15 @@ impl Client {
             let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
             match result {
                 Ok(Ok(())) => {
-                    info!(
-                        "Ford SIV succeeded with cached key (avid dedup resolved, attempt {}/{})",
+                    let bytes = shared.into_bytes();
+                    warn!(
+                        "Ford dedup recovery SUCCESS (avid): record={} attempt={}/{} bytes={}",
+                        record_name,
                         idx + 1,
-                        cached_keys.len()
+                        cached_keys.len(),
+                        bytes.len()
                     );
-                    return Ok(shared.into_bytes());
+                    return Ok(bytes);
                 }
                 Ok(Err(e)) => {
                     debug!("Ford avid recovery attempt {} returned error: {}", idx + 1, e);
