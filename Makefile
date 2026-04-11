@@ -158,24 +158,28 @@ ensure-rustpush-source:
 		if [ -z "$(RUSTPUSH_PIN)" ]; then \
 			echo "error: $(RUSTPUSH_PIN_FILE) is missing or empty — required to pin rustpush SHA" >&2; exit 1; \
 		fi; \
+		export GIT_CONFIG_COUNT=1; \
+		export GIT_CONFIG_KEY_0="url.https://github.com/.insteadOf"; \
+		export GIT_CONFIG_VALUE_0="git@github.com:"; \
 		if [ ! -d third_party/rustpush-upstream/.git ]; then \
 			echo "Cloning OpenBubbles/rustpush at pinned SHA $(RUSTPUSH_PIN)..."; \
 			mkdir -p third_party; \
-			git clone $(UPSTREAM_REPO) third_party/rustpush-upstream; \
-			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN); \
-			git -C third_party/rustpush-upstream config url."https://github.com/".insteadOf "git@github.com:"; \
-			git -C third_party/rustpush-upstream submodule sync --recursive; \
-			git -C third_party/rustpush-upstream submodule update --init --recursive; \
+			git clone $(UPSTREAM_REPO) third_party/rustpush-upstream || exit 1; \
+			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN) || exit 1; \
+			git -C third_party/rustpush-upstream submodule sync --recursive || exit 1; \
+			git -C third_party/rustpush-upstream submodule update --init --recursive || exit 1; \
 		fi; \
 		current=$$(git -C third_party/rustpush-upstream rev-parse HEAD 2>/dev/null || echo none); \
 		if [ "$$current" != "$(RUSTPUSH_PIN)" ]; then \
 			echo "Checking out pinned rustpush SHA $(RUSTPUSH_PIN) (was $$current)..."; \
 			git -C third_party/rustpush-upstream remote set-url origin $(UPSTREAM_REPO); \
-			git -C third_party/rustpush-upstream config url."https://github.com/".insteadOf "git@github.com:"; \
-			git -C third_party/rustpush-upstream fetch --all --tags --prune; \
-			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN); \
-			git -C third_party/rustpush-upstream submodule sync --recursive; \
-			git -C third_party/rustpush-upstream submodule update --init --recursive; \
+			echo "Discarding any local mods to third_party/rustpush-upstream before checkout..."; \
+			git -C third_party/rustpush-upstream reset --hard HEAD || exit 1; \
+			git -C third_party/rustpush-upstream clean -fd || exit 1; \
+			git -C third_party/rustpush-upstream fetch --all --tags --prune || exit 1; \
+			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN) || { echo "error: failed to checkout pinned SHA $(RUSTPUSH_PIN)" >&2; exit 1; }; \
+			git -C third_party/rustpush-upstream submodule sync --recursive || exit 1; \
+			git -C third_party/rustpush-upstream submodule update --init --recursive || exit 1; \
 		fi; \
 		if [ ! -d third_party/rustpush-upstream/certs/fairplay ]; then \
 			echo "Generating FairPlay cert stubs..."; \
