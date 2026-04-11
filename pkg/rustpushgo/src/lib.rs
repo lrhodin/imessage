@@ -3424,15 +3424,7 @@ pub async fn login_start(
     };
 
     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
-
-    // Clear any stale anisette state before login. The upstream RemoteAnisetteProviderV3
-    // panics (explicit panic, line 417) when get_headers() fails with any error other than
-    // AnisetteNotProvisioned — i.e. a stale/corrupt state file causes a panic on network
-    // errors instead of a recoverable Result::Err. Deleting the state forces a clean
-    // re-provision every login; provisioning failures surface as proper errors, not panics.
     let anisette_state_path = PathBuf::from_str("state/anisette").unwrap();
-    let _ = std::fs::remove_file(anisette_state_path.join("state.plist"));
-
     let anisette = default_provider(client_info.clone(), anisette_state_path);
 
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
