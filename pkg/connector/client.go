@@ -752,12 +752,25 @@ func (c *IMClient) Connect(ctx context.Context) {
 				log.Warn().Err(err).Msg("Failed to restore TokenProvider — cloud services unavailable")
 			} else {
 				c.tokenProvider = &tp
-				// Don't seed the cached MobileMe delegate — it's likely expired.
-				// Instead, let get_mme_token() detect the empty delegate and call
-				// refresh_mme(), which triggers the full auto-refresh chain:
-				//   expired PET → get_token() → login_email_pass() → fresh PET
-				//   → login_apple_delegates() → fresh MobileMe delegate
-				log.Info().Msg("TokenProvider restored — MobileMe delegate will be refreshed on first use")
+				// Seed the persisted MobileMe delegate so CloudKit / keychain
+				// ops have something to work with on first use. The wrapper's
+				// RestoreTokenProvider path intentionally returns a
+				// WrappedTokenProvider with empty mme_delegate_bytes (see
+				// pkg/rustpushgo/src/lib.rs::restore_token_provider — "callers
+				// must seed_mme_delegate_json() from persisted state before
+				// using keychain/contacts features"), so we seed it here. The
+				// delegate is whatever was captured during the most recent
+				// successful login; if it's expired, CloudKit calls will
+				// surface an auth error and the user can re-login.
+				if meta.MmeDelegateJSON != "" {
+					if seedErr := tp.SeedMmeDelegateJson(meta.MmeDelegateJSON); seedErr != nil {
+						log.Warn().Err(seedErr).Msg("Failed to seed persisted MobileMe delegate — CloudKit unavailable until re-login")
+					} else {
+						log.Info().Msg("Seeded persisted MobileMe delegate into restored TokenProvider")
+					}
+				} else {
+					log.Warn().Msg("TokenProvider restored but no persisted MobileMe delegate — CloudKit unavailable until re-login captures a fresh one")
+				}
 			}
 		}
 	}
