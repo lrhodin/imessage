@@ -3425,6 +3425,14 @@ pub async fn login_start(
 
     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
     let anisette_state_path = PathBuf::from_str("state/anisette").unwrap();
+    // On Linux, clear any stale anisette state before each login so the
+    // upstream RemoteAnisetteProviderV3 always re-provisions from scratch.
+    // Without this, a stale state.plist causes get_headers() to fail with a
+    // network error, hitting the upstream `else { panic!() }` at line 417
+    // of remote_anisette_v3.rs instead of returning a proper Err.
+    // macOS uses AOSKit for anisette so this path is never reached there.
+    #[cfg(not(target_os = "macos"))]
+    let _ = std::fs::remove_file(anisette_state_path.join("state.plist"));
     let anisette = default_provider(client_info.clone(), anisette_state_path);
 
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
