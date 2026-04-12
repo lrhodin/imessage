@@ -40,9 +40,10 @@ use std::sync::RwLock;
 // by every rustpush client that's parameterized over one (AppleAccount,
 // KeychainClient, CloudKitClient, TokenProvider, etc.). On macOS this is
 // upstream's `AOSKitAnisetteProvider` (native, untouched). On Linux this is
-// our `anisette::BridgeAnisetteProvider`, which reuses upstream's
-// `AnisetteClient::new`/`get_headers` but substitutes our own provisioning
-// dance to avoid upstream's closed `ProvisionInput` enum (see `anisette.rs`).
+// our `anisette::BridgeAnisetteProvider`, which wraps upstream's
+// `RemoteAnisetteProviderV3` with retry logic, a timeout (upstream's
+// provision() loop spins forever on WS close), and error handling for
+// upstream's missing `EndProvisioningError` serde variant.
 #[cfg(target_os = "macos")]
 pub type BridgeDefaultAnisetteProvider = omnisette::DefaultAnisetteProvider;
 #[cfg(not(target_os = "macos"))]
