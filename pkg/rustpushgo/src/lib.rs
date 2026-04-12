@@ -1826,7 +1826,7 @@ pub async fn restore_token_provider(
     // macOS this is upstream's native AOSKit path, unchanged.
     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
     let anisette_state_path = PathBuf::from_str("state/anisette").unwrap();
-    let anisette = default_provider(client_info.clone(), anisette_state_path);
+    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path);
 
     // Create a new AppleAccount and populate it with persisted state
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
@@ -3499,7 +3499,7 @@ pub async fn login_start(
     let state_plist = anisette_state_path.join("state.plist");
     info!("login_start: anisette state path={:?} exists={}", state_plist, state_plist.exists());
 
-    let anisette = default_provider(client_info.clone(), anisette_state_path);
+    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path);
 
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
         .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
