@@ -43,22 +43,25 @@ fn relay_config() -> &'static Mutex<Option<RelayConfig>> {
 }
 
 /// Install a NAC relay so subsequent `ValidationCtx::new()` calls route
-/// validation through the relay's 3-step endpoints instead of the local
-/// x86-64 emulator. Idempotent; overwriting with a fresh call is fine.
+/// validation through the relay's single-shot `/validation-data` endpoint
+/// instead of the local x86-64 emulator. Idempotent; overwriting is fine.
 ///
-/// Hardware keys extracted by the baked-in `extract-key` app store the
-/// full single-shot URL (e.g. `https://host:5001/validation-data`).
-/// We strip the `/validation-data` suffix so the base URL is stored and
-/// `/nac/init` etc. are appended correctly by `relay_post_json`.
+/// The URL should be the full relay endpoint, e.g.
+/// `https://host:5001/validation-data`. If a bare base URL is passed
+/// (no `/validation-data` suffix), the suffix is appended automatically.
 pub fn set_relay_config(url: String, token: Option<String>, cert_fp: Option<String>) {
     let trimmed = url.trim_end_matches('/');
-    let base_url = trimmed.strip_suffix("/validation-data").unwrap_or(trimmed).to_string();
-    let cfg = RelayConfig { url: base_url, token, cert_fp };
+    let full_url = if trimmed.ends_with("/validation-data") {
+        trimmed.to_string()
+    } else {
+        format!("{}/validation-data", trimmed)
+    };
+    let cfg = RelayConfig { url: full_url, token, cert_fp };
     let mut slot = match relay_config().lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    info!("NAC relay base URL: {}", cfg.url);
+    info!("NAC relay URL: {}", cfg.url);
     *slot = Some(cfg);
 }
 
@@ -92,32 +95,9 @@ fn relay_agent(cfg: &RelayConfig) -> Result<ureq::Agent, AbsintheError> {
     Ok(agent)
 }
 
-fn relay_post_json(
-    cfg: &RelayConfig,
-    path: &str,
-    body: &serde_json::Value,
-) -> Result<serde_json::Value, AbsintheError> {
-    let agent = relay_agent(cfg)?;
-    let url = format!("{}{}", cfg.url.trim_end_matches('/'), path);
-    let mut req = agent.post(&url).set("Content-Type", "application/json");
-    if let Some(ref tok) = cfg.token {
-        req = req.set("Authorization", &format!("Bearer {tok}"));
-    }
-    let resp = req
-        .send_json(body)
-        .map_err(|e| AbsintheError::Other(format!("relay POST {path}: {e}")))?;
-    let json: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| AbsintheError::Other(format!("relay {path} JSON decode: {e}")))?;
-    Ok(json)
-}
-
-fn b64_decode(s: &str) -> Result<Vec<u8>, AbsintheError> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(s.trim())
-        .map_err(|e| AbsintheError::Other(format!("relay base64 decode: {e}")))
-}
+// relay_post_json and b64_decode removed — the relay now uses a single-shot
+// POST to /validation-data (matching master's approach) instead of a 3-step
+// JSON protocol.
 
 // ============================================================================
 // XNU IOKit property encryption (x86_64 Linux only)
@@ -954,13 +934,16 @@ enum ValidationCtxInner {
         /// NACSign result is discarded in favour of this authoritative bytes.
         final_data: Option<Vec<u8>>,
     },
-    /// Relay mode: NAC flows through a 3-step HTTPS protocol against a
-    /// `tools/nac-relay` server running on a real Mac. Used when the
-    /// hardware-key JSON carries a `nac_relay_url` (Apple Silicon Macs
-    /// whose keys can't run in the unicorn x86-64 emulator).
+    /// Relay mode: single-shot POST to a `tools/nac-relay` server running
+    /// on a real Mac. The relay does the full NACInit → Apple POST →
+    /// NACKeyEstablishment → NACSign dance internally and returns the
+    /// final validation data. Used when the hardware-key JSON carries a
+    /// `nac_relay_url` (Apple Silicon Macs whose keys can't run in the
+    /// unicorn x86-64 emulator).
     Relay {
-        cfg: RelayConfig,
-        session_id: String,
+        /// Complete validation data returned by the relay's single-shot
+        /// `/validation-data` endpoint.
+        validation_data: Vec<u8>,
     },
 }
 
@@ -979,41 +962,41 @@ impl ValidationCtx {
     ) -> Result<ValidationCtx, AbsintheError> {
         // ====================================================================
         // Relay path — Apple Silicon hardware keys routed through a Mac-hosted
-        // `tools/nac-relay` server. POSTs cert to /nac/init, gets a session id
-        // and real session-info-request bytes back; key_establishment and
-        // sign() drive the subsequent two endpoints. The relay uses native
-        // AAAbsintheContext server-side so every step produces Apple-accepted
-        // output without touching the local emulator.
+        // `tools/nac-relay` server. Single POST to `/validation-data` returns
+        // the complete validation data (the relay does the full NACInit →
+        // Apple POST → NACKeyEstablishment → NACSign dance internally).
+        // We store the result and return it from sign(); key_establishment
+        // is a no-op. out_request_bytes is left empty since the relay
+        // already completed the Apple handshake server-side.
         // ====================================================================
         if let Some(cfg) = get_relay_config() {
-            info!("NAC init (relay path): POST {}/nac/init", cfg.url);
-            let body = serde_json::json!({
-                "cert": base64::engine::general_purpose::STANDARD.encode(cert_chain),
-            });
-            use base64::Engine;
-            match relay_post_json(&cfg, "/nac/init", &body) {
+            info!("NAC relay: single-shot POST to {}", cfg.url);
+            let agent = relay_agent(&cfg)?;
+            let mut req = agent.post(&cfg.url);
+            if let Some(ref tok) = cfg.token {
+                req = req.set("Authorization", &format!("Bearer {tok}"));
+            }
+            match req.call() {
                 Ok(resp) => {
-                    let session_id = resp
-                        .get("session_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| AbsintheError::Other("relay /nac/init missing session_id".into()))?
-                        .to_string();
-                    let req_b64 = resp
-                        .get("request_bytes")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| AbsintheError::Other("relay /nac/init missing request_bytes".into()))?;
-                    let req = b64_decode(req_b64)?;
-                    info!("NAC relay init: session_id={} request_bytes={}", session_id, req.len());
-                    *out_request_bytes = req;
+                    use base64::Engine;
+                    let body = resp.into_string()
+                        .map_err(|e| AbsintheError::Other(format!("relay read error: {e}")))?;
+                    let validation_data = base64::engine::general_purpose::STANDARD
+                        .decode(body.trim())
+                        .map_err(|e| AbsintheError::Other(format!("relay base64 decode: {e}")))?;
+                    info!("NAC relay: got {} bytes of validation data", validation_data.len());
+                    // out_request_bytes left empty — the relay already
+                    // completed the Apple handshake. generate_validation_data
+                    // will POST these empty bytes to Apple but we don't care
+                    // about the response; key_establishment is a no-op and
+                    // sign() returns the relay data directly.
                     return Ok(ValidationCtx {
-                        inner: ValidationCtxInner::Relay { cfg, session_id },
+                        inner: ValidationCtxInner::Relay { validation_data },
                     });
                 }
                 Err(e) => {
-                    // Relay is explicitly configured — this key cannot fall back to
-                    // the x86-64 emulator (ARM hardware identifiers are incompatible).
                     return Err(AbsintheError::Other(format!(
-                        "NAC relay init failed (relay: {}): {e}. \
+                        "NAC relay failed ({}): {e}. \
                          Ensure the nac-relay server is running on the Mac that provided \
                          this hardware key.",
                         cfg.url
@@ -1231,18 +1214,9 @@ impl ValidationCtx {
     /// Process the session-info response from Apple.
     pub fn key_establishment(&mut self, response: &[u8]) -> Result<(), AbsintheError> {
         match &mut self.inner {
-            ValidationCtxInner::Relay { cfg, session_id } => {
-                debug!(
-                    "NAC key_establishment: relay path, {} bytes -> {}/nac/key_establishment",
-                    response.len(),
-                    cfg.url
-                );
-                use base64::Engine;
-                let body = serde_json::json!({
-                    "session_id": session_id,
-                    "session_info": base64::engine::general_purpose::STANDARD.encode(response),
-                });
-                relay_post_json(cfg, "/nac/key_establishment", &body)?;
+            ValidationCtxInner::Relay { .. } => {
+                // No-op — the relay already completed the full handshake
+                // in the single-shot /validation-data call during new().
                 Ok(())
             }
             #[cfg(all(target_os = "macos", feature = "native-nac"))]
@@ -1285,17 +1259,9 @@ impl ValidationCtx {
     /// Generate signed validation data.
     pub fn sign(&self) -> Result<Vec<u8>, AbsintheError> {
         let (uc, state, validation_ctx_addr) = match &self.inner {
-            ValidationCtxInner::Relay { cfg, session_id } => {
-                debug!("NAC sign: relay path, POST {}/nac/sign", cfg.url);
-                let body = serde_json::json!({ "session_id": session_id });
-                let resp = relay_post_json(cfg, "/nac/sign", &body)?;
-                let b64 = resp
-                    .get("validation_data")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| AbsintheError::Other("relay /nac/sign missing validation_data".into()))?;
-                let bytes = b64_decode(b64)?;
-                info!("NAC sign: relay path produced {} bytes", bytes.len());
-                return Ok(bytes);
+            ValidationCtxInner::Relay { validation_data } => {
+                info!("NAC sign: returning relay validation data ({} bytes)", validation_data.len());
+                return Ok(validation_data.clone());
             }
             #[cfg(all(target_os = "macos", feature = "native-nac"))]
             ValidationCtxInner::Native { ctx, final_data } => {

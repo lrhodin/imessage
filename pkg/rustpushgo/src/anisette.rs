@@ -31,7 +31,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
 const APPLE_ROOT: &[u8] = include_bytes!(
-    "../../../third_party/rustpush-upstream/apple-private-apis/icloud-auth/src/apple_root.der"
+    "../../../rustpush/apple-private-apis/icloud-auth/src/apple_root.der"
 );
 const ANISETTE_URL: &str = "https://ani.sidestore.io";
 

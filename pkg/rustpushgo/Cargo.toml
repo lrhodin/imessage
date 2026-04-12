@@ -23,20 +23,20 @@ futures = "0.3"
 uniffi = { version = "0.25.0", features = ["tokio"] }
 pretty_env_logger = "0.5.0"
 log = "0.4.20"
-rustpush = { path = "../../third_party/rustpush-upstream", default-features = false, features = ["macos-validation-data"] }
+rustpush = { path = "../../rustpush", default-features = false, features = ["macos-validation-data"] }
 # Direct path dep on cloudkit-proto so the `CloudKitRecord` derive macro (which
 # emits `cloudkit_proto::*` references in its generated code) can resolve the
 # crate name inside our wrapper. Without this, defining a local CloudKitRecord
 # type in lib.rs fails to compile because the derive expects the crate to be
 # importable by its literal name.
-cloudkit-proto = { path = "../../third_party/rustpush-upstream/cloudkit-proto", package = "cloudkit-proto" }
+cloudkit-proto = { path = "../../rustpush/cloudkit-proto", package = "cloudkit-proto" }
 # Direct dep on open-absinthe so the wrapper can call
 # `open_absinthe::nac::set_relay_config` from Linux and macOS alike.
 # The macOS-only dep block below ADDITIONALLY enables the `native-nac`
 # feature via Cargo feature unification — this base dep provides access
 # to the relay setter on all platforms.
-open-absinthe = { path = "../../third_party/rustpush-upstream/open-absinthe" }
-keystore = { path = "../../third_party/rustpush-upstream/keystore" }
+open-absinthe = { path = "../../rustpush/open-absinthe" }
+keystore = { path = "../../rustpush/keystore" }
 plist = "1.7.0"
 serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1.4.1", features = ["v4"] }
@@ -68,8 +68,8 @@ once_cell = "1"
 rand = { version = "0.8.5", features = ["min_const_gen"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-icloud_auth = { path = "../../third_party/rustpush-upstream/apple-private-apis/icloud-auth", default-features = false }
-omnisette = { path = "../../third_party/rustpush-upstream/apple-private-apis/omnisette", default-features = false }
+icloud_auth = { path = "../../rustpush/apple-private-apis/icloud-auth", default-features = false }
+omnisette = { path = "../../rustpush/apple-private-apis/omnisette", default-features = false }
 nac-validation = { path = "../../nac-validation" }
 # Enable the `native-nac` feature on open-absinthe so its `ValidationCtx`
 # delegates to nac-validation (AAAbsintheContext) instead of running the
@@ -78,11 +78,11 @@ nac-validation = { path = "../../nac-validation" }
 # OSConfig impl as upstream's `rustpush::macos::MacOSConfig`. Cargo unifies
 # this dep with rustpush's own path dep on open-absinthe; features are
 # additive so the `native-nac` flag propagates into both users.
-open-absinthe = { path = "../../third_party/rustpush-upstream/open-absinthe", features = ["native-nac"] }
+open-absinthe = { path = "../../rustpush/open-absinthe", features = ["native-nac"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-icloud_auth = { path = "../../third_party/rustpush-upstream/apple-private-apis/icloud-auth", default-features = false, features = ["remote-anisette-v3"] }
-omnisette = { path = "../../third_party/rustpush-upstream/apple-private-apis/omnisette", default-features = false, features = ["remote-anisette-v3"] }
+icloud_auth = { path = "../../rustpush/apple-private-apis/icloud-auth", default-features = false, features = ["remote-anisette-v3"] }
+omnisette = { path = "../../rustpush/apple-private-apis/omnisette", default-features = false, features = ["remote-anisette-v3"] }
 # WebSocket + datetime + futures adapters for the wrapper-level anisette
 # pre-provisioner (see src/anisette.rs). Versions match upstream omnisette
 # exactly so cargo feature unification doesn't double up crates.
