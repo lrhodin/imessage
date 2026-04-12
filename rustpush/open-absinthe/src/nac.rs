@@ -1023,11 +1023,12 @@ impl ValidationCtx {
                         .decode(body.trim())
                         .map_err(|e| AbsintheError::Other(format!("relay base64 decode: {e}")))?;
                     info!("NAC relay: got {} bytes of validation data", validation_data.len());
-                    // out_request_bytes left empty — the relay already
-                    // completed the Apple handshake. generate_validation_data
-                    // will POST these empty bytes to Apple but we don't care
-                    // about the response; key_establishment is a no-op and
-                    // sign() returns the relay data directly.
+                    // Provide the validation data as out_request_bytes so
+                    // upstream's generate_validation_data() POSTs non-empty
+                    // bytes to Apple's id-initialize-validation endpoint.
+                    // key_establishment is a no-op; sign() returns the
+                    // pre-fetched relay data.
+                    *out_request_bytes = validation_data.clone();
                     return Ok(ValidationCtx {
                         inner: ValidationCtxInner::Relay { validation_data },
                     });

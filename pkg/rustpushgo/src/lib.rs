@@ -3434,11 +3434,15 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
     }
     let device_id = hw_uuid;
 
-    // For Apple Silicon keys, the relay URL/token are stored on WrappedOSConfig
-    // so the bridge can pre-fetch validation data before upstream calls that
-    // need it (login_apple_delegates, register). The emulator handles
-    // NACInit/KeyEstablishment; sign() returns the pre-fetched relay data.
-    let _ = relay_cert_fp; // cert pinning handled by reqwest danger_accept_invalid_certs
+    // For Apple Silicon keys, register the relay so ValidationCtx::new()
+    // takes the relay path (avoiding the emulator which can't handle ARM keys).
+    // The relay URL/token are also stored on WrappedOSConfig so the bridge
+    // can pre-fetch validation data before upstream calls.
+    if let Some(ref url) = nac_relay_url {
+        open_absinthe::nac::set_relay_config(url.clone(), relay_token.clone(), relay_cert_fp.clone());
+        log::info!("NAC relay configured: {}", url);
+    }
+    let _ = relay_cert_fp;
 
     // Build upstream's MacOSConfig with only the fields it has — relay
     // fields live in wrapper state, not on the OSConfig.
