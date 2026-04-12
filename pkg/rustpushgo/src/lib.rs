@@ -3495,14 +3495,15 @@ pub async fn login_start(
     };
 
     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
+    info!("login_start: mme_client_info={}", client_info.mme_client_info);
+    info!("login_start: mme_client_info_akd={}", client_info.mme_client_info_akd);
+    info!("login_start: akd_user_agent={}", client_info.akd_user_agent);
+    info!("login_start: hardware_headers={:?}", client_info.hardware_headers);
+    info!("login_start: push_token={:?}", client_info.push_token);
     let anisette_state_path = PathBuf::from_str("state/anisette").unwrap();
     let state_plist = anisette_state_path.join("state.plist");
     info!("login_start: anisette state path={:?} exists={}", state_plist, state_plist.exists());
 
-    // `bridge_default_provider` returns upstream's AOSKit path on macOS
-    // and our `BridgeAnisetteProvider` on Linux; the latter owns
-    // provisioning end-to-end so upstream's broken `ProvisionInput` enum
-    // is never reached (see src/anisette.rs).
     let anisette = bridge_default_provider(client_info.clone(), anisette_state_path);
 
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
