@@ -778,9 +778,16 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 	if len(handles) == 0 {
 		return
 	}
-	// invite_to_channel in upstream rustpush can panic if the GSA token
-	// needed to allocate our StatusKit channel isn't available yet. Wrap
-	// in a recover so a panic here is logged but never crashes the bridge.
+	// ensure_channel (called inside invite_to_channel) panics with "No my
+	// key!!" if our StatusKit channel hasn't been allocated yet. SetStatus
+	// calls share_status → ensure_channel safely (returns error, never
+	// panics), allocating our channel key before we attempt the invite.
+	if err := c.client.SetStatus(true); err != nil {
+		log.Warn().Err(err).Msg("StatusKit: channel not ready for invite, will retry on next restart")
+		return
+	}
+	// Invite contacts to key exchange. Still wrapped in recover for any
+	// upstream panics (e.g. handle normalization mismatch in the closure).
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
