@@ -718,15 +718,6 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rustpushgo_checksum_method_client_invite_to_status_sharing(uniffiStatus)
-		})
-		if checksum != 40272 {
-			// If this happens try cleaning and rebuilding your project
-			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_invite_to_status_sharing: UniFFI API checksum mismatch")
-		}
-	}
-	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_list_recoverable_chats(uniffiStatus)
 		})
 		if checksum != 61049 {
@@ -2804,31 +2795,6 @@ func (_self *Client) InitStatuskit(callback StatusCallback) error {
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_init_statuskit(
 				_pointer, FfiConverterCallbackInterfaceStatusCallbackINSTANCE.Lower(callback),
-				status,
-			))
-		},
-		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
-			// pollFunc
-			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
-		},
-		func(handle *C.void, status *C.RustCallStatus) {
-			// completeFunc
-			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
-		},
-		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
-			// freeFunc
-			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
-		})
-}
-
-func (_self *Client) InviteToStatusSharing(senderHandle string, handles []string) error {
-	_pointer := _self.ffiObject.incrementPointer("*Client")
-	defer _self.ffiObject.decrementPointer()
-	return uniffiRustCallAsyncWithError(
-		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
-			// rustFutureFunc
-			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_invite_to_status_sharing(
-				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(senderHandle)), rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(handles)),
 				status,
 			))
 		},

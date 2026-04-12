@@ -29,7 +29,6 @@ use rustpush::{
     ResourceState,
 };
 use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
-use rustpush::findmy::MULTIPLEX_SERVICE;
 use omnisette::default_provider;
 use std::sync::RwLock;
 
@@ -3764,7 +3763,7 @@ impl LoginSession {
                     register(
                         &*os_config,
                         &*conn.state.read().await,
-                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
+                        &[&MADRID_SERVICE],
                         &mut users,
                         &identity,
                     ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
@@ -3778,7 +3777,7 @@ impl LoginSession {
                     register(
                         &*os_config,
                         &*conn.state.read().await,
-                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
+                        &[&MADRID_SERVICE],
                         &mut users,
                         &identity,
                     ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
@@ -4682,7 +4681,7 @@ pub async fn new_client(
             conn.clone(),
             users_clone,
             identity_clone,
-            &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
+            &[&MADRID_SERVICE],
             "state/id_cache.plist".into(),
             config_clone.clone(),
             Box::new(move |updated_keys| {
@@ -5383,33 +5382,6 @@ impl Client {
         info!("Reset {} StatusKit channel cursor(s) to 1 for replay", count);
     }
 
-    /// Send our StatusKit key to the specified contact handles (via IDS
-    /// keysharing), establishing the mutual key exchange needed to receive
-    /// their Focus/DND status updates. Should be called after init_statuskit()
-    /// for handles that are not yet in the persisted key state. When the
-    /// contact's device receives our key, it should respond by sending its own
-    /// key, which the receive loop stores in the StatusKit state.
-    pub async fn invite_to_status_sharing(
-        &self,
-        sender_handle: String,
-        handles: Vec<String>,
-    ) -> Result<(), WrappedError> {
-        let sk = self.shared_statuskit.read().await.clone().ok_or(WrappedError::GenericError {
-            msg: "StatusKit not initialized".into(),
-        })?;
-
-        let config_map: std::collections::HashMap<String, rustpush::statuskit::StatusKitPersonalConfig> =
-            handles.iter()
-                .map(|h| (h.clone(), rustpush::statuskit::StatusKitPersonalConfig {
-                    allowed_modes: vec![],
-                }))
-                .collect();
-
-        info!("StatusKit: inviting {} handle(s) to key exchange", handles.len());
-        sk.invite_to_channel(&sender_handle, config_map).await.map_err(|e| WrappedError::GenericError {
-            msg: format!("StatusKit invite_to_channel failed: {:?}", e),
-        })
-    }
 
     /// Fetch a shared iMessage profile (Name & Photo Sharing) from CloudKit.
     /// `record_key` and `decryption_key` are obtained from an incoming

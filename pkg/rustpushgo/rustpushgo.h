@@ -233,13 +233,6 @@ void* uniffi_rustpushgo_fn_method_client_init_statuskit(
 	RustCallStatus* out_status
 );
 
-void* uniffi_rustpushgo_fn_method_client_invite_to_status_sharing(
-	void* ptr,
-	RustBuffer sender_handle,
-	RustBuffer handles,
-	RustCallStatus* out_status
-);
-
 void* uniffi_rustpushgo_fn_method_client_list_recoverable_chats(
 	void* ptr,
 	RustCallStatus* out_status
@@ -1646,10 +1639,6 @@ uint16_t uniffi_rustpushgo_checksum_method_client_get_statuskit_client(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_init_statuskit(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_client_invite_to_status_sharing(
 	RustCallStatus* out_status
 );
 

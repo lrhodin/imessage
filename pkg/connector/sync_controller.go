@@ -750,57 +750,6 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 	}
 }
 
-// inviteContactsToStatusSharing sends our StatusKit key to all known ghost
-// handles. This triggers the mutual key exchange: when a contact's device
-// receives our key invite, it should respond with its own key (if Focus
-// sharing is enabled for this account). Without the key we can't subscribe
-// to their channel or receive their presence updates.
-func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
-	if c.client == nil || c.handle == "" {
-		return
-	}
-	ctx := context.Background()
-	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost")
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to query ghosts for StatusKit invite")
-		return
-	}
-	defer rows.Close()
-
-	var handles []string
-	for rows.Next() {
-		var ghostID string
-		if err := rows.Scan(&ghostID); err != nil {
-			continue
-		}
-		handles = append(handles, ghostID)
-	}
-	if len(handles) == 0 {
-		return
-	}
-	// ensure_channel (called inside invite_to_channel) panics with "No my
-	// key!!" if our StatusKit channel hasn't been allocated yet. SetStatus
-	// calls share_status → ensure_channel safely (returns error, never
-	// panics), allocating our channel key before we attempt the invite.
-	if err := c.client.SetStatus(true); err != nil {
-		log.Warn().Err(err).Msg("StatusKit: channel not ready for invite, will retry on next restart")
-		return
-	}
-	// Invite contacts to key exchange. Still wrapped in recover for any
-	// upstream panics (e.g. handle normalization mismatch in the closure).
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Warn().Str("panic", fmt.Sprintf("%v", r)).Msg("StatusKit invite panicked — will retry on next restart")
-			}
-		}()
-		if err := c.client.InviteToStatusSharing(c.handle, handles); err != nil {
-			log.Warn().Err(err).Int("count", len(handles)).Msg("StatusKit invite failed")
-		} else {
-			log.Info().Int("count", len(handles)).Msg("Sent StatusKit key invite to known ghosts")
-		}
-	}()
-}
 
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	if c.contacts == nil {
