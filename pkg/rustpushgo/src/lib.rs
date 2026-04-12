@@ -3301,18 +3301,33 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
                 )
             } else {
                 // JSON parsed as FullHardwareKey but has no `inner` field —
-                // retry as bare HardwareConfig.
+                // retry as bare HardwareConfig.  Preserve any relay fields that
+                // were already parsed into `full` — dropping them here would
+                // silently skip register_nac_relay() for keys that carry relay
+                // info at the top level without a nested `inner` object.
                 let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
                     .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
+                let version = full.version
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "13.6.4".to_string());
+                let protocol_version = full.protocol_version
+                    .filter(|v| *v != 0)
+                    .unwrap_or(1660);
+                let icloud_ua = full.icloud_ua
+                    .filter(|v| v.split_once(char::is_whitespace).is_some())
+                    .unwrap_or_else(|| "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string());
+                let aoskit_version = full.aoskit_version
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string());
                 (
                     hw,
-                    "13.6.4".to_string(),
-                    1660,
-                    "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string(),
-                    "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
-                    None,
-                    None,
-                    None,
+                    version,
+                    protocol_version,
+                    icloud_ua,
+                    aoskit_version,
+                    full.nac_relay_url,
+                    full.relay_token,
+                    full.relay_cert_fp,
                 )
             }
         } else {
