@@ -135,6 +135,18 @@ type IMClient struct {
 	// Contact source for name resolution (iCloud or external CardDAV)
 	contacts contactSource
 
+	// sharedProfiles caches shared iMessage profile records (Name & Photo
+	// Sharing) received via ShareProfile / UpdateProfile messages, keyed by
+	// sender identifier (e.g. "tel:+1234567890" or "mailto:user@icloud.com").
+	// Used as a supplement to CardDAV contacts in GetUserInfo.
+	sharedProfiles sync.Map // map[string]*rustpushgo.WrappedProfileRecord
+
+	// statusKitPresence tracks the last-known availability state per contact
+	// handle, keyed by iMessage identifier string (e.g. "tel:+1234567890").
+	// Stored as bool (true = available). Used to suppress duplicate bot notices
+	// when StatusKit re-delivers the same presence state on reconnect.
+	statusKitPresence sync.Map // map[string]bool
+
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool
 	contactsReadyLock sync.RWMutex
@@ -325,6 +337,7 @@ var _ bridgev2.BackfillingNetworkAPIWithLimits = (*IMClient)(nil)
 var _ bridgev2.DeleteChatHandlingNetworkAPI = (*IMClient)(nil)
 var _ rustpushgo.MessageCallback = (*IMClient)(nil)
 var _ rustpushgo.UpdateUsersCallback = (*IMClient)(nil)
+var _ rustpushgo.StatusCallback = (*IMClient)(nil)
 
 // ============================================================================
 // APNs message reorder buffer
@@ -857,6 +870,20 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// Persist state after connect (APS tokens, IDS keys, device ID)
 	c.persistState(log)
 
+	// Initialize StatusKit presence system (non-fatal — runs in background).
+	// Once initialized, the Rust receive loop intercepts StatusKit APNs
+	// messages and invokes OnStatusUpdate for subscribed handles.
+	go func() {
+		if c.client == nil {
+			return
+		}
+		if err := c.client.InitStatuskit(c); err != nil {
+			log.Warn().Err(err).Msg("StatusKit initialization failed — presence updates unavailable")
+		} else {
+			log.Info().Msg("StatusKit presence system initialized")
+		}
+	}()
+
 	// Pre-populate sender_guid cache from existing portal metadata
 	go c.loadSenderGuidsFromDB(log)
 
@@ -995,6 +1022,117 @@ func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal)
 // Callbacks from rustpush
 // ============================================================================
 
+// statusKitModeLabel converts a Focus/DND mode identifier to a human-readable
+// label for use in bridge bot notices.
+func statusKitModeLabel(mode *string) string {
+	if mode == nil || *mode == "" {
+		return ""
+	}
+	switch *mode {
+	case "com.apple.donotdisturb.mode.default":
+		return "Do Not Disturb"
+	case "com.apple.donotdisturb.mode.sleep":
+		return "Sleep"
+	default:
+		// Focus modes use identifiers like "com.apple.focus.mode.personal"
+		// or user-defined UUIDs. Humanise what we can; fall back to a generic label.
+		if strings.Contains(*mode, "focus") {
+			return "Focus"
+		}
+		return "Do Not Disturb"
+	}
+}
+
+// OnStatusUpdate is called by StatusKit when a contact's presence changes.
+// Posts an m.notice in the DM portal so the user sees a subtle inline notice
+// (the way Apple shows "has notifications silenced" at the bottom of the chat).
+// Also sets Matrix ghost presence for clients that render it.
+func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
+	log := c.UserLogin.Log.With().
+		Str("component", "statuskit").
+		Str("user", user).
+		Logger()
+
+	// Suppress duplicate notices: only act when the availability state changes.
+	if prev, loaded := c.statusKitPresence.Load(user); loaded {
+		if prev.(bool) == available {
+			log.Debug().Bool("available", available).Msg("StatusKit: presence unchanged, skipping notice")
+			return
+		}
+	}
+	c.statusKitPresence.Store(user, available)
+
+	presence := event.PresenceUnavailable
+	statusMsg := ""
+	if available {
+		presence = event.PresenceOnline
+	} else if mode != nil && *mode != "" {
+		statusMsg = *mode
+	}
+	log.Debug().
+		Str("presence", string(presence)).
+		Str("status_msg", statusMsg).
+		Msg("Received iMessage presence update")
+
+	ctx := context.Background()
+	ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
+	if err != nil || ghost == nil || ghost.Intent == nil {
+		log.Debug().Err(err).Msg("No ghost found for presence update — ignoring")
+		return
+	}
+
+	// Set Matrix presence for clients that render it (not Beeper, but others may).
+	if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
+		if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
+			Presence:  presence,
+			StatusMsg: statusMsg,
+		}); err != nil {
+			log.Warn().Err(err).Msg("Failed to set Matrix presence for ghost")
+		}
+	}
+
+	// Post an m.notice in the DM portal — this is what actually shows up in
+	// Beeper as the inline "notifications silenced" indicator.
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+		ID:       networkid.PortalID(user),
+		Receiver: c.UserLogin.ID,
+	})
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to look up DM portal for presence notice")
+		return
+	}
+	if portal == nil || portal.MXID == "" {
+		log.Debug().Msg("No DM portal found for presence notice")
+		return
+	}
+
+	name := ghost.Name
+	if name == "" {
+		name = user
+	}
+	var notice string
+	if available {
+		notice = name + " has notifications turned on."
+	} else {
+		label := statusKitModeLabel(mode)
+		if label != "" {
+			notice = "🔕 " + name + " has notifications silenced (" + label + ")."
+		} else {
+			notice = "🔕 " + name + " has notifications silenced."
+		}
+	}
+
+	_, err = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+		Parsed: &event.MessageEventContent{
+			MsgType: event.MsgNotice,
+			Body:    notice,
+		},
+	}, nil)
+	if err != nil {
+		log.Warn().Err(err).Str("portal_mxid", string(portal.MXID)).Msg("Failed to send presence notice to portal")
+	}
+}
+
 // OnMessage is called by rustpush when a message is received via APNs.
 func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	log := c.UserLogin.Log.With().
@@ -1070,6 +1208,10 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	}
 	if msg.IsIconChange {
 		go c.handleIconChange(log, msg)
+		return
+	}
+	if msg.IsShareProfile && msg.Sender != nil && *msg.Sender != "" {
+		go c.handleShareProfile(log, msg)
 		return
 	}
 
@@ -1594,6 +1736,35 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		}
 	}
 
+	// Sticker tapbacks (type 7) carry an image placed on top of a message
+	// bubble. Matrix reactions are text-only, so bridge the sticker as an
+	// image message replying to the target instead.
+	if msg.TapbackType != nil && *msg.TapbackType == 7 && msg.StickerData != nil && len(*msg.StickerData) > 0 {
+		stickerData := *msg.StickerData
+		stickerMime := "image/png"
+		if msg.StickerMime != nil && *msg.StickerMime != "" {
+			stickerMime = *msg.StickerMime
+		}
+		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*stickerTapbackData]{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventMessage,
+				PortalKey: portalKey,
+				Sender:    c.canonicalizeDMSender(portalKey, c.makeEventSender(msg.Sender)),
+				Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
+			},
+			Data: &stickerTapbackData{
+				ImageData: stickerData,
+				MimeType:  stickerMime,
+				TargetID:  targetGUID,
+			},
+			ID: makeMessageID(msg.Uuid),
+			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *stickerTapbackData) (*bridgev2.ConvertedMessage, error) {
+				return convertStickerTapback(ctx, intent, data)
+			},
+		})
+		return
+	}
+
 	emoji := tapbackTypeToEmoji(msg.TapbackType, msg.TapbackEmoji)
 
 	evtType := bridgev2.RemoteEventReaction
@@ -1689,6 +1860,52 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		},
 		TargetMessage: makeMessageID(targetGUID),
 	})
+}
+
+// handleShareProfile fetches a shared iMessage profile (Name & Photo Sharing)
+// from CloudKit and caches it for GetUserInfo. Triggered by an incoming
+// ShareProfile / UpdateProfile message containing the record & decryption keys.
+func (c *IMClient) handleShareProfile(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	sender := *msg.Sender
+	log = log.With().Str("sender", sender).Logger()
+
+	if msg.ShareProfileRecordKey == nil || msg.ShareProfileDecryptionKey == nil {
+		log.Debug().Msg("ShareProfile message has no record key or decryption key, ignoring")
+		return
+	}
+	if c.client == nil {
+		return
+	}
+
+	log.Info().Msg("Fetching shared iMessage profile")
+	record, err := c.client.FetchProfile(*msg.ShareProfileRecordKey, *msg.ShareProfileDecryptionKey, msg.ShareProfileHasPoster)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to fetch shared profile")
+		return
+	}
+
+	c.sharedProfiles.Store(sender, &record)
+	log.Info().
+		Str("display_name", record.DisplayName).
+		Str("first_name", record.FirstName).
+		Str("last_name", record.LastName).
+		Bool("has_avatar", record.Avatar != nil && len(*record.Avatar) > 0).
+		Msg("Cached shared iMessage profile")
+
+	// Refresh the ghost so the Matrix-side display name / avatar updates.
+	ctx := context.Background()
+	userID := makeUserID(sender)
+	ghost, err := c.Main.Bridge.GetGhostByID(ctx, userID)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get ghost for profile update")
+		return
+	}
+	info, err := c.GetUserInfo(ctx, ghost)
+	if err != nil || info == nil {
+		return
+	}
+	ghost.UpdateInfo(ctx, info)
+	log.Info().Msg("Updated ghost info from shared profile")
 }
 
 func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -4648,6 +4865,33 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 			}
 		}
 		return ui, nil
+	}
+
+	// Check for a shared iMessage profile (Name & Photo Sharing / Me card)
+	// as a supplement to CardDAV when no contact is found.
+	if val, ok := c.sharedProfiles.Load(identifier); ok {
+		profile := val.(*rustpushgo.WrappedProfileRecord)
+		if profile.FirstName != "" || profile.LastName != "" || profile.DisplayName != "" {
+			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+				FirstName: profile.FirstName,
+				LastName:  profile.LastName,
+				ID:        localID,
+			})
+			ui.Name = &name
+		}
+		if profile.Avatar != nil && len(*profile.Avatar) > 0 {
+			avatarData := *profile.Avatar
+			avatarHash := sha256.Sum256(avatarData)
+			ui.Avatar = &bridgev2.Avatar{
+				ID: networkid.AvatarID(fmt.Sprintf("improfile:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
+				Get: func(ctx context.Context) ([]byte, error) {
+					return avatarData, nil
+				},
+			}
+		}
+		if ui.Name != nil {
+			return ui, nil
+		}
 	}
 
 	// Fallback: format from identifier
@@ -7616,6 +7860,47 @@ type attachmentMessage struct {
 	*rustpushgo.WrappedMessage
 	Attachment *rustpushgo.WrappedAttachment
 	Index      int
+}
+
+// stickerTapbackData carries the image bytes for a sticker placed on a
+// message bubble (iMessage sticker tapback, type 7). Bridged as an image
+// message replying to the target since Matrix reactions are text-only.
+type stickerTapbackData struct {
+	ImageData []byte
+	MimeType  string
+	TargetID  string // UUID of the message the sticker was placed on
+}
+
+func convertStickerTapback(ctx context.Context, intent bridgev2.MatrixAPI, data *stickerTapbackData) (*bridgev2.ConvertedMessage, error) {
+	content := &event.MessageEventContent{
+		MsgType: event.MsgImage,
+		Body:    "sticker.png",
+		Info: &event.FileInfo{
+			MimeType: data.MimeType,
+			Size:     len(data.ImageData),
+		},
+	}
+	if intent != nil {
+		url, encFile, err := intent.UploadMedia(ctx, "", data.ImageData, "sticker.png", data.MimeType)
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload sticker: %w", err)
+		}
+		if encFile != nil {
+			content.File = encFile
+		} else {
+			content.URL = url
+		}
+	}
+	cm := &bridgev2.ConvertedMessage{
+		Parts: []*bridgev2.ConvertedMessagePart{{
+			Type:    event.EventMessage,
+			Content: content,
+		}},
+	}
+	if data.TargetID != "" {
+		cm.ReplyTo = &networkid.MessageOptionalPartID{MessageID: makeMessageID(data.TargetID)}
+	}
+	return cm, nil
 }
 
 // convertURLPreviewToBeeper parses rich link sideband attachments from an

@@ -714,6 +714,40 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	}
 	go c.refreshGhostNamesFromContacts(log)
 	go c.refreshGroupPortalNamesFromContacts(log)
+	go c.subscribeToContactPresence(log)
+}
+
+// subscribeToContactPresence subscribes to iMessage presence updates for all
+// known ghosts via StatusKit. Presence changes are delivered via
+// OnStatusUpdate and mapped to Matrix ghost presence.
+func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
+	if c.client == nil {
+		return
+	}
+	ctx := context.Background()
+	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost")
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to query ghosts for presence subscription")
+		return
+	}
+	defer rows.Close()
+
+	var handles []string
+	for rows.Next() {
+		var ghostID string
+		if err := rows.Scan(&ghostID); err != nil {
+			continue
+		}
+		handles = append(handles, ghostID)
+	}
+	if len(handles) == 0 {
+		return
+	}
+	if err := c.client.SubscribeToStatus(handles); err != nil {
+		log.Warn().Err(err).Int("count", len(handles)).Msg("Failed to subscribe to presence")
+	} else {
+		log.Info().Int("count", len(handles)).Msg("Subscribed to iMessage presence for known ghosts")
+	}
 }
 
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {

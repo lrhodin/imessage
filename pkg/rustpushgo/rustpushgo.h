@@ -156,6 +156,14 @@ void* uniffi_rustpushgo_fn_method_client_delete_cloud_messages(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_fetch_profile(
+	void* ptr,
+	RustBuffer record_key,
+	RustBuffer decryption_key,
+	int8_t has_poster,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_findmy_friends_import(
 	void* ptr,
 	int8_t daemon,
@@ -216,6 +224,12 @@ void* uniffi_rustpushgo_fn_method_client_get_sharedstreams_client(
 
 void* uniffi_rustpushgo_fn_method_client_get_statuskit_client(
 	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_init_statuskit(
+	void* ptr,
+	uint64_t callback,
 	RustCallStatus* out_status
 );
 
@@ -519,12 +533,29 @@ void* uniffi_rustpushgo_fn_method_client_send_update_profile_sharing(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_set_status(
+	void* ptr,
+	int8_t active,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_stop(
 	void* ptr,
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_subscribe_to_status(
+	void* ptr,
+	RustBuffer handles,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_test_cloud_messages(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_unsubscribe_all_status(
 	void* ptr,
 	RustCallStatus* out_status
 );
@@ -1073,6 +1104,11 @@ void uniffi_rustpushgo_fn_init_callback_messagecallback(
 	RustCallStatus* out_status
 );
 
+void uniffi_rustpushgo_fn_init_callback_statuscallback(
+	ForeignCallback callback_stub,
+	RustCallStatus* out_status
+);
+
 void uniffi_rustpushgo_fn_init_callback_updateuserscallback(
 	ForeignCallback callback_stub,
 	RustCallStatus* out_status
@@ -1545,6 +1581,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_delete_cloud_messages(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_fetch_profile(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_findmy_friends_import(
 	RustCallStatus* out_status
 );
@@ -1590,6 +1630,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_get_sharedstreams_client(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_get_statuskit_client(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_init_statuskit(
 	RustCallStatus* out_status
 );
 
@@ -1733,11 +1777,23 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_update_profile_sharing(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_set_status(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_stop(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_subscribe_to_status(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_test_cloud_messages(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_unsubscribe_all_status(
 	RustCallStatus* out_status
 );
 
@@ -2061,6 +2117,10 @@ uint16_t uniffi_rustpushgo_checksum_method_messagecallback_on_message(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_statuscallback_on_status_update(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_updateuserscallback_update_users(
 	RustCallStatus* out_status
 );
@@ -2071,5 +2131,6 @@ uint32_t ffi_rustpushgo_uniffi_contract_version(
 
 
 int32_t rustpushgo_cgo_MessageCallback(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
+int32_t rustpushgo_cgo_StatusCallback(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
 int32_t rustpushgo_cgo_UpdateUsersCallback(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
 

@@ -2126,6 +2126,15 @@ pub struct WrappedAttachment {
     pub iris: bool,
 }
 
+/// Result of fetching a shared iMessage profile (Name & Photo Sharing).
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedProfileRecord {
+    pub display_name: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub avatar: Option<Vec<u8>>,
+}
+
 #[derive(uniffi::Record, Clone)]
 pub struct WrappedStickerExtension {
     pub msg_width: f64,
@@ -3089,6 +3098,15 @@ pub trait MessageCallback: Send + Sync {
 #[uniffi::export(callback_interface)]
 pub trait UpdateUsersCallback: Send + Sync {
     fn update_users(&self, users: Arc<WrappedIDSUsers>);
+}
+
+/// Callback invoked when an iMessage contact's presence state changes.
+/// `user` is an iMessage handle (e.g. "tel:+1..." or "mailto:..."). When
+/// `available` is false, `mode` may carry a Focus/DND mode identifier such
+/// as "com.apple.donotdisturb.mode.default".
+#[uniffi::export(callback_interface)]
+pub trait StatusCallback: Send + Sync {
+    fn on_status_update(&self, user: String, mode: Option<String>, available: bool);
 }
 
 // ============================================================================
@@ -4626,6 +4644,19 @@ pub struct Client {
     passwords_client: tokio::sync::Mutex<Option<Arc<WrappedPasswordsClient>>>,
     statuskit_client: tokio::sync::Mutex<Option<Arc<WrappedStatusKitClient>>>,
     sharedstreams_client: tokio::sync::Mutex<Option<Arc<WrappedSharedStreamsClient>>>,
+    /// Cached Profiles client (Name & Photo Sharing). Initialized lazily the
+    /// first time a shared profile needs to be fetched from CloudKit.
+    profiles_client: tokio::sync::Mutex<Option<Arc<rustpush::name_photo_sharing::ProfilesClient<BridgeDefaultAnisetteProvider>>>>,
+    /// Shared handle to the raw StatusKit client, used by the APNs receive
+    /// loop to intercept presence messages before iMessage handling. Set by
+    /// `init_statuskit()`; the loop no-ops when unset.
+    shared_statuskit: Arc<tokio::sync::RwLock<Option<Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>>>>,
+    /// Shared callback for presence updates delivered by StatusKit. Populated
+    /// alongside `shared_statuskit` by `init_statuskit()`.
+    status_callback: Arc<tokio::sync::RwLock<Option<Arc<dyn StatusCallback>>>>,
+    /// Subscription tokens held to keep presence channels open. Cleared by
+    /// `unsubscribe_all_status()`.
+    statuskit_interest_tokens: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -4682,6 +4713,15 @@ pub async fn new_client(
     let client_for_recv = client.clone();
     let callback = Arc::new(message_callback);
 
+    // Shared StatusKit state: init_statuskit() populates these Arc<RwLock>s,
+    // and the receive loop below reads them on every message. The raw
+    // StatusKit client gets first crack at incoming APNs messages so presence
+    // updates are consumed before iMessage handling.
+    let shared_statuskit_for_recv: Arc<tokio::sync::RwLock<Option<Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+    let status_callback_for_recv: Arc<tokio::sync::RwLock<Option<Arc<dyn StatusCallback>>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+
     // Shared reconnect timestamp: set when APNs reconnects (generated_signal
     // fires) or when the drain task starts listening (initial connection).
     // Messages arriving within RECONNECT_WINDOW_MS of a (re)connect are
@@ -4697,6 +4737,8 @@ pub async fn new_client(
         let conn = connection.inner.clone();
         let conn_for_download = connection.inner.clone();
         let reconnected_at = reconnected_at.clone();
+        let sk_for_recv = shared_statuskit_for_recv.clone();
+        let status_cb_for_recv = status_callback_for_recv.clone();
         async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
             let pending = Arc::new(AtomicU64::new(0));
@@ -4787,12 +4829,48 @@ pub async fn new_client(
             const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
             while let Some((msg, drain_ts)) = rx.recv().await {
+                // StatusKit gets first crack at the APNs message. If it
+                // consumes the message (presence update on a subscribed
+                // channel), we dispatch to the Go callback and skip iMessage
+                // handling. Only active when init_statuskit() has been
+                // called; otherwise falls through.
+                if let Some(sk) = sk_for_recv.read().await.as_ref().cloned() {
+                    match sk.handle(msg.clone()).await {
+                        Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged { user, mode, allowed })) => {
+                            if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                cb.on_status_update(user, mode, allowed);
+                            }
+                            pending.fetch_sub(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        Ok(None) => {} // not a StatusKit message — fall through
+                        Err(e) => {
+                            warn!("StatusKit handle error: {:?}", e);
+                        }
+                    }
+                }
+
                 let mut retries = 0u32;
                 let mut backoff = INITIAL_BACKOFF;
 
                 loop {
                     match client_for_recv.handle(msg.clone()).await {
                         Ok(Some(msg_inst)) => {
+                            // Certify delivery back to the sender when the
+                            // incoming message carries a certified context.
+                            // Without this, the sender's device displays a
+                            // "not delivered" indicator even though we
+                            // received and decrypted the message successfully.
+                            if let Some(ref context) = msg_inst.certified_context {
+                                if let Err(e) = client_for_recv
+                                    .identity
+                                    .certify_delivery("com.apple.madrid", context, msg_inst.send_delivered)
+                                    .await
+                                {
+                                    warn!("Failed to certify delivery for {}: {:?}", msg_inst.id, e);
+                                }
+                            }
+
                             if msg_inst.has_payload() || matches!(msg_inst.message, Message::Typing(_, _) | Message::Read | Message::Delivered | Message::Error(_) | Message::PeerCacheInvalidate) {
                                 let mut wrapped = message_inst_to_wrapped(&msg_inst);
 
@@ -4876,6 +4954,10 @@ pub async fn new_client(
         passwords_client: tokio::sync::Mutex::new(None),
         statuskit_client: tokio::sync::Mutex::new(None),
         sharedstreams_client: tokio::sync::Mutex::new(None),
+        profiles_client: tokio::sync::Mutex::new(None),
+        shared_statuskit: shared_statuskit_for_recv,
+        status_callback: status_callback_for_recv,
+        statuskit_interest_tokens: tokio::sync::Mutex::new(Vec::new()),
     }))
 }
 
@@ -5028,6 +5110,20 @@ impl Client {
         let keychain = self.get_or_init_cloud_keychain_client().await?;
         refresh_recoverable_tlk_shares(&keychain, context).await?;
         sync_keychain_with_retries(&keychain, 6, context).await
+    }
+
+    async fn get_or_init_profiles_client(&self) -> Result<Arc<rustpush::name_photo_sharing::ProfilesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+        let mut locked = self.profiles_client.lock().await;
+        if let Some(client) = &*locked {
+            return Ok(client.clone());
+        }
+        // ProfilesClient shares the CloudKit handle owned by the keychain
+        // client — initialize cloud messages first so both are available.
+        let keychain = self.get_or_init_cloud_keychain_client().await?;
+        let cloudkit = keychain.client.clone();
+        let profiles = Arc::new(rustpush::name_photo_sharing::ProfilesClient::new(cloudkit));
+        *locked = Some(profiles.clone());
+        Ok(profiles)
     }
 
     async fn get_or_init_findmy_client(&self) -> Result<Arc<WrappedFindMyClient>, WrappedError> {
@@ -5214,6 +5310,94 @@ impl Client {
     pub async fn reset_cloud_client(&self) {
         *self.cloud_messages_client.lock().await = None;
         *self.cloud_keychain_client.lock().await = None;
+        *self.profiles_client.lock().await = None;
+    }
+
+    /// Initialize the StatusKit presence system. Must be called after login
+    /// when a TokenProvider is available. The callback receives presence
+    /// updates for subscribed handles via the APNs receive loop.
+    pub async fn init_statuskit(&self, callback: Box<dyn StatusCallback>) -> Result<(), WrappedError> {
+        // Reuse the existing get_or_init_statuskit_client() path so the
+        // WrappedStatusKitClient sub-client (used for share_status etc.)
+        // and the shared raw handle (used by the receive loop) both point
+        // at the same underlying StatusKitClient.
+        let wrapped = self.get_or_init_statuskit_client().await?;
+        *self.shared_statuskit.write().await = Some(wrapped.inner.clone());
+        *self.status_callback.write().await = Some(Arc::from(callback));
+        info!("StatusKit initialized — presence system ready");
+        Ok(())
+    }
+
+    /// Publish our own presence status. `active=true` → online;
+    /// `active=false` → away/DND (mode defaults to do-not-disturb).
+    pub async fn set_status(&self, active: bool) -> Result<(), WrappedError> {
+        let sk = self.shared_statuskit.read().await.clone().ok_or(WrappedError::GenericError {
+            msg: "StatusKit not initialized".into(),
+        })?;
+        let status = if active {
+            rustpush::statuskit::StatusKitStatus::new_active()
+        } else {
+            rustpush::statuskit::StatusKitStatus::new_away("com.apple.donotdisturb.mode.default".to_string())
+        };
+        sk.share_status(&status).await.map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to publish status: {}", e),
+        })
+    }
+
+    /// Subscribe to presence updates for the given handles (e.g. "tel:+1...",
+    /// "mailto:..."). The subscription is held internally until
+    /// `unsubscribe_all_status()` is called.
+    pub async fn subscribe_to_status(&self, handles: Vec<String>) -> Result<(), WrappedError> {
+        let sk = self.shared_statuskit.read().await.clone().ok_or(WrappedError::GenericError {
+            msg: "StatusKit not initialized".into(),
+        })?;
+        let token = sk.request_handles(&handles).await;
+        self.statuskit_interest_tokens.lock().await.push(token);
+        info!("Subscribed to presence for {} handle(s)", handles.len());
+        Ok(())
+    }
+
+    /// Drop all presence subscriptions.
+    pub async fn unsubscribe_all_status(&self) {
+        self.statuskit_interest_tokens.lock().await.clear();
+        info!("Unsubscribed from all presence channels");
+    }
+
+    /// Fetch a shared iMessage profile (Name & Photo Sharing) from CloudKit.
+    /// `record_key` and `decryption_key` are obtained from an incoming
+    /// ShareProfile / UpdateProfile message.
+    pub async fn fetch_profile(
+        &self,
+        record_key: String,
+        decryption_key: Vec<u8>,
+        has_poster: bool,
+    ) -> Result<WrappedProfileRecord, WrappedError> {
+        let profiles = self.get_or_init_profiles_client().await?;
+        let share_msg = rustpush::ShareProfileMessage {
+            cloud_kit_record_key: record_key,
+            cloud_kit_decryption_record_key: decryption_key,
+            poster: if has_poster {
+                // Minimal poster struct — the fetch path only checks
+                // `poster.is_some()` to decide whether to pull the wallpaper
+                // record alongside the profile record.
+                Some(rustpush::SharedPoster {
+                    low_res_wallpaper_tag: vec![],
+                    wallpaper_tag: vec![],
+                    message_tag: vec![],
+                })
+            } else {
+                None
+            },
+        };
+        let record = profiles.get_record(&share_msg).await.map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to fetch profile: {}", e),
+        })?;
+        Ok(WrappedProfileRecord {
+            display_name: record.name.name,
+            first_name: record.name.first,
+            last_name: record.name.last,
+            avatar: record.image,
+        })
     }
 
     pub async fn get_handles(&self) -> Vec<String> {
