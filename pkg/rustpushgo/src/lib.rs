@@ -43,32 +43,8 @@ use std::sync::RwLock;
 // our `anisette::BridgeAnisetteProvider`, which reuses upstream's
 // `AnisetteClient::new`/`get_headers` but substitutes our own provisioning
 // dance to avoid upstream's closed `ProvisionInput` enum (see `anisette.rs`).
-#[cfg(target_os = "macos")]
+// Use upstream's provider directly on all platforms — identical to master.
 pub type BridgeDefaultAnisetteProvider = omnisette::DefaultAnisetteProvider;
-#[cfg(not(target_os = "macos"))]
-pub type BridgeDefaultAnisetteProvider = anisette::BridgeAnisetteProvider;
-
-/// Construct a fresh `ArcAnisetteClient<BridgeDefaultAnisetteProvider>`.
-/// On macOS this delegates to upstream `default_provider` verbatim. On
-/// Linux it wraps our own `BridgeAnisetteProvider` in upstream's
-/// `AnisetteClient` wrapper so the resulting shape matches what every
-/// rustpush client expects.
-#[cfg(target_os = "macos")]
-fn bridge_default_provider(
-    info: omnisette::LoginClientInfo,
-    path: PathBuf,
-) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
-    default_provider(info, path)
-}
-#[cfg(not(target_os = "macos"))]
-fn bridge_default_provider(
-    info: omnisette::LoginClientInfo,
-    path: PathBuf,
-) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
-    std::sync::Arc::new(tokio::sync::Mutex::new(omnisette::AnisetteClient::new(
-        anisette::BridgeAnisetteProvider::new(info, path),
-    )))
-}
 use tokio::sync::broadcast;
 use util::{plist_from_string, plist_to_string};
 
@@ -1831,7 +1807,7 @@ pub async fn restore_token_provider(
     // macOS this is upstream's native AOSKit path, unchanged.
     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
     let anisette_state_path = PathBuf::from_str("state/anisette").unwrap();
-    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path);
+    let anisette = default_provider(client_info.clone(), anisette_state_path);
 
     // Create a new AppleAccount and populate it with persisted state
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
@@ -3504,7 +3480,7 @@ pub async fn login_start(
     let state_plist = anisette_state_path.join("state.plist");
     info!("login_start: anisette state path={:?} exists={}", state_plist, state_plist.exists());
 
-    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path);
+    let anisette = default_provider(client_info.clone(), anisette_state_path);
 
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
         .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
