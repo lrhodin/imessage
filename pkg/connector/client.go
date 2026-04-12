@@ -1077,14 +1077,21 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		Str("user", user).
 		Logger()
 
-	// Suppress duplicate notices: only act when the availability state changes.
+	// Suppress duplicate notices: only act when the state actually changes.
+	// Track available+mode together so DND→Sleep (both unavailable) still fires.
+	modeKey := "unavailable"
+	if available {
+		modeKey = "available"
+	} else if mode != nil {
+		modeKey = *mode
+	}
 	if prev, loaded := c.statusKitPresence.Load(user); loaded {
-		if prev.(bool) == available {
-			log.Debug().Bool("available", available).Msg("StatusKit: presence unchanged, skipping notice")
+		if prev.(string) == modeKey {
+			log.Debug().Bool("available", available).Str("mode", modeKey).Msg("StatusKit: presence unchanged, skipping notice")
 			return
 		}
 	}
-	c.statusKitPresence.Store(user, available)
+	c.statusKitPresence.Store(user, modeKey)
 
 	presence := event.PresenceUnavailable
 	statusMsg := ""
@@ -1157,7 +1164,10 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		}
 	}
 
-	_, err = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+	// Send as the ghost user (not the bridge bot) so m.notice follows default
+	// push rules and doesn't trigger a notification in Beeper/Element.
+	// The bridge bot's m.notice in DMs still pings; ghost m.notice doesn't.
+	_, err = ghost.Intent.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
 		Parsed: &event.MessageEventContent{
 			MsgType: event.MsgNotice,
 			Body:    notice,
