@@ -1164,13 +1164,15 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		}
 	}
 
-	// Send as the ghost user (not the bridge bot) so m.notice follows default
-	// push rules and doesn't trigger a notification in Beeper/Element.
-	// The bridge bot's m.notice in DMs still pings; ghost m.notice doesn't.
-	_, err = ghost.Intent.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+	// Send via bridge bot with m.notice + empty m.mentions to suppress
+	// push notifications. The m.mentions field (MSC 3952) with an empty
+	// user_ids array tells push rules "this intentionally mentions nobody,"
+	// which overrides the default DM notification rule in Beeper/Element.
+	_, err = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
 		Parsed: &event.MessageEventContent{
-			MsgType: event.MsgNotice,
+			MsgType:  event.MsgNotice,
 			Body:    notice,
+			Mentions: &event.Mentions{},
 		},
 	}, nil)
 	if err != nil {
