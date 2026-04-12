@@ -201,6 +201,10 @@ ensure-rustpush-source:
 				cp -Rp rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe; \
 			fi; \
 		fi; \
+		if grep -q '^mod activation;' $(RUSTPUSH_DIR)/src/lib.rs 2>/dev/null; then \
+			echo "Making rustpush activation module public (needed by RelayOSConfig)..."; \
+			sed -i.bak 's/^mod activation;/pub mod activation;/' $(RUSTPUSH_DIR)/src/lib.rs && rm -f $(RUSTPUSH_DIR)/src/lib.rs.bak; \
+		fi; \
 	fi
 
 # `ensure-rustpush-source` is an order-only prereq (the `|` separator):

@@ -3756,9 +3756,6 @@ impl LoginSession {
                 let mut users = vec![fresh_user];
                 if users[0].registration.is_empty() {
                     info!("Registering identity (first login)...");
-                    if let Some(ref url) = config.relay_url {
-                        prefetch_relay_validation_data(url, config.relay_token.as_deref()).await?;
-                    }
                     register(
                         &*os_config,
                         &*conn.state.read().await,
