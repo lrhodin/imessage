@@ -29,6 +29,7 @@ use rustpush::{
     ResourceState,
 };
 use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
+use rustpush::findmy::MULTIPLEX_SERVICE;
 use omnisette::default_provider;
 use std::sync::RwLock;
 
@@ -3763,7 +3764,7 @@ impl LoginSession {
                     register(
                         &*os_config,
                         &*conn.state.read().await,
-                        &[&MADRID_SERVICE],
+                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
                         &mut users,
                         &identity,
                     ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
@@ -3777,7 +3778,7 @@ impl LoginSession {
                     register(
                         &*os_config,
                         &*conn.state.read().await,
-                        &[&MADRID_SERVICE],
+                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
                         &mut users,
                         &identity,
                     ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
@@ -4681,7 +4682,7 @@ pub async fn new_client(
             conn.clone(),
             users_clone,
             identity_clone,
-            &[&MADRID_SERVICE],
+            &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
             "state/id_cache.plist".into(),
             config_clone.clone(),
             Box::new(move |updated_keys| {

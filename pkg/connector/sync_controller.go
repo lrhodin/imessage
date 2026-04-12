@@ -791,7 +791,7 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Warn().Interface("panic", r).Msg("StatusKit invite panicked — will retry on next restart")
+				log.Warn().Str("panic", fmt.Sprintf("%v", r)).Msg("StatusKit invite panicked — will retry on next restart")
 			}
 		}()
 		if err := c.client.InviteToStatusSharing(c.handle, handles); err != nil {
