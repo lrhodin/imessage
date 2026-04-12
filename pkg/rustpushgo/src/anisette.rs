@@ -240,12 +240,20 @@ async fn run_provision(
             AnisetteError::InvalidArgument("lookup: no midFinishProvisioning".into())
         })?
         .to_string();
-    debug!("anisette: got provisioning urls");
+    info!(
+        "anisette: lookup OK — start={}, end={}",
+        start_url, end_url
+    );
 
     // 2. Open provisioning WebSocket
     let ws_url =
         format!("{}/v3/provisioning_session", ANISETTE_URL).replace("https://", "wss://");
-    let (mut ws, _) = connect_async(&ws_url).await?;
+    info!("anisette: connecting WS to {}", ws_url);
+    let (mut ws, ws_resp) = connect_async(&ws_url).await?;
+    info!(
+        "anisette: WS connected (status={})",
+        ws_resp.status()
+    );
 
     // 3. Dance. Parse `result` loosely so unknown variants become a
     //    clean error instead of a serde crash.
@@ -484,11 +492,32 @@ impl BridgeAnisetteProvider {
             }
         }
 
-        // Fresh provisioning via our own dance.
-        let mut fresh = BridgeAnisetteState::fresh();
-        run_provision(&self.info, &mut fresh).await?;
-        self.state = Some(persist_and_reload(&self.state_path, &fresh)?);
-        Ok(())
+        // Fresh provisioning via our own dance. Retry once with a new
+        // keychain_identifier if the first attempt fails — transient WS
+        // resets and server-side rejections tied to a specific identifier
+        // often clear on a second try with a fresh identity.
+        let mut last_err = None;
+        for attempt in 1..=2 {
+            let mut fresh = BridgeAnisetteState::fresh();
+            match run_provision(&self.info, &mut fresh).await {
+                Ok(()) => {
+                    self.state = Some(persist_and_reload(&self.state_path, &fresh)?);
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(
+                        "anisette: provisioning attempt {}/2 failed: {}",
+                        attempt, e
+                    );
+                    last_err = Some(e);
+                    if attempt < 2 {
+                        info!("anisette: retrying with fresh keychain_identifier");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap())
     }
 
     /// Force a re-provisioning pass, discarding any cached/on-disk state.
