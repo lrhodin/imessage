@@ -403,11 +403,6 @@ func main() {
 			len(data), time.Since(start), r.RemoteAddr)
 	})
 
-	// 3-step endpoints for the refactor-branch Linux bridge.
-	http.HandleFunc("/nac/init", handleNacInit)
-	http.HandleFunc("/nac/key_establishment", handleNacKeyEstablishment)
-	http.HandleFunc("/nac/sign", handleNacSign)
-
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
