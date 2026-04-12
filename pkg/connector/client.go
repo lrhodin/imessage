@@ -892,12 +892,6 @@ func (c *IMClient) Connect(ctx context.Context) {
 			// and failed with "StatusKit not initialized". Re-run it now that
 			// the StatusKit client is guaranteed to be ready.
 			c.subscribeToContactPresence(log)
-			// Send our StatusKit key to all known contacts so they can share
-			// their Focus/DND status with this bridge device. Contacts whose
-			// devices haven't shared keys with us yet (empty state plist) need
-			// this invite to trigger the mutual key exchange. Existing key
-			// relationships are refreshed harmlessly.
-			c.inviteContactsToStatusSharing(log)
 		}
 	}()
 
