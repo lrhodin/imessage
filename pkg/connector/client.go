@@ -884,14 +884,27 @@ func (c *IMClient) Connect(ctx context.Context) {
 		if c.client == nil {
 			return
 		}
-		if err := c.client.InitStatuskit(c); err != nil {
-			log.Warn().Err(err).Msg("StatusKit initialization failed — presence updates unavailable")
-		} else {
-			log.Info().Msg("StatusKit presence system initialized")
-			// subscribeToContactPresence may have raced ahead of InitStatuskit
-			// and failed with "StatusKit not initialized". Re-run it now that
-			// the StatusKit client is guaranteed to be ready.
-			c.subscribeToContactPresence(log)
+		// Wrapped in a 30s timeout to prevent silent goroutine hangs if the
+		// Rust future (StatusKitClient::new → request_topics) never completes.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- c.client.InitStatuskit(c)
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				log.Warn().Err(err).Msg("StatusKit initialization failed — presence updates unavailable")
+			} else {
+				log.Info().Msg("StatusKit presence system initialized")
+				// subscribeToContactPresence may have raced ahead of InitStatuskit
+				// and failed with "StatusKit not initialized". Re-run it now that
+				// the StatusKit client is guaranteed to be ready.
+				c.subscribeToContactPresence(log)
+			}
+		case <-ctx.Done():
+			log.Warn().Msg("StatusKit initialization timed out after 30s — presence updates unavailable")
 		}
 	}()
 
