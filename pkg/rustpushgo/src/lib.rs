@@ -809,11 +809,15 @@ fn register_nac_relay(url: String, token: Option<String>, cert_fp: Option<String
 }
 
 // ---------------------------------------------------------------------------
-// RelayOSConfig — wraps upstream's MacOSConfig for Apple Silicon hardware
-// keys that need the NAC relay for validation data. Intercepts
-// generate_validation_data() to call the relay directly (single-shot POST),
-// exactly like master's vendored MacOSConfig did. All other methods
-// delegate to the inner MacOSConfig unchanged.
+// RelayOSConfig — wraps MacOSConfig for Apple Silicon hardware keys.
+//
+// Upstream's MacOSConfig.generate_validation_data() calls ValidationCtx
+// which runs the x86 emulator. ARM Mac keys can't use the emulator (empty
+// _enc fields) — they need the NAC relay. On master, MacOSConfig had a
+// relay path that returned early before calling ValidationCtx. Since we
+// can't modify upstream, we wrap MacOSConfig and intercept just
+// generate_validation_data() to call the relay's single-shot
+// /validation-data endpoint directly. All other methods delegate.
 // ---------------------------------------------------------------------------
 
 struct RelayOSConfig {
@@ -836,70 +840,42 @@ impl OSConfig for RelayOSConfig {
         let relay_client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
-            .map_err(|e| rustpush::PushError::RelayError(0, format!("Failed to build relay client: {}", e)))?;
+            .map_err(|e| rustpush::PushError::RelayError(0, format!("Failed to build relay client: {e}")))?;
 
         let mut req = relay_client.post(&self.relay_url);
         if let Some(ref token) = self.relay_token {
-            req = req.header("Authorization", format!("Bearer {}", token));
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
 
         let resp = req.send().await
-            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay request failed: {}", e)))?;
+            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay request failed: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(rustpush::PushError::RelayError(status, format!("NAC relay error: {}", body)));
+            return Err(rustpush::PushError::RelayError(status, format!("NAC relay error: {body}")));
         }
         let b64 = resp.text().await
-            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay read error: {}", e)))?;
+            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay read error: {e}")))?;
         let data = STANDARD.decode(b64.trim())
-            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay base64 decode error: {}", e)))?;
+            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay base64 decode: {e}")))?;
         info!("NAC relay: got {} bytes of validation data from {}", data.len(), self.relay_url);
         Ok(data)
     }
-    fn get_protocol_version(&self) -> u32 {
-        self.inner.get_protocol_version()
-    }
-    fn get_register_meta(&self) -> rustpush::RegisterMeta {
-        self.inner.get_register_meta()
-    }
-    fn get_normal_ua(&self, item: &str) -> String {
-        self.inner.get_normal_ua(item)
-    }
-    fn get_mme_clientinfo(&self, for_item: &str) -> String {
-        self.inner.get_mme_clientinfo(for_item)
-    }
-    fn get_version_ua(&self) -> String {
-        self.inner.get_version_ua()
-    }
-    fn get_device_name(&self) -> String {
-        self.inner.get_device_name()
-    }
-    fn get_device_uuid(&self) -> String {
-        self.inner.get_device_uuid()
-    }
-    fn get_private_data(&self) -> plist::Dictionary {
-        self.inner.get_private_data()
-    }
-    fn get_debug_meta(&self) -> rustpush::DebugMeta {
-        self.inner.get_debug_meta()
-    }
-    fn get_login_url(&self) -> &'static str {
-        self.inner.get_login_url()
-    }
-    fn get_serial_number(&self) -> String {
-        self.inner.get_serial_number()
-    }
-    fn get_gsa_hardware_headers(&self) -> HashMap<String, String> {
-        self.inner.get_gsa_hardware_headers()
-    }
-    fn get_aoskit_version(&self) -> String {
-        self.inner.get_aoskit_version()
-    }
-    fn get_udid(&self) -> String {
-        self.inner.get_udid()
-    }
+    fn get_protocol_version(&self) -> u32 { self.inner.get_protocol_version() }
+    fn get_register_meta(&self) -> rustpush::RegisterMeta { self.inner.get_register_meta() }
+    fn get_normal_ua(&self, item: &str) -> String { self.inner.get_normal_ua(item) }
+    fn get_mme_clientinfo(&self, for_item: &str) -> String { self.inner.get_mme_clientinfo(for_item) }
+    fn get_version_ua(&self) -> String { self.inner.get_version_ua() }
+    fn get_device_name(&self) -> String { self.inner.get_device_name() }
+    fn get_device_uuid(&self) -> String { self.inner.get_device_uuid() }
+    fn get_private_data(&self) -> plist::Dictionary { self.inner.get_private_data() }
+    fn get_debug_meta(&self) -> rustpush::DebugMeta { self.inner.get_debug_meta() }
+    fn get_login_url(&self) -> &'static str { self.inner.get_login_url() }
+    fn get_serial_number(&self) -> String { self.inner.get_serial_number() }
+    fn get_gsa_hardware_headers(&self) -> HashMap<String, String> { self.inner.get_gsa_hardware_headers() }
+    fn get_aoskit_version(&self) -> String { self.inner.get_aoskit_version() }
+    fn get_udid(&self) -> String { self.inner.get_udid() }
 }
 
 // ============================================================================
@@ -3526,9 +3502,8 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
     });
 
     // For Apple Silicon keys with a NAC relay, wrap in RelayOSConfig so
-    // generate_validation_data() calls the relay directly instead of going
-    // through open-absinthe's ValidationCtx (which leaves out_request_bytes
-    // empty and breaks upstream's Apple POST flow).
+    // generate_validation_data() calls the relay directly instead of
+    // going through the x86 emulator (which can't handle ARM keys).
     let os_config: Arc<dyn OSConfig> = if let Some(ref url) = nac_relay_url {
         let trimmed = url.trim_end_matches('/');
         let relay_url = if trimmed.ends_with("/validation-data") {
