@@ -43,7 +43,27 @@ use std::sync::RwLock;
 // our `anisette::BridgeAnisetteProvider`, which reuses upstream's
 // `AnisetteClient::new`/`get_headers` but substitutes our own provisioning
 // dance to avoid upstream's closed `ProvisionInput` enum (see `anisette.rs`).
+#[cfg(target_os = "macos")]
 pub type BridgeDefaultAnisetteProvider = omnisette::DefaultAnisetteProvider;
+#[cfg(not(target_os = "macos"))]
+pub type BridgeDefaultAnisetteProvider = anisette::BridgeAnisetteProvider;
+
+#[cfg(target_os = "macos")]
+fn bridge_default_provider(
+    info: omnisette::LoginClientInfo,
+    path: PathBuf,
+) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
+    default_provider(info, path)
+}
+#[cfg(not(target_os = "macos"))]
+fn bridge_default_provider(
+    info: omnisette::LoginClientInfo,
+    path: PathBuf,
+) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
+    std::sync::Arc::new(tokio::sync::Mutex::new(omnisette::AnisetteClient::new(
+        anisette::BridgeAnisetteProvider::new(info, path),
+    )))
+}
 use tokio::sync::broadcast;
 use util::{plist_from_string, plist_to_string};
 
