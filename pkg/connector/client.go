@@ -1093,8 +1093,17 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 
 	// Post an m.notice in the DM portal — this is what actually shows up in
 	// Beeper as the inline "notifications silenced" indicator.
+	// Use the full DM resolution chain (normalize → contact merge → phone
+	// variant) to match the same portal ID that makePortalKey would produce.
+	normalizedUser := normalizeIdentifierForPortalID(user)
+	portalID := c.resolveContactPortalID(normalizedUser)
+	portalID = c.resolveExistingDMPortalID(string(portalID))
+	log.Debug().
+		Str("normalized_user", normalizedUser).
+		Str("resolved_portal_id", string(portalID)).
+		Msg("StatusKit: resolved DM portal ID")
 	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-		ID:       networkid.PortalID(user),
+		ID:       portalID,
 		Receiver: c.UserLogin.ID,
 	})
 	if err != nil {
@@ -1102,7 +1111,9 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		return
 	}
 	if portal == nil || portal.MXID == "" {
-		log.Debug().Msg("No DM portal found for presence notice")
+		log.Warn().
+			Str("portal_id", string(portalID)).
+			Msg("No DM portal with MXID found for presence notice")
 		return
 	}
 
