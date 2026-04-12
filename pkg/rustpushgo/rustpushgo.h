@@ -1013,6 +1013,11 @@ void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_export_state_json(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_get_known_handles(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_invite_to_channel(
 	void* ptr,
 	RustBuffer sender_handle,
@@ -2047,6 +2052,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_ensure_channel
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_export_state_json(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_get_known_handles(
 	RustCallStatus* out_status
 );
 

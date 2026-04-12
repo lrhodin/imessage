@@ -1141,12 +1141,45 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		log.Warn().Err(err).Msg("Failed to look up DM portal for presence notice")
 		return
 	}
-	if portal == nil || portal.MXID == "" {
-		log.Warn().
-			Str("portal_id", string(portalID)).
-			Msg("No DM portal with MXID found for presence notice")
-		return
-	}
+		if portal == nil || portal.MXID == "" {
+			// If the portal lookup failed (common for mailto: handles whose DM
+			// portal was created under a tel: handle), try all other handles
+			// from the StatusKit state. A contact may have both
+			// mailto:user@icloud.com and tel:+1... channels — their DM portal
+			// is likely under the tel: handle.
+			if c.client != nil {
+				sk, skErr := c.client.GetStatuskitClient()
+				if skErr == nil && sk != nil {
+					for _, handle := range sk.GetKnownHandles() {
+						if handle == user {
+							continue // already tried
+						}
+						altNormalized := normalizeIdentifierForPortalID(handle)
+						altPortalID := c.resolveContactPortalID(altNormalized)
+						altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
+						altPortal, altErr := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+							ID:       altPortalID,
+							Receiver: c.UserLogin.ID,
+						})
+						if altErr == nil && altPortal != nil && altPortal.MXID != "" {
+							log.Info().
+								Str("original", normalizedUser).
+								Str("alt_handle", handle).
+								Str("alt_portal_id", string(altPortalID)).
+								Msg("StatusKit: resolved DM portal via alternate handle")
+							portal = altPortal
+							break
+						}
+					}
+				}
+			}
+			if portal == nil || portal.MXID == "" {
+				log.Warn().
+					Str("portal_id", string(portalID)).
+					Msg("No DM portal with MXID found for presence notice")
+				return
+			}
+		}
 
 	name := ghost.Name
 	if name == "" {

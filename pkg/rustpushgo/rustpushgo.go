@@ -1636,6 +1636,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_get_known_handles(uniffiStatus)
+		})
+		if checksum != 9296 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_get_known_handles: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_invite_to_channel(uniffiStatus)
 		})
 		if checksum != 51991 {
@@ -5734,6 +5743,30 @@ func (_self *WrappedStatusKitClient) ExportStateJson() (string, error) {
 			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
 		},
 		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *WrappedStatusKitClient) GetKnownHandles() []string {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedStatusKitClient")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithResult(func(status *C.RustCallStatus) *C.void {
+		// rustFutureFunc
+		return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedstatuskitclient_get_known_handles(
+			_pointer,
+			status,
+		))
+	},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterSequenceStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
 		})

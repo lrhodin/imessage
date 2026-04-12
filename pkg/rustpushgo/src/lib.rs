@@ -4448,6 +4448,42 @@ impl WrappedStatusKitClient {
         self.inner.reset_keys().await;
     }
 
+    /// Returns all known contact handles from the StatusKit shared device state.
+    /// Each entry is a "from" handle (e.g. "mailto:user@icloud.com" or "tel:+1...")
+    /// associated with a StatusKit channel. Used by the Go layer to resolve
+    /// mailto: handles to their tel: counterpart when the DM portal was created
+    /// under the phone number.
+    ///
+    /// Since upstream's StatusKitSharedDevice::from is private, this reads
+    /// the plist file directly and extracts the "from" strings.
+    pub async fn get_known_handles(&self) -> Vec<String> {
+        let state_path = subsystem_state_path("statuskit-state.plist");
+        let data = match std::fs::read(&state_path) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        // Parse the plist and extract "from" values from the keys dict.
+        // The plist structure is: keys -> { channel_id -> { from: "..." } }
+        let value = match plist::from_bytes::<plist::Value>(&data) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        let Some(dict) = value.as_dictionary() else { return Vec::new() };
+        let Some(keys_dict) = dict.get("keys") else { return Vec::new() };
+        let Some(keys_dict) = keys_dict.as_dictionary() else { return Vec::new() };
+
+        let mut handles = Vec::new();
+        for (_channel_id, entry) in keys_dict {
+            let Some(entry_dict) = entry.as_dictionary() else { continue };
+            if let Some(from_val) = entry_dict.get("from") {
+                if let Some(from_str) = from_val.as_string() {
+                    handles.push(from_str.to_string());
+                }
+            }
+        }
+        handles
+    }
+
     pub async fn share_status(&self, active: bool, mode: Option<String>) -> Result<(), WrappedError> {
         let status = if active {
             rustpush::statuskit::StatusKitStatus::new_active()
