@@ -1073,15 +1073,15 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	} else if mode != nil && *mode != "" {
 		statusMsg = *mode
 	}
-	log.Debug().
-		Str("presence", string(presence)).
+	log.Info().
+		Bool("available", available).
 		Str("status_msg", statusMsg).
-		Msg("Received iMessage presence update")
+		Msg("StatusKit: received presence update")
 
 	ctx := context.Background()
 	ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
 	if err != nil || ghost == nil || ghost.Intent == nil {
-		log.Debug().Err(err).Msg("No ghost found for presence update — ignoring")
+		log.Warn().Err(err).Msg("No ghost found for presence update — ignoring")
 		return
 	}
 
@@ -1102,7 +1102,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	normalizedUser := normalizeIdentifierForPortalID(user)
 	portalID := c.resolveContactPortalID(normalizedUser)
 	portalID = c.resolveExistingDMPortalID(string(portalID))
-	log.Debug().
+	log.Info().
 		Str("normalized_user", normalizedUser).
 		Str("resolved_portal_id", string(portalID)).
 		Msg("StatusKit: resolved DM portal ID")
