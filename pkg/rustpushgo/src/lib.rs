@@ -5363,6 +5363,53 @@ impl Client {
         info!("Unsubscribed from all presence channels");
     }
 
+    /// Reset all StatusKit APNs channel cursors (last_msg_ns) to 1 in the
+    /// persisted state file. Must be called BEFORE init_statuskit() so the
+    /// StatusKit client loads the reset cursors on startup. Resetting to 1
+    /// causes Apple's APNs server to replay the most recently published status
+    /// for each channel (within the 7-day retention window), allowing the
+    /// bridge to learn the current presence of contacts on startup instead of
+    /// waiting for the next change. Keys and channel identifiers are preserved.
+    pub fn reset_statuskit_cursors(&self) {
+        let state_path = subsystem_state_path("statuskit-state.plist");
+        let mut state = read_plist_state::<rustpush::statuskit::StatusKitState>(&state_path)
+            .unwrap_or_default();
+        let count = state.recent_channels.len();
+        for ch in state.recent_channels.iter_mut() {
+            ch.last_msg_ns = 1;
+        }
+        persist_plist_state(&state_path, &state);
+        info!("Reset {} StatusKit channel cursor(s) to 1 for replay", count);
+    }
+
+    /// Send our StatusKit key to the specified contact handles (via IDS
+    /// keysharing), establishing the mutual key exchange needed to receive
+    /// their Focus/DND status updates. Should be called after init_statuskit()
+    /// for handles that are not yet in the persisted key state. When the
+    /// contact's device receives our key, it should respond by sending its own
+    /// key, which the receive loop stores in the StatusKit state.
+    pub async fn invite_to_status_sharing(
+        &self,
+        sender_handle: String,
+        handles: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        let sk = self.shared_statuskit.read().await.clone().ok_or(WrappedError::GenericError {
+            msg: "StatusKit not initialized".into(),
+        })?;
+
+        let config_map: std::collections::HashMap<String, rustpush::statuskit::StatusKitPersonalConfig> =
+            handles.iter()
+                .map(|h| (h.clone(), rustpush::statuskit::StatusKitPersonalConfig {
+                    allowed_modes: vec![],
+                }))
+                .collect();
+
+        info!("StatusKit: inviting {} handle(s) to key exchange", handles.len());
+        sk.invite_to_channel(&sender_handle, config_map).await.map_err(|e| WrappedError::GenericError {
+            msg: format!("StatusKit invite_to_channel failed: {:?}", e),
+        })
+    }
+
     /// Fetch a shared iMessage profile (Name & Photo Sharing) from CloudKit.
     /// `record_key` and `decryption_key` are obtained from an incoming
     /// ShareProfile / UpdateProfile message.
