@@ -4845,6 +4845,30 @@ pub async fn new_client(
                             continue;
                         }
                         Ok(None) => {} // not a StatusKit message — fall through
+                        Err(rustpush::PushError::VerificationFailed) => {
+                            warn!("StatusKit signature verification failed — clearing stale channel keys");
+                            // Extract the channel ID from the APS message and
+                            // remove that channel's shared keys from the in-memory
+                            // state. This is a purely local operation — no API
+                            // calls to Apple. The next key-sharing IDS message
+                            // will repopulate the keys automatically. We also
+                            // persist the updated state so the cleared keys
+                            // survive a restart.
+                            if let rustpush::APSMessage::Notification { channel: Some(ch), .. } = &msg {
+                                let ch_id_b64 = base64_encode(&ch.id);
+                                let mut state = sk.state.write().await;
+                                if state.keys.remove(&ch_id_b64).is_some() {
+                                    info!(
+                                        "Cleared stale StatusKit channel keys for {} — \
+                                         fresh keys will be obtained from the next key-sharing message",
+                                        ch_id_b64
+                                    );
+                                    let state_path = subsystem_state_path("statuskit-state.plist");
+                                    persist_plist_state(&state_path, &*state);
+                                }
+                                drop(state);
+                            }
+                        }
                         Err(e) => {
                             warn!("StatusKit handle error: {:?}", e);
                         }

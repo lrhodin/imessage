@@ -6789,10 +6789,42 @@ func (c *IMClient) ensureDoublePuppet() {
 
 // resolveExistingDMPortalID prefers an already-created DM portal key variant
 // (e.g. legacy tel:1415... vs canonical tel:+1415...) to avoid splitting rooms
-// when normalization rules change.
+// when normalization rules change. For mailto: identifiers, it also tries
+// the contact's phone-based portal IDs (since StatusKit may report the email
+// handle while the DM portal was created under the phone handle).
 func (c *IMClient) resolveExistingDMPortalID(identifier string) networkid.PortalID {
 	defaultID := networkid.PortalID(identifier)
-	if identifier == "" || strings.Contains(identifier, ",") || !strings.HasPrefix(identifier, "tel:") {
+	if identifier == "" || strings.Contains(identifier, ",") {
+		return defaultID
+	}
+
+	// For mailto: identifiers, try the contact's other handles (phone numbers)
+	// since the DM portal may have been created under a tel: handle.
+	if strings.HasPrefix(identifier, "mailto:") {
+		contact := c.lookupContact(identifier)
+		if contact != nil {
+			ctx := context.Background()
+			for _, altID := range contactPortalIDs(contact) {
+				if altID == identifier {
+					continue
+				}
+				portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+					ID:       networkid.PortalID(altID),
+					Receiver: c.UserLogin.ID,
+				})
+				if err == nil && portal != nil && portal.MXID != "" {
+					c.UserLogin.Log.Debug().
+						Str("original", identifier).
+						Str("resolved", altID).
+						Msg("Resolved mailto: DM portal to existing contact portal")
+					return networkid.PortalID(altID)
+				}
+			}
+		}
+		return defaultID
+	}
+
+	if !strings.HasPrefix(identifier, "tel:") {
 		return defaultID
 	}
 
