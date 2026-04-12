@@ -83,6 +83,12 @@ open-absinthe = { path = "../../third_party/rustpush-upstream/open-absinthe", fe
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 icloud_auth = { path = "../../third_party/rustpush-upstream/apple-private-apis/icloud-auth", default-features = false, features = ["remote-anisette-v3"] }
 omnisette = { path = "../../third_party/rustpush-upstream/apple-private-apis/omnisette", default-features = false, features = ["remote-anisette-v3"] }
+# WebSocket + datetime + futures adapters for the wrapper-level anisette
+# pre-provisioner (see src/anisette.rs). Versions match upstream omnisette
+# exactly so cargo feature unification doesn't double up crates.
+tokio-tungstenite = { version = "0.20.1", features = ["rustls-tls-webpki-roots"] }
+chrono = "0.4.37"
+futures-util = "0.3.28"
 
 [build-dependencies]
 uniffi = { version = "0.25.0", features = ["build"] }

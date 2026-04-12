@@ -1,6 +1,8 @@
 pub mod util;
 #[cfg(target_os = "macos")]
 pub mod local_config;
+#[cfg(not(target_os = "macos"))]
+pub mod anisette;
 #[cfg(test)]
 mod test_hwinfo;
 
@@ -29,6 +31,44 @@ use rustpush::{
 use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
 use omnisette::default_provider;
 use std::sync::RwLock;
+
+// ============================================================================
+// Anisette provider selection
+// ============================================================================
+//
+// `BridgeDefaultAnisetteProvider` is the concrete `AnisetteProvider` type used
+// by every rustpush client that's parameterized over one (AppleAccount,
+// KeychainClient, CloudKitClient, TokenProvider, etc.). On macOS this is
+// upstream's `AOSKitAnisetteProvider` (native, untouched). On Linux this is
+// our `anisette::BridgeAnisetteProvider`, which reuses upstream's
+// `AnisetteClient::new`/`get_headers` but substitutes our own provisioning
+// dance to avoid upstream's closed `ProvisionInput` enum (see `anisette.rs`).
+#[cfg(target_os = "macos")]
+pub type BridgeDefaultAnisetteProvider = omnisette::DefaultAnisetteProvider;
+#[cfg(not(target_os = "macos"))]
+pub type BridgeDefaultAnisetteProvider = anisette::BridgeAnisetteProvider;
+
+/// Construct a fresh `ArcAnisetteClient<BridgeDefaultAnisetteProvider>`.
+/// On macOS this delegates to upstream `default_provider` verbatim. On
+/// Linux it wraps our own `BridgeAnisetteProvider` in upstream's
+/// `AnisetteClient` wrapper so the resulting shape matches what every
+/// rustpush client expects.
+#[cfg(target_os = "macos")]
+fn bridge_default_provider(
+    info: omnisette::LoginClientInfo,
+    path: PathBuf,
+) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
+    default_provider(info, path)
+}
+#[cfg(not(target_os = "macos"))]
+fn bridge_default_provider(
+    info: omnisette::LoginClientInfo,
+    path: PathBuf,
+) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
+    std::sync::Arc::new(tokio::sync::Mutex::new(omnisette::AnisetteClient::new(
+        anisette::BridgeAnisetteProvider::new(info, path),
+    )))
+}
 use tokio::sync::broadcast;
 use util::{plist_from_string, plist_to_string};
 
@@ -1011,7 +1051,7 @@ fn keychain_retry_delay(attempt: usize) -> Duration {
 /// This mirrors what master's rustpush fork achieves by ignoring self-exclusion
 /// inside `fast_forward_trust`, but implemented entirely at the wrapper layer.
 async fn recover_keychain_after_exclusion(
-    keychain: &rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>,
+    keychain: &rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>,
     context: &str,
 ) -> Result<(), WrappedError> {
     // Step 1: attempt TLK share refresh (best-effort; doesn't need clique membership).
@@ -1055,7 +1095,7 @@ async fn recover_keychain_after_exclusion(
 }
 
 async fn sync_keychain_with_retries(
-    keychain: &rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>,
+    keychain: &rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>,
     max_attempts: usize,
     context: &str,
 ) -> Result<(), WrappedError> {
@@ -1101,7 +1141,7 @@ async fn sync_keychain_with_retries(
 }
 
 async fn refresh_recoverable_tlk_shares(
-    keychain: &Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
+    keychain: &Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
     context: &str,
 ) -> Result<(), WrappedError> {
     let identity_opt = {
@@ -1131,8 +1171,8 @@ async fn refresh_recoverable_tlk_shares(
 }
 
 async fn finalize_keychain_setup_with_probe(
-    keychain: Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
-    cloudkit: Arc<rustpush::cloudkit::CloudKitClient<omnisette::DefaultAnisetteProvider>>,
+    keychain: Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
+    cloudkit: Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
     max_attempts: usize,
 ) -> Result<(), WrappedError> {
     let cloud_messages = rustpush::cloud_messages::CloudMessagesClient::new(cloudkit, keychain.clone());
@@ -1277,8 +1317,8 @@ pub struct EscrowDeviceInfo {
 /// we pass them in at construction time and read from our own state.
 #[derive(uniffi::Object)]
 pub struct WrappedTokenProvider {
-    inner: Arc<TokenProvider<omnisette::DefaultAnisetteProvider>>,
-    account: Arc<rustpush::DebugMutex<AppleAccount<omnisette::DefaultAnisetteProvider>>>,
+    inner: Arc<TokenProvider<BridgeDefaultAnisetteProvider>>,
+    account: Arc<rustpush::DebugMutex<AppleAccount<BridgeDefaultAnisetteProvider>>>,
     os_config: Arc<dyn OSConfig>,
     // MobileMe delegate stored as opaque plist XML bytes because
     // `rustpush::auth::MobileMeDelegateResponse` is not nameable from outside the
@@ -1298,8 +1338,8 @@ pub struct WrappedTokenProvider {
 async fn create_keychain_clients(
     wp: &WrappedTokenProvider,
 ) -> Result<(
-    Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
-    Arc<rustpush::cloudkit::CloudKitClient<omnisette::DefaultAnisetteProvider>>,
+    Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
+    Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
 ), WrappedError> {
     let (dsid, adsid, anisette) = {
         let account = wp.account.lock().await;
@@ -1394,8 +1434,8 @@ fn extract_device_info(meta: &rustpush::keychain::EscrowMetadata) -> (String, St
 /// Core keychain joining logic used by both join_keychain_clique and join_keychain_clique_for_device.
 /// If `preferred_index` is Some, the bottle at that index is tried first before falling back to others.
 async fn join_keychain_with_bottles(
-    keychain: Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
-    cloudkit: Arc<rustpush::cloudkit::CloudKitClient<omnisette::DefaultAnisetteProvider>>,
+    keychain: Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
+    cloudkit: Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
     bottles: &[(rustpush::cloudkit_proto::EscrowData, rustpush::keychain::EscrowMetadata)],
     passcode: &str,
     preferred_index: Option<u32>,
@@ -1662,7 +1702,7 @@ impl WrappedTokenProvider {
     }
 
     /// Clone the shared AppleAccount handle.
-    pub(crate) fn get_account(&self) -> Arc<rustpush::DebugMutex<AppleAccount<omnisette::DefaultAnisetteProvider>>> {
+    pub(crate) fn get_account(&self) -> Arc<rustpush::DebugMutex<AppleAccount<BridgeDefaultAnisetteProvider>>> {
         self.account.clone()
     }
 
@@ -1785,9 +1825,13 @@ pub async fn restore_token_provider(
     let os_config = config.config.clone();
     let conn = connection.inner.clone();
 
-    // Create a fresh anisette provider
+    // Create a fresh anisette provider. On Linux the
+    // `BridgeAnisetteProvider` owns provisioning and bypasses upstream's
+    // broken `ProvisionInput` enum entirely (see src/anisette.rs). On
+    // macOS this is upstream's native AOSKit path, unchanged.
     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
-    let anisette = default_provider(client_info.clone(), PathBuf::from_str("state/anisette").unwrap());
+    let anisette_state_path = PathBuf::from_str("state/anisette").unwrap();
+    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path);
 
     // Create a new AppleAccount and populate it with persisted state
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
@@ -3424,7 +3468,7 @@ pub async fn connect(
 /// Login session object that holds state between login steps.
 #[derive(uniffi::Object)]
 pub struct LoginSession {
-    account: tokio::sync::Mutex<Option<AppleAccount<omnisette::DefaultAnisetteProvider>>>,
+    account: tokio::sync::Mutex<Option<AppleAccount<BridgeDefaultAnisetteProvider>>>,
     username: String,
     password_hash: Vec<u8>,
     needs_2fa: bool,
@@ -3454,7 +3498,12 @@ pub async fn login_start(
     let anisette_state_path = PathBuf::from_str("state/anisette").unwrap();
     let state_plist = anisette_state_path.join("state.plist");
     info!("login_start: anisette state path={:?} exists={}", state_plist, state_plist.exists());
-    let anisette = default_provider(client_info.clone(), anisette_state_path);
+
+    // `bridge_default_provider` returns upstream's AOSKit path on macOS
+    // and our `BridgeAnisetteProvider` on Linux; the latter owns
+    // provisioning end-to-end so upstream's broken `ProvisionInput` enum
+    // is never reached (see src/anisette.rs).
+    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path);
 
     let mut account = AppleAccount::new_with_anisette(client_info, anisette)
         .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
@@ -3988,7 +4037,7 @@ async fn download_icon_change_photo(
 
 #[derive(uniffi::Object)]
 pub struct WrappedFindMyClient {
-    inner: Arc<rustpush::findmy::FindMyClient<omnisette::DefaultAnisetteProvider>>,
+    inner: Arc<rustpush::findmy::FindMyClient<BridgeDefaultAnisetteProvider>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -4176,7 +4225,7 @@ impl WrappedFaceTimeClient {
 
 #[derive(uniffi::Object)]
 pub struct WrappedPasswordsClient {
-    inner: Arc<rustpush::passwords::PasswordManager<omnisette::DefaultAnisetteProvider>>,
+    inner: Arc<rustpush::passwords::PasswordManager<BridgeDefaultAnisetteProvider>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -4284,7 +4333,7 @@ impl WrappedPasswordsClient {
 
 #[derive(uniffi::Object)]
 pub struct WrappedStatusKitClient {
-    inner: Arc<rustpush::statuskit::StatusKitClient<omnisette::DefaultAnisetteProvider>>,
+    inner: Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>,
     interests: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
 }
 
@@ -4385,7 +4434,7 @@ impl WrappedStatusKitClient {
 
 #[derive(uniffi::Object)]
 pub struct WrappedSharedStreamsClient {
-    inner: Arc<rustpush::sharedstreams::SharedStreamClient<omnisette::DefaultAnisetteProvider>>,
+    inner: Arc<rustpush::sharedstreams::SharedStreamClient<BridgeDefaultAnisetteProvider>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -4503,8 +4552,8 @@ pub struct Client {
     os_config: Arc<dyn OSConfig>,
     receive_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     token_provider: Option<Arc<WrappedTokenProvider>>,
-    cloud_messages_client: tokio::sync::Mutex<Option<Arc<rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>>>>,
-    cloud_keychain_client: tokio::sync::Mutex<Option<Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>>>,
+    cloud_messages_client: tokio::sync::Mutex<Option<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>>>,
+    cloud_keychain_client: tokio::sync::Mutex<Option<Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>>>,
     findmy_client: tokio::sync::Mutex<Option<Arc<WrappedFindMyClient>>>,
     facetime_client: tokio::sync::Mutex<Option<Arc<WrappedFaceTimeClient>>>,
     passwords_client: tokio::sync::Mutex<Option<Arc<WrappedPasswordsClient>>>,
@@ -4764,7 +4813,7 @@ pub async fn new_client(
 }
 
 impl Client {
-    async fn get_or_init_cloud_messages_client(&self) -> Result<Arc<rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>>, WrappedError> {
+    async fn get_or_init_cloud_messages_client(&self) -> Result<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
         let mut locked = self.cloud_messages_client.lock().await;
         if let Some(client) = &*locked {
             return Ok(client.clone());
@@ -4896,7 +4945,7 @@ impl Client {
         Ok(cloud_messages)
     }
 
-    async fn get_or_init_cloud_keychain_client(&self) -> Result<Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>, WrappedError> {
+    async fn get_or_init_cloud_keychain_client(&self) -> Result<Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
         let _ = self.get_or_init_cloud_messages_client().await?;
         self.cloud_keychain_client
             .lock()
@@ -8471,7 +8520,7 @@ impl Client {
     /// instead of re-fetching, which saves a CloudKit round-trip per download.
     async fn cloud_download_attachment_ford_recovery_with_record(
         &self,
-        container: Arc<rustpush::cloudkit::CloudKitOpenContainer<'static, omnisette::DefaultAnisetteProvider>>,
+        container: Arc<rustpush::cloudkit::CloudKitOpenContainer<'static, BridgeDefaultAnisetteProvider>>,
         records: rustpush::cloudkit::FetchedRecords,
         base_record: CloudAttachmentWithAvid,
         record_name: &str,
@@ -8580,7 +8629,7 @@ impl Client {
     #[allow(dead_code)]
     async fn cloud_download_attachment_ford_recovery(
         &self,
-        cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>,
+        cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>,
         record_name: &str,
     ) -> Result<Vec<u8>, WrappedError> {
         use futures::FutureExt;
@@ -8704,7 +8753,7 @@ impl Client {
     /// the CloudKit record endpoint per attempt.
     async fn cloud_download_avid_ford_recovery(
         &self,
-        container: Arc<rustpush::cloudkit::CloudKitOpenContainer<'static, omnisette::DefaultAnisetteProvider>>,
+        container: Arc<rustpush::cloudkit::CloudKitOpenContainer<'static, BridgeDefaultAnisetteProvider>>,
         records: &rustpush::cloudkit::FetchedRecords,
         base_record: CloudAttachmentWithAvid,
         record_name: &str,
@@ -8798,7 +8847,7 @@ impl Client {
 /// vendored sync_messages path. This lets cloud_fetch_recent_messages find recent
 /// messages in the first ~50 pages instead of requiring 200+ oldest-first pages.
 async fn fetch_main_zone_page_newest_first(
-    cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>,
+    cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>,
     token: Option<Vec<u8>>,
 ) -> Result<(Vec<u8>, HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), rustpush::PushError> {
     use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
@@ -8880,7 +8929,7 @@ impl Drop for Client {
 /// Replicates sync_records logic for "messageManateeZone" but handles None proto fields
 /// gracefully (no .unwrap()) and wraps from_record_encrypted in catch_unwind per record.
 async fn sync_messages_fallback(
-    cloud_messages: &Arc<rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>>,
+    cloud_messages: &Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>,
     token: Option<Vec<u8>>,
 ) -> Result<(Vec<u8>, HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), rustpush::PushError> {
     use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
