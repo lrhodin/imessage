@@ -206,43 +206,70 @@ impl AnisetteProvider for BridgeAnisetteProvider {
     ) -> impl std::future::Future<Output = Result<HashMap<String, String>, AnisetteError>> + Send
     {
         async move {
-            // === Primary path: delegate to upstream (same as master) ===
-            let mut upstream = RemoteAnisetteProviderV3::new(
-                ANISETTE_URL.to_string(),
-                self.info.clone(),
-                self.state_path.clone(),
-            );
-            match upstream.get_anisette_headers().await {
-                Ok(headers) => return Ok(headers),
-                Err(AnisetteError::SerdeError(ref e)) => {
-                    // Upstream's ProvisionInput enum hit an unknown variant
-                    // (e.g. EndProvisioningError). Fall back to our dance.
-                    warn!(
-                        "anisette: upstream provision serde crash ({}), falling back",
-                        e
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-
-            // === Fallback: our own provision with loose JSON parsing ===
-            let mut state = FallbackState::fresh();
-            fallback_provision(&self.info, &mut state).await?;
-
-            // Write state.plist in upstream's format so next call skips provision.
             fs::create_dir_all(&self.state_path)?;
             let state_plist = self.state_path.join("state.plist");
-            plist::to_file_xml(&state_plist, &state).map_err(AnisetteError::PlistError)?;
-            info!("anisette: wrote fallback state to {}", state_plist.display());
 
-            // Now delegate to upstream again — it'll read our state.plist,
-            // see is_provisioned(), skip provision, and just call get_headers.
-            let mut upstream2 = RemoteAnisetteProviderV3::new(
-                ANISETTE_URL.to_string(),
-                self.info.clone(),
-                self.state_path.clone(),
-            );
-            upstream2.get_anisette_headers().await
+            // Load or create state.
+            let mut state: FallbackState = if state_plist.exists() {
+                match plist::from_file(&state_plist) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("anisette: failed to read state.plist ({}), regenerating", e);
+                        FallbackState::fresh()
+                    }
+                }
+            } else {
+                FallbackState::fresh()
+            };
+
+            // Provision if needed — our own dance, not upstream's (which
+            // has an infinite loop on WS drop and crashes on unknown variants).
+            if state.adi_pb.is_none() {
+                let mut last_err = None;
+                for attempt in 1..=2 {
+                    match fallback_provision(&self.info, &mut state).await {
+                        Ok(()) => {
+                            plist::to_file_xml(&state_plist, &state)
+                                .map_err(AnisetteError::PlistError)?;
+                            info!("anisette: provisioned, wrote state to {}", state_plist.display());
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("anisette: provision attempt {}/2 failed: {}", attempt, e);
+                            last_err = Some(e);
+                            if attempt < 2 {
+                                state = FallbackState::fresh();
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            }
+                        }
+                    }
+                }
+                if state.adi_pb.is_none() {
+                    return Err(last_err.unwrap());
+                }
+            }
+
+            // Use upstream's AnisetteClient::get_headers for the actual
+            // header fetch (no provisioning needed — we already did it).
+            let client = AnisetteClient::new(ANISETTE_URL.to_string(), self.info.clone()).await?;
+            let upstream_state: omnisette::remote_anisette_v3::AnisetteState =
+                plist::from_file(&state_plist).map_err(AnisetteError::PlistError)?;
+            match client.get_headers(&upstream_state).await {
+                Ok(data) => Ok(data.get_headers()),
+                Err(AnisetteError::AnisetteNotProvisioned) => {
+                    // State expired — re-provision and retry.
+                    warn!("anisette: state expired, re-provisioning");
+                    state = FallbackState::fresh();
+                    fallback_provision(&self.info, &mut state).await?;
+                    plist::to_file_xml(&state_plist, &state)
+                        .map_err(AnisetteError::PlistError)?;
+                    let upstream_state: omnisette::remote_anisette_v3::AnisetteState =
+                        plist::from_file(&state_plist).map_err(AnisetteError::PlistError)?;
+                    let data = client.get_headers(&upstream_state).await?;
+                    Ok(data.get_headers())
+                }
+                Err(e) => Err(e),
+            }
         }
     }
 }
