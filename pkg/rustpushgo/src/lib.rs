@@ -801,38 +801,69 @@ mod manual_ford {
 // `nac-validation`) — same integration pattern, just over HTTPS to a
 // Mac running `tools/nac-relay`.
 
-/// Fetch validation data from the NAC relay and stash it in open-absinthe
-/// so that `ValidationCtx::sign()` returns it instead of the emulator's
-/// NACSign output. Called before any upstream function that triggers
-/// `generate_validation_data()`.
-async fn prefetch_relay_validation_data(url: &str, token: Option<&str>) -> Result<(), WrappedError> {
-    use base64::{Engine, engine::general_purpose::STANDARD};
+// ---------------------------------------------------------------------------
+// RelayOSConfig — wraps MacOSConfig for Apple Silicon hardware keys.
+//
+// Copies master's relay logic: generate_validation_data() calls the relay
+// directly and returns the data, bypassing the Apple handshake entirely.
+// All other OSConfig methods delegate to the inner MacOSConfig.
+// ---------------------------------------------------------------------------
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to build relay client: {e}") })?;
+struct RelayOSConfig {
+    inner: Arc<rustpush::macos::MacOSConfig>,
+    relay_url: String,
+    relay_token: Option<String>,
+}
 
-    let mut req = client.post(url);
-    if let Some(tok) = token {
-        req = req.header("Authorization", format!("Bearer {tok}"));
+#[async_trait::async_trait]
+impl OSConfig for RelayOSConfig {
+    fn build_activation_info(&self, csr: Vec<u8>) -> rustpush::activation::ActivationInfo {
+        self.inner.build_activation_info(csr)
     }
+    fn get_activation_device(&self) -> String { self.inner.get_activation_device() }
+    async fn generate_validation_data(&self) -> Result<Vec<u8>, rustpush::PushError> {
+        // Same logic as master's MacOSConfig relay path: call relay, return directly.
+        use base64::{Engine, engine::general_purpose::STANDARD};
 
-    let resp = req.send().await
-        .map_err(|e| WrappedError::GenericError { msg: format!("NAC relay request failed: {e}") })?;
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|e| rustpush::PushError::RelayError(0, format!("Failed to build relay client: {e}")))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(WrappedError::GenericError { msg: format!("NAC relay error ({}): {body}", status) });
+        let mut req = client.post(&self.relay_url);
+        if let Some(ref token) = self.relay_token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req.send().await
+            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(rustpush::PushError::RelayError(status, format!("NAC relay error: {body}")));
+        }
+        let b64 = resp.text().await
+            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay read error: {e}")))?;
+        let data = STANDARD.decode(b64.trim())
+            .map_err(|e| rustpush::PushError::RelayError(0, format!("NAC relay base64 decode: {e}")))?;
+        info!("NAC relay: got {} bytes of validation data from {}", data.len(), self.relay_url);
+        Ok(data)
     }
-    let b64 = resp.text().await
-        .map_err(|e| WrappedError::GenericError { msg: format!("NAC relay read error: {e}") })?;
-    let data = STANDARD.decode(b64.trim())
-        .map_err(|e| WrappedError::GenericError { msg: format!("NAC relay base64 decode: {e}") })?;
-    info!("NAC relay: pre-fetched {} bytes of validation data", data.len());
-    open_absinthe::nac::set_prefetched_validation_data(data);
-    Ok(())
+    fn get_protocol_version(&self) -> u32 { self.inner.get_protocol_version() }
+    fn get_register_meta(&self) -> rustpush::RegisterMeta { self.inner.get_register_meta() }
+    fn get_normal_ua(&self, item: &str) -> String { self.inner.get_normal_ua(item) }
+    fn get_mme_clientinfo(&self, for_item: &str) -> String { self.inner.get_mme_clientinfo(for_item) }
+    fn get_version_ua(&self) -> String { self.inner.get_version_ua() }
+    fn get_device_name(&self) -> String { self.inner.get_device_name() }
+    fn get_device_uuid(&self) -> String { self.inner.get_device_uuid() }
+    fn get_private_data(&self) -> plist::Dictionary { self.inner.get_private_data() }
+    fn get_debug_meta(&self) -> rustpush::DebugMeta { self.inner.get_debug_meta() }
+    fn get_login_url(&self) -> &'static str { self.inner.get_login_url() }
+    fn get_serial_number(&self) -> String { self.inner.get_serial_number() }
+    fn get_gsa_hardware_headers(&self) -> HashMap<String, String> { self.inner.get_gsa_hardware_headers() }
+    fn get_aoskit_version(&self) -> String { self.inner.get_aoskit_version() }
+    fn get_udid(&self) -> String { self.inner.get_udid() }
 }
 
 // ============================================================================
@@ -3434,14 +3465,6 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
     }
     let device_id = hw_uuid;
 
-    // For Apple Silicon keys, register the relay so ValidationCtx::new()
-    // takes the relay path (avoiding the emulator which can't handle ARM keys).
-    // The relay URL/token are also stored on WrappedOSConfig so the bridge
-    // can pre-fetch validation data before upstream calls.
-    if let Some(ref url) = nac_relay_url {
-        open_absinthe::nac::set_relay_config(url.clone(), relay_token.clone(), relay_cert_fp.clone());
-        log::info!("NAC relay configured: {}", url);
-    }
     let _ = relay_cert_fp;
 
     // Build upstream's MacOSConfig with only the fields it has — relay
@@ -3458,21 +3481,29 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
         udid: Some(device_id),
     });
 
-    // Normalize relay URL if present
-    let relay_url = nac_relay_url.map(|url| {
+    // For Apple Silicon keys with a relay, wrap in RelayOSConfig so
+    // generate_validation_data() calls the relay directly — same as master.
+    let os_config: Arc<dyn OSConfig> = if let Some(url) = nac_relay_url {
         let trimmed = url.trim_end_matches('/');
-        if trimmed.ends_with("/validation-data") {
+        let relay_url = if trimmed.ends_with("/validation-data") {
             trimmed.to_string()
         } else {
             format!("{}/validation-data", trimmed)
-        }
-    });
+        };
+        Arc::new(RelayOSConfig {
+            inner: config,
+            relay_url,
+            relay_token: relay_token.clone(),
+        })
+    } else {
+        config
+    };
 
     Ok(Arc::new(WrappedOSConfig {
-        config,
-        has_nac_relay: relay_url.is_some(),
-        relay_url,
-        relay_token,
+        config: os_config,
+        has_nac_relay: relay_token.is_some(),
+        relay_url: None,
+        relay_token: None,
     }))
 }
 
@@ -3668,13 +3699,6 @@ impl LoginSession {
             spd_base64,
         };
 
-        // Pre-fetch relay validation data so sign() returns it instead of
-        // the emulator's NACSign output. Must be done before any upstream
-        // call that triggers generate_validation_data().
-        if let Some(ref url) = config.relay_url {
-            prefetch_relay_validation_data(url, config.relay_token.as_deref()).await?;
-        }
-
         // Request both IDS (for messaging) and MobileMe (for contacts CardDAV URL)
         let delegates = login_apple_delegates(
             &*account,
@@ -3717,9 +3741,6 @@ impl LoginSession {
                     existing
                 } else {
                     info!("Existing registration expired, must re-register");
-                    if let Some(ref url) = config.relay_url {
-                        prefetch_relay_validation_data(url, config.relay_token.as_deref()).await?;
-                    }
                     let mut users = vec![fresh_user];
                     register(
                         &*os_config,

@@ -1023,11 +1023,11 @@ impl ValidationCtx {
                         .decode(body.trim())
                         .map_err(|e| AbsintheError::Other(format!("relay base64 decode: {e}")))?;
                     info!("NAC relay: got {} bytes of validation data", validation_data.len());
-                    // Stash the relay data so sign() returns it.
-                    // Provide the cert chain as out_request_bytes —
-                    // upstream will POST these to Apple's
-                    // id-initialize-validation endpoint.
-                    *out_request_bytes = cert_chain.to_vec();
+                    // Stash the relay data for sign() and pre-fetch.
+                    // out_request_bytes left empty — the bridge
+                    // pre-fetches and uses RelayOSConfig to return
+                    // relay data directly from generate_validation_data(),
+                    // bypassing the Apple handshake entirely (same as master).
                     return Ok(ValidationCtx {
                         inner: ValidationCtxInner::Relay { validation_data },
                     });
