@@ -892,6 +892,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 			// and failed with "StatusKit not initialized". Re-run it now that
 			// the StatusKit client is guaranteed to be ready.
 			c.subscribeToContactPresence(log)
+			// Send our StatusKit key to known contacts to trigger key exchange.
+			// Wrapped in recover() in case upstream panics on missing GSA token.
+			c.inviteContactsToStatusSharing(log)
 		}
 	}()
 

@@ -778,11 +778,21 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 	if len(handles) == 0 {
 		return
 	}
-	if err := c.client.InviteToStatusSharing(c.handle, handles); err != nil {
-		log.Warn().Err(err).Int("count", len(handles)).Msg("StatusKit invite failed")
-	} else {
-		log.Info().Int("count", len(handles)).Msg("Sent StatusKit key invite to known ghosts")
-	}
+	// invite_to_channel in upstream rustpush can panic if the GSA token
+	// needed to allocate our StatusKit channel isn't available yet. Wrap
+	// in a recover so a panic here is logged but never crashes the bridge.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Warn().Interface("panic", r).Msg("StatusKit invite panicked — will retry on next restart")
+			}
+		}()
+		if err := c.client.InviteToStatusSharing(c.handle, handles); err != nil {
+			log.Warn().Err(err).Int("count", len(handles)).Msg("StatusKit invite failed")
+		} else {
+			log.Info().Int("count", len(handles)).Msg("Sent StatusKit key invite to known ghosts")
+		}
+	}()
 }
 
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
