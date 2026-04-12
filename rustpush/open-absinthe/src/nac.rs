@@ -73,6 +73,44 @@ fn get_relay_config() -> Option<RelayConfig> {
     slot.clone()
 }
 
+// ---------------------------------------------------------------------------
+// Pre-fetched validation data (Apple Silicon relay path)
+//
+// The bridge pre-fetches validation data from the relay and stashes it here.
+// sign() checks this before returning the emulator's NACSign output — if
+// set, the relay's data is authoritative and the emulator result is discarded.
+// This lets the emulator handle NACInit/KeyEstablishment (producing valid
+// request bytes for upstream's Apple handshake) while the relay provides
+// the actual signed validation data.
+// ---------------------------------------------------------------------------
+
+fn prefetched_data() -> &'static Mutex<Option<Vec<u8>>> {
+    static DATA: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
+    DATA.get_or_init(|| Mutex::new(None))
+}
+
+/// Stash pre-fetched validation data from the NAC relay.
+/// The next call to `ValidationCtx::sign()` will return this data
+/// instead of the emulator's NACSign output.
+pub fn set_prefetched_validation_data(data: Vec<u8>) {
+    info!("NAC: stashed {} bytes of pre-fetched relay validation data", data.len());
+    let mut slot = match prefetched_data().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    *slot = Some(data);
+}
+
+/// Take the pre-fetched validation data (if any). Returns None if
+/// nothing was stashed or it was already consumed.
+fn take_prefetched_validation_data() -> Option<Vec<u8>> {
+    let mut slot = match prefetched_data().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    slot.take()
+}
+
 /// Build a ureq agent that trusts the relay's self-signed TLS certificate
 /// if a fingerprint is configured. Matches the danger-accept-invalid-certs
 /// behavior the master-branch reqwest client used.
@@ -1258,6 +1296,13 @@ impl ValidationCtx {
 
     /// Generate signed validation data.
     pub fn sign(&self) -> Result<Vec<u8>, AbsintheError> {
+        // Check for pre-fetched relay data first — if the bridge stashed
+        // validation data from the NAC relay, it's authoritative.
+        if let Some(data) = take_prefetched_validation_data() {
+            info!("NAC sign: returning pre-fetched relay validation data ({} bytes)", data.len());
+            return Ok(data);
+        }
+
         let (uc, state, validation_ctx_addr) = match &self.inner {
             ValidationCtxInner::Relay { validation_data } => {
                 info!("NAC sign: returning relay validation data ({} bytes)", validation_data.len());
