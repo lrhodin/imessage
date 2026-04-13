@@ -1344,9 +1344,9 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 				},
 			}
 			batchReq := &mautrix.ReqBeeperBatchSend{
-				ForwardIfNoMessages: true,
-				SendNotification:    false,
-				Events:              []*event.Event{batchEvt},
+				Forward:          true,  // insert at end of live timeline (not as hidden backfill)
+				SendNotification: false, // suppress APNs push on Hungry
+				Events:           []*event.Event{batchEvt},
 			}
 			if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
 				batchReq.MarkReadBy = dp.GetMXID()
