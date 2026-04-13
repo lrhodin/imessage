@@ -762,6 +762,55 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 	}
 }
 
+// inviteContactsToStatusSharing sends our StatusKit key to all known ghost
+// handles via IDS keysharing. When a contact's device receives our key, it
+// responds with its own key — without this exchange the bridge device never
+// gets any contact's channel key, no APNs channel exists, and OnStatusUpdate
+// never fires. Must run after InitStatuskit so shared_statuskit is populated.
+func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
+	if c.client == nil || c.handle == "" {
+		return
+	}
+	ctx := context.Background()
+	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost WHERE bridge_id=$1", c.Main.Bridge.ID)
+	if err != nil {
+		log.Warn().Err(err).Msg("StatusKit invite: failed to query ghosts")
+		return
+	}
+	var handles []string
+	for rows.Next() {
+		var ghostID string
+		if err := rows.Scan(&ghostID); err != nil {
+			continue
+		}
+		handles = append(handles, ghostID)
+	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("StatusKit invite: ghost row iteration error")
+	}
+	rows.Close()
+	if len(handles) == 0 {
+		return
+	}
+	// ensure_channel (called inside invite_to_channel) panics with "No my
+	// key!!" if our StatusKit channel hasn't been allocated yet. SetStatus
+	// calls share_status → ensure_channel safely (returns error, never
+	// panics), allocating our channel key before we attempt the invite.
+	if err := c.client.SetStatus(true); err != nil {
+		log.Warn().Err(err).Msg("StatusKit invite: channel not ready (will retry on next restart)")
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warn().Str("panic", fmt.Sprintf("%v", r)).Msg("StatusKit invite panicked")
+		}
+	}()
+	if err := c.client.InviteToStatusSharing(c.handle, handles); err != nil {
+		log.Warn().Err(err).Int("count", len(handles)).Msg("StatusKit invite failed")
+	} else {
+		log.Info().Int("count", len(handles)).Msg("Sent StatusKit key invite to known ghosts")
+	}
+}
 
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	if c.contacts == nil {

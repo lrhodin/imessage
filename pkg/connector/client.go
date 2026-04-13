@@ -916,6 +916,11 @@ func (c *IMClient) Connect(ctx context.Context) {
 				// and failed with "StatusKit not initialized". Re-run it now that
 				// the StatusKit client is guaranteed to be ready.
 				c.subscribeToContactPresence(log)
+				// Send our StatusKit key to known contacts to trigger key exchange.
+				// Without this, contacts' devices never send us their keys and
+				// presence channels are never created. MULTIPLEX_SERVICE is now
+				// registered so the previous panic path is closed.
+				c.inviteContactsToStatusSharing(log)
 			}
 		case <-ctx.Done():
 			log.Warn().Msg("StatusKit initialization timed out after 30s — presence updates unavailable")
