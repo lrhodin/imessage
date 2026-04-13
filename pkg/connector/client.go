@@ -1303,15 +1303,22 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			notice = name + " has notifications turned on."
 		}
 
-		// Send via the bridge bot (not the ghost) so the notice is a silent
-		// system event. Ghost-authored notices ring the user's phone because
-		// they appear as a message from the contact; bot messages are treated
-		// as system notices and do not trigger push notifications.
+		// Send via the bridge bot so the notice is a silent system event.
+		// Ghost-authored notices ring the user's phone because they look like
+		// messages from the contact. The bot + m.notice + com.beeper.action_message
+		// combination matches the pattern used by disappearing-message notices
+		// in mautrix, which are shown in the timeline but do not trigger push
+		// notifications in the Beeper client.
 		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
 			Parsed: &event.MessageEventContent{
 				MsgType:  event.MsgNotice,
 				Body:     notice,
 				Mentions: &event.Mentions{},
+			},
+			Raw: map[string]any{
+				"com.beeper.action_message": map[string]any{
+					"type": "presence_update",
+				},
 			},
 		}, nil)
 		if sendErr != nil {
