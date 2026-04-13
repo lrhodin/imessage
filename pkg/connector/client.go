@@ -906,24 +906,32 @@ func (c *IMClient) Connect(ctx context.Context) {
 		go func() {
 			done <- c.client.InitStatuskit(c)
 		}()
-		select {
-		case err := <-done:
+		subscribeAfterInit := func(err error) {
 			if err != nil {
 				log.Warn().Err(err).Msg("StatusKit initialization failed — presence updates unavailable")
-			} else {
-				log.Info().Msg("StatusKit presence system initialized")
-				// subscribeToContactPresence may have raced ahead of InitStatuskit
-				// and failed with "StatusKit not initialized". Re-run it now that
-				// the StatusKit client is guaranteed to be ready.
-				c.subscribeToContactPresence(log)
-				// Send our StatusKit key to known contacts to trigger key exchange.
-				// Without this, contacts' devices never send us their keys and
-				// presence channels are never created. MULTIPLEX_SERVICE is now
-				// registered so the previous panic path is closed.
-				c.inviteContactsToStatusSharing(log)
+				return
 			}
+			log.Info().Msg("StatusKit presence system initialized")
+			// subscribeToContactPresence may have raced ahead of InitStatuskit
+			// and failed with "StatusKit not initialized". Re-run it now that
+			// the StatusKit client is guaranteed to be ready.
+			c.subscribeToContactPresence(log)
+			// Send our StatusKit key to known contacts to trigger key exchange.
+			// Without this, contacts' devices never send us their keys and
+			// presence channels are never created.
+			c.inviteContactsToStatusSharing(log)
+		}
+		select {
+		case err := <-done:
+			subscribeAfterInit(err)
 		case <-ctx.Done():
-			log.Warn().Msg("StatusKit initialization timed out after 30s — presence updates unavailable")
+			// The Rust FFI call (StatusKitClient::new → request_topics) is
+			// taking longer than 30s. Don't block the connect flow, but keep
+			// a goroutine alive to subscribe as soon as it eventually finishes.
+			// The Rust side WILL set shared_statuskit/status_callback once
+			// StatusKitClient::new completes; we just need to subscribe then.
+			log.Warn().Msg("StatusKit initialization taking >30s — will subscribe when ready")
+			go func() { subscribeAfterInit(<-done) }()
 		}
 	}()
 

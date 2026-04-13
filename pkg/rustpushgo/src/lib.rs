@@ -5431,11 +5431,17 @@ impl Client {
     }
 
     async fn get_or_init_statuskit_client(&self) -> Result<Arc<WrappedStatusKitClient>, WrappedError> {
-        let mut locked = self.statuskit_client.lock().await;
-        if let Some(client) = &*locked {
-            return Ok(client.clone());
+        // Fast path: return cached client without holding the lock during init.
+        {
+            let locked = self.statuskit_client.lock().await;
+            if let Some(client) = &*locked {
+                return Ok(client.clone());
+            }
         }
 
+        // Slow path: StatusKitClient::new() calls request_topics which can
+        // block the tokio thread. Build the client WITHOUT holding the mutex
+        // so concurrent callers are not blocked.
         let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
             msg: "No TokenProvider available".into(),
         })?;
@@ -5455,6 +5461,12 @@ impl Client {
             .await,
             interests: tokio::sync::Mutex::new(Vec::new()),
         });
+
+        // Write path: re-acquire briefly to store result; handle race.
+        let mut locked = self.statuskit_client.lock().await;
+        if let Some(existing) = &*locked {
+            return Ok(existing.clone());
+        }
         *locked = Some(wrapped.clone());
         Ok(wrapped)
     }
