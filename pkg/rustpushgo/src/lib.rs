@@ -4934,17 +4934,16 @@ pub async fn new_client(
                                         // Only a non-ACK message that fails to populate
                                         // state.keys indicates a real problem (peer invite
                                         // not addressed to us / stale identity keys).
-                                        let is_server_ack = if let rustpush::APSMessage::Notification { payload, .. } = &msg {
+                                        let cmd_byte = if let rustpush::APSMessage::Notification { payload, .. } = &msg {
                                             plist::from_bytes::<plist::Value>(payload)
                                                 .ok()
                                                 .and_then(|v| v.as_dictionary().and_then(|d| d.get("c").and_then(|c| c.as_unsigned_integer())).map(|c| c as u8))
-                                                .map(|cmd| cmd == 255)
-                                                .unwrap_or(false)
                                         } else {
-                                            false
+                                            None
                                         };
+                                        let is_server_ack = cmd_byte.map(|c| c == 255).unwrap_or(false);
                                         if !is_server_ack {
-                                            warn!("StatusKit inbound keysharing message failed to populate state.keys — peer invite may be malformed or not addressed to this device");
+                                            warn!("StatusKit inbound keysharing message (c={}) failed to populate state.keys — peer invite may be malformed or not addressed to this device", cmd_byte.map(|c| c.to_string()).unwrap_or_else(|| "?".into()));
                                         }
                                     }
                                 }
@@ -5566,27 +5565,20 @@ impl Client {
             msg: "StatusKit not initialized".into(),
         })?;
 
-        // Force-reset all keysharing IDS cache entries before calling
-        // invite_to_channel. invite_to_channel uses cache_keys with refresh=false,
-        // which skips IDS queries for any handle whose last lookup returned empty
-        // results and is still within the 1-hour EMPTY_REFRESH TTL. Reset both the
-        // sender handle and all recipient handles so does_not_need_refresh returns
-        // false for everyone, triggering live IDS queries and actual invite delivery.
-        // We also need fresh recipient keys cached so that when peers respond,
-        // get_key_for_sender can find their push token and decrypt the response.
-        // and_modify only fires if the entry exists, so no panic risk.
-        {
-            let mut cache_guard = sk.identity.cache.lock().await;
-            if let Some(service_map) = cache_guard.cache.get_mut("com.apple.private.alloy.status.keysharing") {
-                let all_handles = std::iter::once(&sender_handle).chain(handles.iter());
-                for h in all_handles {
-                    service_map.entry(h.clone()).and_modify(|e| {
-                        *e = Default::default();
-                    });
-                }
-            }
-            cache_guard.save();
-        }
+        // Query IDS with strong flags (required_for_message=true, result_expected=true)
+        // before calling invite_to_channel. invite_to_channel uses cache_keys with
+        // refresh=false and weak flags, which can short-circuit on cached empty results.
+        // targets_for_handles forces a live IDS query and populates the push-token cache
+        // so that (a) the invite reaches real devices and (b) when peers respond,
+        // get_key_for_sender can find their token and decrypt the response.
+        let targets = sk.identity.targets_for_handles(
+            "com.apple.private.alloy.status.keysharing",
+            &handles,
+            &sender_handle,
+        ).await.map_err(|e| WrappedError::GenericError {
+            msg: format!("StatusKit targets_for_handles failed: {:?}", e),
+        })?;
+        info!("StatusKit: IDS found {} delivery target(s) for {} handle(s)", targets.len(), handles.len());
 
         let config_map: std::collections::HashMap<String, rustpush::statuskit::StatusKitPersonalConfig> =
             handles.iter()
