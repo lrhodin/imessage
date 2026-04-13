@@ -966,6 +966,11 @@ func (c *IMClient) Connect(ctx context.Context) {
 	}
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 
+	// Eagerly silence bridge bot push notifications so the rule is in place
+	// before any bot message (StatusKit notices, admin messages, etc.) fires.
+	// Run in a goroutine to avoid blocking Connect on the homeserver round-trip.
+	go c.ensureBotPushRuleSilenced(ctx)
+
 	// Set up contact source: external CardDAV > local macOS > iCloud CardDAV
 	if c.Main.Config.CardDAV.IsConfigured() {
 		extContacts := newExternalCardDAVClient(c.Main.Config.CardDAV, log)
@@ -1325,34 +1330,45 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			// Store dedup key only after successful send to avoid poisoning
 			// on transient failures.
 			c.statusKitPresence.Store(user, modeKey)
-			// Install a sender push rule via the double puppet so Beeper's
-			// push gateway never fires a notification for messages from the
-			// bridge bot. This is done once per session; the rule is durable
-			// on the homeserver so it persists across restarts automatically.
-			// We do NOT use dp.MarkRead here because Matrix read receipts are
-			// sequential — marking the bot's notice would also advance the
-			// read pointer past any real unread iMessages before it, which
-			// would suppress their push notifications and could send spurious
-			// iMessage read receipts to the contact.
-			if !c.statusKitBotRulePushed.Load() {
-				if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
-					if asIntent, ok := dp.(*matrixfmt.ASIntent); ok {
-						botMXID := c.Main.Bridge.Bot.GetMXID().String()
-						err := asIntent.Matrix.PutPushRule(ctx, "global", pushrules.SenderRule, botMXID,
-							&mautrix.ReqPutPushRule{
-								Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
-							})
-						if err != nil {
-							log.Debug().Err(err).Msg("StatusKit: failed to install bot sender push rule")
-						} else {
-							c.statusKitBotRulePushed.Store(true)
-							log.Debug().Str("bot_mxid", botMXID).Msg("StatusKit: installed bot sender push rule")
-						}
-					}
-				}
-			}
+			// Belt-and-suspenders: ensure the bot push rule is installed in
+			// case the Connect()-time goroutine hadn't completed yet.
+			c.ensureBotPushRuleSilenced(ctx)
 		}
 	}()
+}
+
+// ensureBotPushRuleSilenced installs a global sender push rule via the double
+// puppet that tells Beeper's push gateway never to send a notification for
+// messages from the bridge bot. Called eagerly at Connect() time and again as
+// a belt-and-suspenders fallback after each StatusKit notice send.
+//
+// The rule is durable on the homeserver, so it persists across bridge restarts.
+// statusKitBotRulePushed guards against redundant API calls within a session.
+// A no-op if the double puppet is not available or the assertion fails.
+func (c *IMClient) ensureBotPushRuleSilenced(ctx context.Context) {
+	if c.statusKitBotRulePushed.Load() {
+		return
+	}
+	dp := c.UserLogin.User.DoublePuppet(ctx)
+	if dp == nil {
+		return
+	}
+	asIntent, ok := dp.(*matrixfmt.ASIntent)
+	if !ok {
+		return
+	}
+	log := c.UserLogin.Log.With().Str("component", "statuskit").Logger()
+	botMXID := c.Main.Bridge.Bot.GetMXID().String()
+	err := asIntent.Matrix.PutPushRule(ctx, "global", pushrules.SenderRule, botMXID,
+		&mautrix.ReqPutPushRule{
+			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+		})
+	if err != nil {
+		log.Debug().Err(err).Str("bot_mxid", botMXID).Msg("Failed to install bot sender push rule")
+		return
+	}
+	c.statusKitBotRulePushed.Store(true)
+	log.Debug().Str("bot_mxid", botMXID).Msg("Bot sender push rule installed — bridge bot messages will not notify")
 }
 
 // resolveStatusPortalViaIDS is the last-resort portal resolver for StatusKit
