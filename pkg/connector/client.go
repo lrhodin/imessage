@@ -1229,40 +1229,37 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	// gives Matrix push rules the best chance to evaluate
 	// .m.rule.suppress_notices correctly — the bridge bot is a third-party
 	// actor, so Beeper's push path bypasses suppress_notices for bot-sent
-	// messages in DMs. Keep MsgNotice + empty Mentions as secondary hints.
-	if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
-		_, err = asIntent.Matrix.SendMessageEvent(ctx, portal.MXID, event.EventMessage, &event.Content{
-			Parsed: &event.MessageEventContent{
-				MsgType:  event.MsgNotice,
-				Body:    notice,
-				Mentions: &event.Mentions{},
-			},
-		})
-	} else {
-		// Fallback: bot send for non-appservice ghost types
-		_, err = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-			Parsed: &event.MessageEventContent{
-				MsgType:  event.MsgNotice,
-				Body:    notice,
-				Mentions: &event.Mentions{},
-			},
-		}, nil)
-	}
-	if err != nil {
-		log.Warn().Err(err).Str("portal_mxid", string(portal.MXID)).Msg("Failed to send presence notice to portal")
-		// Debug: send an error notice via the bridge bot so the failure
-		// is visible in the room instead of silently swallowed.
-		c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-			Parsed: &event.MessageEventContent{
-				MsgType: event.MsgNotice,
-				Body:   "⚠️ StatusKit presence notice delivery failed (see bridge logs for details)",
-			},
-		}, nil)
-	} else {
-		// Only store the dedup key after a successful send.
-		// Storing before the send would poison the map on transient failures.
-		c.statusKitPresence.Store(user, modeKey)
-	}
+	// messages in DMs. Run in a goroutine to avoid deadlocking — the ghost
+	// intent's SendMessageEvent may trigger EnsureJoined which acquires a
+	// portal lock already held by the caller.
+	go func() {
+		var sendErr error
+		if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
+			_, sendErr = asIntent.Matrix.SendMessageEvent(ctx, portal.MXID, event.EventMessage, &event.Content{
+				Parsed: &event.MessageEventContent{
+					MsgType:  event.MsgNotice,
+					Body:    notice,
+					Mentions: &event.Mentions{},
+				},
+			})
+		} else {
+			// Fallback: bot send for non-appservice ghost types
+			_, sendErr = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+				Parsed: &event.MessageEventContent{
+					MsgType:  event.MsgNotice,
+					Body:    notice,
+					Mentions: &event.Mentions{},
+				},
+			}, nil)
+		}
+		if sendErr != nil {
+			log.Warn().Err(sendErr).Str("portal_mxid", string(portal.MXID)).Msg("Failed to send presence notice to portal")
+		} else {
+			// Only store the dedup key after a successful send.
+			// Storing before the send would poison the map on transient failures.
+			c.statusKitPresence.Store(user, modeKey)
+		}
+	}()
 }
 
 // resolveStatusPortalViaIDS is the last-resort portal resolver for StatusKit
