@@ -4872,39 +4872,41 @@ pub async fn new_client(
                 // handling. Only active when init_statuskit() has been
                 // called; otherwise falls through.
                 if let Some(sk) = sk_for_recv.read().await.as_ref().cloned() {
-                    // Pre-check: upstream statuskit.rs:736 panics with "Channel
-                    // not found!" if a status update arrives for a channel that
-                    // has no entry in state.keys. This can happen if keys were
-                    // cleared or never received. Guard against the panic by
-                    // checking the key exists before calling handle().
-                    let has_keys = if let rustpush::APSMessage::Notification { channel: Some(ch), .. } = &msg {
-                        let state = sk.state.read().await;
-                        state.keys.contains_key(&base64_encode(&ch.id))
-                    } else {
-                        true // non-notification messages don't need the check
-                    };
-                    if !has_keys {
-                        warn!("StatusKit: skipping message for channel with no shared keys — waiting for key-sharing message");
-                        // Don't fall through to iMessage handling; the message
-                        // was for StatusKit (it's on a presence topic) but we
-                        // can't process it yet.
-                        pending.fetch_sub(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    match sk.handle(msg.clone()).await {
-                        Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged { user, mode, allowed })) => {
+                    // Wrap handle() in catch_unwind to prevent upstream panics
+                    // (statuskit.rs:736 panics with "Channel not found!" if a
+                    // status update arrives for a channel with no shared keys).
+                    // Catching the panic prevents the message loop from crashing;
+                    // we log and continue so the message can be retried if keys
+                    // arrive via a subsequent key-sharing IDS message.
+                    let handle_result = tokio::task::spawn_blocking({
+                        let sk = sk.clone();
+                        let msg = msg.clone();
+                        move || std::panic::catch_unwind(|| {
+                            // Use a single-threaded runtime to drive the async handle()
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("Failed to create runtime for StatusKit handle");
+                            rt.block_on(sk.handle(msg))
+                        })
+                    }).await;
+                    match handle_result {
+                        Ok(Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged { user, mode, allowed }))) => {
                             if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
                                 cb.on_status_update(user, mode, allowed);
                             }
                             pending.fetch_sub(1, Ordering::Relaxed);
                             continue;
                         }
-                        Ok(None) => {} // not a StatusKit message — fall through
-                        Err(rustpush::PushError::VerificationFailed) => {
+                        Ok(Ok(None)) => {} // not a StatusKit message — fall through
+                        Ok(Err(rustpush::PushError::VerificationFailed)) => {
                             warn!("StatusKit signature verification failed — key ratchet mismatch, will resolve on next key-sharing message");
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!("StatusKit handle error: {:?}", e);
+                        }
+                        Err(_) => {
+                            warn!("StatusKit handle panicked — channel may lack shared keys, waiting for key-sharing message");
                         }
                     }
                 }
