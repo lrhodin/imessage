@@ -1306,13 +1306,11 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			notice = name + " has notifications turned on."
 		}
 
-		// Send via the bridge bot so the notice is a silent system event.
-		// Ghost-authored notices ring the user's phone because they look like
-		// messages from the contact. The bot + m.notice + com.beeper.action_message
-		// combination matches the pattern used by disappearing-message notices
-		// in mautrix, which are shown in the timeline but do not trigger push
-		// notifications in the Beeper client.
-		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+		// Send the notice 1ms in the past so Hungry does not use it as the
+		// room's last-activity timestamp — the chat won't jump to the top of
+		// the list as though a new message arrived from the contact.
+		noticeTS := time.Now().Add(-1 * time.Millisecond)
+		sendResp, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
 			Parsed: &event.MessageEventContent{
 				MsgType:  event.MsgNotice,
 				Body:     notice,
@@ -1323,16 +1321,45 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 					"type": "presence_update",
 				},
 			},
-		}, nil)
+		}, &bridgev2.MatrixSendExtra{Timestamp: noticeTS})
 		if sendErr != nil {
 			log.Warn().Err(sendErr).Str("portal_mxid", string(portal.MXID)).Msg("StatusKit: failed to send presence notice")
 		} else {
 			// Store dedup key only after successful send to avoid poisoning
 			// on transient failures.
 			c.statusKitPresence.Store(user, modeKey)
-			// Belt-and-suspenders: ensure the bot push rule is installed in
-			// case the Connect()-time goroutine hadn't completed yet.
+			// Keep push rules installed as a best-effort measure.
 			c.ensureBotPushRuleSilenced(ctx)
+			// Immediately mark the notice as *privately* read via the double
+			// puppet. Private read receipts (m.read.private) are:
+			//   • NOT forwarded to the iMessage contact — the bridge only
+			//     processes m.read, never m.read.private.
+			//   • NOT visible to other room members.
+			//   • Checked by Hungry's push gateway before dispatching to
+			//     APNs/FCM; if the private marker is ≥ the event's stream
+			//     order, the push is suppressed.
+			// We call SetBeeperInboxState / SetReadMarkers directly on the
+			// underlying Matrix client — not via ASIntent.MarkRead, which
+			// deliberately skips m.read.private and uses only m.read on
+			// Hungry.
+			if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
+				if asIntent, ok := dp.(*matrixfmt.ASIntent); ok {
+					req := &mautrix.ReqSetReadMarkers{
+						ReadPrivate: sendResp.EventID,
+					}
+					var rrErr error
+					if asIntent.Connector.SpecVersions.Supports(mautrix.BeeperFeatureInboxState) {
+						rrErr = asIntent.Matrix.SetBeeperInboxState(ctx, portal.MXID, &mautrix.ReqSetBeeperInboxState{
+							ReadMarkers: req,
+						})
+					} else {
+						rrErr = asIntent.Matrix.SetReadMarkers(ctx, portal.MXID, req)
+					}
+					if rrErr != nil {
+						log.Debug().Err(rrErr).Msg("StatusKit: failed to set private read marker for notice")
+					}
+				}
+			}
 		}
 	}()
 }
