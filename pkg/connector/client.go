@@ -1130,9 +1130,26 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	if mode != nil && *mode != "" {
 		modeKey = *mode
 	}
+	// kvKeyFor returns the KV store key used to persist StatusKit state for
+	// a given user handle across bridge restarts.
+	kvKeyFor := func(u string) database.Key {
+		return database.Key("statuskit.presence." + u)
+	}
+
 	if prev, loaded := c.statusKitPresence.Load(user); loaded {
 		if prev.(string) == modeKey {
 			log.Debug().Bool("available", available).Str("mode", modeKey).Msg("StatusKit: presence unchanged, skipping notice")
+			return
+		}
+	} else {
+		// Not in memory (first call this session for this user): check KV store
+		// for the state persisted from the previous bridge run.  If it matches
+		// the incoming state, warm the in-memory cache and skip the notice so
+		// users don't see a flood of "has notifications turned on/off" messages
+		// every time the bridge restarts.
+		if c.Main.Bridge.DB.KV.Get(context.Background(), kvKeyFor(user)) == modeKey {
+			c.statusKitPresence.Store(user, modeKey)
+			log.Debug().Bool("available", available).Str("mode", modeKey).Msg("StatusKit: presence unchanged (restored from DB), skipping notice")
 			return
 		}
 	}
@@ -1153,7 +1170,9 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	// rapid-fire re-deliveries of the same state (e.g. APNs replay on
 	// reconnect) are caught by the check above before the goroutine has
 	// had a chance to complete and store the key itself.
+	// Also persist to the KV store so the dedup survives a bridge restart.
 	c.statusKitPresence.Store(user, modeKey)
+	c.Main.Bridge.DB.KV.Set(context.Background(), kvKeyFor(user), modeKey)
 
 	// Dispatch ALL blocking work — ghost lookup, portal resolution, IDS
 	// fallback, and Matrix send — to a goroutine so this callback returns
