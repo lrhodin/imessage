@@ -1111,12 +1111,15 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		Logger()
 
 	// Suppress duplicate notices: only act when the state actually changes.
-	// Track available+mode together so DND→Sleep (both unavailable) still fires.
-	modeKey := "unavailable"
+	// Track silenced+mode together so DND→Sleep (both silenced) still fires.
+	// available=true means silenced in Apple's protocol (see goroutine below).
+	modeKey := "available"
 	if available {
-		modeKey = "available"
-	} else if mode != nil {
-		modeKey = *mode
+		if mode != nil && *mode != "" {
+			modeKey = *mode
+		} else {
+			modeKey = "silenced"
+		}
 	}
 	if prev, loaded := c.statusKitPresence.Load(user); loaded {
 		if prev.(string) == modeKey {
@@ -1143,12 +1146,20 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	go func() {
 		ctx := context.Background()
 
-		presence := event.PresenceUnavailable
+		// NOTE: in Apple's StatusKit protocol "available" (= rustpush's
+		// is_available / allowed) is TRUE when a Focus/DND mode is ACTIVE
+		// (i.e. notifications are silenced), and FALSE when the person is
+		// in the normal/unrestricted state. The flag is named from the
+		// "is the Focus mode allowed to fire?" perspective, not from the
+		// "is the person available?" perspective. We invert here.
+		silenced := available // true = DND/Focus on = notifications silenced
+		presence := event.PresenceOnline
 		statusMsg := ""
-		if available {
-			presence = event.PresenceOnline
-		} else if modeCopy != nil && *modeCopy != "" {
-			statusMsg = *modeCopy
+		if silenced {
+			presence = event.PresenceUnavailable
+			if modeCopy != nil && *modeCopy != "" {
+				statusMsg = *modeCopy
+			}
 		}
 
 		// findPortal returns an existing, active portal or nil.
@@ -1281,36 +1292,28 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			name = ghostHandle
 		}
 		var notice string
-		if available {
-			notice = name + " has notifications turned on."
-		} else {
+		if silenced {
 			label := statusKitModeLabel(modeCopy)
 			if label != "" {
 				notice = "🔕 " + name + " has notifications silenced (" + label + ")."
 			} else {
 				notice = "🔕 " + name + " has notifications silenced."
 			}
+		} else {
+			notice = name + " has notifications turned on."
 		}
 
-		// Send via ghost intent so the notice appears authored by the peer.
-		var sendErr error
-		if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
-			_, sendErr = asIntent.Matrix.SendMessageEvent(ctx, portal.MXID, event.EventMessage, &event.Content{
-				Parsed: &event.MessageEventContent{
-					MsgType:  event.MsgNotice,
-					Body:     notice,
-					Mentions: &event.Mentions{},
-				},
-			})
-		} else {
-			_, sendErr = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-				Parsed: &event.MessageEventContent{
-					MsgType:  event.MsgNotice,
-					Body:     notice,
-					Mentions: &event.Mentions{},
-				},
-			}, nil)
-		}
+		// Send via the bridge bot (not the ghost) so the notice is a silent
+		// system event. Ghost-authored notices ring the user's phone because
+		// they appear as a message from the contact; bot messages are treated
+		// as system notices and do not trigger push notifications.
+		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+			Parsed: &event.MessageEventContent{
+				MsgType:  event.MsgNotice,
+				Body:     notice,
+				Mentions: &event.Mentions{},
+			},
+		}, nil)
 		if sendErr != nil {
 			log.Warn().Err(sendErr).Str("portal_mxid", string(portal.MXID)).Msg("StatusKit: failed to send presence notice")
 		} else {
