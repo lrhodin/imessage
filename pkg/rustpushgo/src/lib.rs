@@ -55,7 +55,7 @@ fn bridge_default_provider(
     info: omnisette::LoginClientInfo,
     path: PathBuf,
 ) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
-    default_provider(info, path)
+    omnisette::default_provider(info, path)
 }
 #[cfg(not(target_os = "macos"))]
 fn bridge_default_provider(
