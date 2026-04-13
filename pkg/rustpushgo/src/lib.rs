@@ -5574,6 +5574,42 @@ impl Client {
         Ok(aliases)
     }
 
+    /// Like resolve_handle but reads ONLY from the in-memory IDS cache —
+    /// no network call, no validate_targets, no blocking. Returns the
+    /// tel: (or other) aliases that share the same sender_correlation_identifier
+    /// as `handle` according to data already cached from prior message processing.
+    /// Returns an empty Vec if the handle is not in the cache yet.
+    pub async fn resolve_handle_cached(&self, handle: String, known_handles: Vec<String>) -> Vec<String> {
+        let my_handles = self.client.identity.get_handles().await;
+        let my_handle = match my_handles.first() {
+            Some(h) => h.clone(),
+            None => return vec![],
+        };
+
+        let cache = self.client.identity.cache.lock().await;
+        let correlation_id = match cache.get_correlation_id("com.apple.madrid", &my_handle, &handle) {
+            Some(cid) if !cid.is_empty() => cid,
+            _ => {
+                info!("resolve_handle_cached: {} not in IDS cache", handle);
+                return vec![];
+            }
+        };
+
+        let mut aliases = vec![];
+        for known_handle in &known_handles {
+            if known_handle == &handle {
+                continue;
+            }
+            if let Some(cid) = cache.get_correlation_id("com.apple.madrid", &my_handle, known_handle) {
+                if cid == correlation_id {
+                    aliases.push(known_handle.clone());
+                }
+            }
+        }
+        info!("resolve_handle_cached: {} → {} alias(es) from cache (correlation {})", handle, aliases.len(), correlation_id);
+        aliases
+    }
+
     /// Reset all StatusKit APNs channel cursors (last_msg_ns) to 1 in the
     /// persisted state file. Must be called BEFORE init_statuskit() so the
     /// StatusKit client loads the reset cursors on startup. Resetting to 1

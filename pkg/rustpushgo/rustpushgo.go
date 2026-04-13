@@ -3007,6 +3007,35 @@ func (_self *Client) ResolveHandle(handle string, knownHandles []string) ([]stri
 		})
 }
 
+// ResolveHandleCached looks up handle aliases from the in-memory IDS cache
+// only — no network call, no blocking. Returns tel: (or other) aliases that
+// share the same sender_correlation_identifier as handle, based on data
+// already cached from prior message processing. Returns an empty slice if the
+// handle is not in the cache.
+func (_self *Client) ResolveHandleCached(handle string, knownHandles []string) []string {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithResult(func(status *C.RustCallStatus) *C.void {
+		// rustFutureFunc
+		return (*C.void)(C.uniffi_rustpushgo_fn_method_client_resolve_handle_cached(
+			_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)), rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(knownHandles)),
+			status,
+		))
+	},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterSequenceStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *Client) RestoreCloudChat(recordName string, chatIdentifier string, groupId string, style int64, service string, displayName *string, participants []string) error {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()

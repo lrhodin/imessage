@@ -1367,29 +1367,55 @@ func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Lo
 		return nil
 	}
 
+	// Fast path: check the in-memory IDS cache populated from message
+	// processing. No network call, no blocking. If the correlation ID is
+	// already cached (common when the contact has sent messages before),
+	// this resolves instantly and we skip the slow validate_targets call.
+	if aliases := c.client.ResolveHandleCached(user, knownHandles); len(aliases) > 0 {
+		log.Info().Str("user", user).Int("aliases", len(aliases)).Msg("StatusKit IDS fallback: resolved from cache (no network)")
+		if portal := c.findPortalForAliases(ctx, log, user, aliases); portal != nil {
+			return portal
+		}
+	}
+
+	// Slow path: validate_targets queries Apple IDS. Can block or hang;
+	// caller is responsible for applying a timeout.
 	aliases, err := c.client.ResolveHandle(user, knownHandles)
 	if err != nil {
 		log.Warn().Err(err).Str("user", user).Msg("StatusKit IDS fallback: ResolveHandle failed")
 		return nil
 	}
-	for _, alias := range aliases {
-		if alias == user {
-			continue
-		}
-		aliasPortalID := c.resolveContactPortalID(alias)
-		aliasPortalID = c.resolveExistingDMPortalID(string(aliasPortalID))
-		altPortal, altErr := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-			ID:       aliasPortalID,
-			Receiver: c.UserLogin.ID,
-		})
-		if altErr == nil && altPortal != nil && altPortal.MXID != "" {
-			log.Info().
-				Str("original", user).
-				Str("alias", alias).
-				Str("resolved_portal_id", string(aliasPortalID)).
-				Msg("StatusKit: resolved DM portal via IDS correlation")
-			c.statusKitPortalCache.Store(user, aliasPortalID)
-			return altPortal
+	return c.findPortalForAliases(ctx, log, user, aliases)
+}
+
+// findPortalForAliases iterates aliases returned by IDS correlation and
+// returns the first portal found. Prefers tel: aliases over mailto: so the
+// presence notice lands in the phone portal rather than the email portal.
+func (c *IMClient) findPortalForAliases(ctx context.Context, log zerolog.Logger, user string, aliases []string) *bridgev2.Portal {
+	// Two-pass: tel: first, then anything else.
+	for _, preferTel := range []bool{true, false} {
+		for _, alias := range aliases {
+			if alias == user {
+				continue
+			}
+			if preferTel != strings.HasPrefix(alias, "tel:") {
+				continue
+			}
+			aliasPortalID := c.resolveContactPortalID(alias)
+			aliasPortalID = c.resolveExistingDMPortalID(string(aliasPortalID))
+			altPortal, altErr := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+				ID:       aliasPortalID,
+				Receiver: c.UserLogin.ID,
+			})
+			if altErr == nil && altPortal != nil && altPortal.MXID != "" {
+				log.Info().
+					Str("original", user).
+					Str("alias", alias).
+					Str("resolved_portal_id", string(aliasPortalID)).
+					Msg("StatusKit: resolved DM portal via IDS correlation")
+				c.statusKitPortalCache.Store(user, aliasPortalID)
+				return altPortal
+			}
 		}
 	}
 	return nil
