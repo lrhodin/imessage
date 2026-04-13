@@ -473,13 +473,12 @@ func (b *messageBuffer) stop() {
 }
 
 // sendGhostReadReceipt sends a "they read my message" receipt from the ghost
-// user with the correct timestamp. The standard framework path
-// (QueueRemoteEvent → MarkRead → SetReadMarkers) doesn't work because the
-// ghost isn't double-puppeted, so the homeserver ignores BeeperReadExtra["ts"]
-// and uses server time instead. This method bypasses the framework by calling
-// SetBeeperInboxState directly on the ghost's underlying Matrix client, which
-// the homeserver honors for BeeperReadExtra["ts"] regardless of puppet status.
-// Falls back to QueueRemoteEvent if the direct path fails.
+// user with the correct iMessage read timestamp. The standard framework path
+// (QueueRemoteEvent → MarkRead) also calls SetReadMarkers, but goes through
+// ASIntent.MarkRead which strips BeeperReadExtra["ts"] for non-custom-puppet
+// users. By calling SetReadMarkers directly on the ghost's underlying Matrix
+// client we include the custom timestamp, giving Hungry the best chance of
+// honoring it. Falls back to QueueRemoteEvent if the direct path fails.
 func (c *IMClient) sendGhostReadReceipt(
 	log *zerolog.Logger,
 	ghostUserID networkid.UserID,
@@ -545,7 +544,10 @@ func (c *IMClient) sendGhostReadReceipt(
 	}
 
 	// Step 4: Type-assert to access the ghost's underlying Matrix client
-	// and call SetBeeperInboxState directly (bypasses IsCustomPuppet check).
+	// and call SetReadMarkers directly (bypasses IsCustomPuppet check so
+	// BeeperReadExtra["ts"] is included, giving Hungry the iMessage read time).
+	// Do NOT use SetBeeperInboxState here — Hungry returns HTTP 400 for ghost
+	// (appservice puppet) users because they have no Beeper inbox.
 	asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent)
 	if !ok {
 		log.Warn().Str("portal_id", string(portalKey.ID)).
@@ -563,13 +565,11 @@ func (c *IMClient) sendGhostReadReceipt(
 		BeeperReadExtra:      extraData,
 		BeeperFullyReadExtra: extraData,
 	}
-	err = asIntent.Matrix.SetBeeperInboxState(ctx, portal.MXID, &mautrix.ReqSetBeeperInboxState{
-		ReadMarkers: req,
-	})
+	err = asIntent.Matrix.SetReadMarkers(ctx, portal.MXID, req)
 	if err != nil {
 		log.Warn().Err(err).Str("portal_id", string(portalKey.ID)).
 			Stringer("event_id", targetMsg.MXID).
-			Msg("SetBeeperInboxState failed for ghost, falling back to QueueRemoteEvent")
+			Msg("SetReadMarkers failed for ghost, falling back to QueueRemoteEvent")
 		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
 		return
 	}
@@ -580,7 +580,7 @@ func (c *IMClient) sendGhostReadReceipt(
 		Stringer("event_id", targetMsg.MXID).
 		Int64("read_time_ms", readTime.UnixMilli()).
 		Str("read_time", readTime.UTC().Format(time.RFC3339)).
-		Msg("Set ghost read receipt via SetBeeperInboxState with correct timestamp")
+		Msg("Set ghost read receipt via SetReadMarkers with correct timestamp")
 }
 
 // queueGhostReceiptFallback sends a ghost read receipt via the standard
