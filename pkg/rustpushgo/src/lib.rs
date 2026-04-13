@@ -4875,7 +4875,8 @@ pub async fn new_client(
                 // channel), we dispatch to the Go callback and skip iMessage
                 // handling. Only active when init_statuskit() has been
                 // called; otherwise falls through.
-                if let Some(sk) = sk_for_recv.read().await.as_ref().cloned() {
+                let sk_opt = sk_for_recv.read().await.clone();
+                if let Some(sk) = sk_opt {
                     // Extract the APNs topic before spawning the thread so we can
                     // check it later for key-sharing detection (msg is moved into
                     // the spawned thread and unavailable afterwards).
