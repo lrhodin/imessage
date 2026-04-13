@@ -1143,12 +1143,6 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	go func() {
 		ctx := context.Background()
 
-		ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
-		if err != nil || ghost == nil || ghost.Intent == nil {
-			log.Warn().Err(err).Msg("StatusKit: no ghost found for presence update — ignoring")
-			return
-		}
-
 		presence := event.PresenceUnavailable
 		statusMsg := ""
 		if available {
@@ -1157,26 +1151,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			statusMsg = *modeCopy
 		}
 
-		// Set Matrix presence for clients that render it.
-		if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
-			if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
-				Presence:  presence,
-				StatusMsg: statusMsg,
-			}); err != nil {
-				log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
-			}
-		}
-
-		// Resolve the DM portal, strongly preferring tel: over mailto:.
-		// A contact may have a mailto: portal (from messages on their Apple ID)
-		// AND a tel: portal (from messages on their phone number). The tel:
-		// portal is what the user actively uses. For mailto: handles that are
-		// not in the address book we cannot use the contact-store path, so we
-		// go straight to IDS correlation to find the tel: alias, and only
-		// fall back to the mailto: portal as a last resort.
-		normalizedUser := normalizeIdentifierForPortalID(user)
-
-		// findPortal returns a portal for the given portal ID, or nil.
+		// findPortal returns an existing, active portal or nil.
 		findPortal := func(id networkid.PortalID) *bridgev2.Portal {
 			p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
 				ID:       id,
@@ -1188,18 +1163,28 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			return p
 		}
 
+		normalizedUser := normalizeIdentifierForPortalID(user)
+
+		// Resolve the portal AND the ghost handle to use for sending.
+		//
+		// For mailto: handles the ghost often has no MXID (never joined a
+		// Matrix room) so ghost.Intent is nil. We must use the tel: ghost
+		// instead — it IS in the portal and has a valid MXID. portal.ID is
+		// the tel: handle, so we derive the ghost from the resolved portal.
+		//
+		// Resolution order for mailto: handles:
+		//   (1) address-book phones (fast, no network)
+		//   (2) IDS correlation — self-bounding 5s tokio timeout in Rust
+		//   (3) mailto: portal itself as absolute last resort
 		var portal *bridgev2.Portal
 
 		if strings.HasPrefix(normalizedUser, "mailto:") {
-			// mailto: handle: prioritise tel: over the mailto: portal.
-			// Order: (1) address-book phones, (2) IDS correlation, (3) mailto: portal.
-
-			// (1) Address-book path — only works if contact is in address book.
+			// (1) Address-book.
 			contact := c.lookupContact(user)
 			if contact != nil {
 				for _, altID := range contactPortalIDs(contact) {
 					if !strings.HasPrefix(altID, "tel:") {
-						continue // phones first; skip emails
+						continue
 					}
 					if p := findPortal(networkid.PortalID(altID)); p != nil {
 						log.Info().Str("tel_handle", altID).Msg("StatusKit: resolved mailto→tel via address book")
@@ -1209,12 +1194,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 				}
 			}
 
-			// (2) IDS correlation — handles contacts not in the address book.
-			// Safe to call back into Rust here because we are in a goroutine,
-			// not the Rust FFI callback stack. 15s timeout to bound the wait.
-			// (2) IDS correlation — handles contacts not in the address book.
-			// ResolveHandle now queries IDS only for the mailto: handle with
-			// an internal 5s tokio timeout, so this call is self-bounding.
+			// (2) IDS correlation (self-bounding, safe to call from goroutine).
 			if portal == nil {
 				if altPortal := c.resolveStatusPortalViaIDS(ctx, log, user); altPortal != nil {
 					log.Info().Str("user", user).Msg("StatusKit: resolved mailto→tel via IDS correlation")
@@ -1222,20 +1202,18 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 				}
 			}
 
-			// (3) Last resort: use the mailto: portal itself.
+			// (3) mailto: portal as last resort.
 			if portal == nil {
-				portal = findPortal(networkid.PortalID(normalizedUser))
-				if portal != nil {
-					log.Info().Str("portal_id", normalizedUser).Msg("StatusKit: using mailto: portal as last resort (no tel: found)")
+				if p := findPortal(networkid.PortalID(normalizedUser)); p != nil {
+					log.Info().Str("portal_id", normalizedUser).Msg("StatusKit: using mailto: portal as last resort")
+					portal = p
 				}
 			}
 		} else {
-			// tel: or other handle: standard resolution chain.
 			portalID := c.resolveContactPortalID(normalizedUser)
 			portalID = c.resolveExistingDMPortalID(string(portalID))
 			portal = findPortal(portalID)
 
-			// Contact-store fallback.
 			if portal == nil {
 				contact := c.lookupContact(user)
 				if contact != nil {
@@ -1262,14 +1240,45 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			return
 		}
 
+		// Use the ghost keyed to the portal's handle — for a tel: portal this
+		// is the tel: ghost which has an MXID and is a member of the room.
+		// The mailto: ghost typically has no MXID (never joined a room) so
+		// ghost.Intent would be nil. Prefer portal ghost; fall back to the
+		// mailto: ghost if the portal ghost is unavailable.
+		ghostHandle := string(portal.ID)
+		ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(ghostHandle))
+		if err != nil || ghost == nil || ghost.Intent == nil {
+			// Fallback: try the original mailto: ghost.
+			ghost, err = c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
+			if err != nil || ghost == nil || ghost.Intent == nil {
+				log.Warn().Err(err).Str("portal_handle", ghostHandle).Str("mailto_handle", user).
+					Msg("StatusKit: no usable ghost found — skipping notice")
+				return
+			}
+			log.Debug().Str("ghost", user).Msg("StatusKit: using mailto: ghost as fallback")
+		} else {
+			log.Debug().Str("ghost", ghostHandle).Msg("StatusKit: using portal ghost (tel:)")
+		}
+
+		// Set Matrix presence using whichever ghost we resolved.
+		if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
+			if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
+				Presence:  presence,
+				StatusMsg: statusMsg,
+			}); err != nil {
+				log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
+			}
+		}
+
 		log.Info().
 			Str("normalized_user", normalizedUser).
 			Str("portal_id", string(portal.ID)).
+			Str("ghost_handle", ghostHandle).
 			Msg("StatusKit: sending presence notice to portal")
 
 		name := ghost.Name
 		if name == "" {
-			name = user
+			name = ghostHandle
 		}
 		var notice string
 		if available {
