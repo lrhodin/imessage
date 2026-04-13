@@ -30,7 +30,7 @@ use rustpush::{
 };
 use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
 use rustpush::findmy::MULTIPLEX_SERVICE;
-use omnisette::default_provider;
+
 use std::sync::RwLock;
 
 // ============================================================================
@@ -258,7 +258,6 @@ mod manual_ford {
     };
     use prost::Message;
     use sha2::{Digest as Sha2Digest, Sha256};
-    use std::sync::Mutex;
 
     /// Shared reqwest client for HTTP container fetches. We can't use
     /// upstream's private `REQWEST` static, so we maintain our own.
@@ -5544,7 +5543,7 @@ impl Client {
             Duration::from_secs(5),
             self.client.identity.validate_targets(&[handle.clone()], "com.apple.madrid", &my_handle),
         ).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(e)) => info!("resolve_handle: validate_targets failed for {}: {:?}", handle, e),
             Err(_) => info!("resolve_handle: validate_targets timed out after 5s for {}", handle),
         }
