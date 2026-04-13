@@ -48,6 +48,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
+	"maunium.net/go/mautrix/pushrules"
 
 	"github.com/lrhodin/imessage/imessage"
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
@@ -152,6 +153,12 @@ type IMClient struct {
 	// (see resolveStatusPortalViaIDS) so we only pay the IDS round trip once
 	// per unresolved handle per session. Values are networkid.PortalID.
 	statusKitPortalCache sync.Map // map[string]networkid.PortalID
+
+	// statusKitBotRulePushed is set to true after we successfully install a
+	// sender push rule via the double puppet that silences push notifications
+	// from the bridge bot. Done once per session; the rule is durable on the
+	// homeserver so re-installs across sessions are harmless but redundant.
+	statusKitBotRulePushed atomic.Bool
 
 	// lastPresenceSubscribe timestamps the most recent call to
 	// subscribeToContactPresence. OnKeysReceived triggers re-subscription
@@ -1318,6 +1325,32 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			// Store dedup key only after successful send to avoid poisoning
 			// on transient failures.
 			c.statusKitPresence.Store(user, modeKey)
+			// Install a sender push rule via the double puppet so Beeper's
+			// push gateway never fires a notification for messages from the
+			// bridge bot. This is done once per session; the rule is durable
+			// on the homeserver so it persists across restarts automatically.
+			// We do NOT use dp.MarkRead here because Matrix read receipts are
+			// sequential — marking the bot's notice would also advance the
+			// read pointer past any real unread iMessages before it, which
+			// would suppress their push notifications and could send spurious
+			// iMessage read receipts to the contact.
+			if !c.statusKitBotRulePushed.Load() {
+				if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
+					if asIntent, ok := dp.(*matrixfmt.ASIntent); ok {
+						botMXID := c.Main.Bridge.Bot.GetMXID().String()
+						err := asIntent.Matrix.PutPushRule(ctx, "global", pushrules.SenderRule, botMXID,
+							&mautrix.ReqPutPushRule{
+								Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+							})
+						if err != nil {
+							log.Debug().Err(err).Msg("StatusKit: failed to install bot sender push rule")
+						} else {
+							c.statusKitBotRulePushed.Store(true)
+							log.Debug().Str("bot_mxid", botMXID).Msg("StatusKit: installed bot sender push rule")
+						}
+					}
+				}
+			}
 		}
 	}()
 }
