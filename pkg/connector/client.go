@@ -8222,7 +8222,7 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 }
 
 func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
-	text := strings.Trim(ptrStringOr(msg.Text, ""), "\ufffc \n")
+	text := strings.TrimSpace(strings.ReplaceAll(ptrStringOr(msg.Text, ""), "\uFFFC", ""))
 	content := &event.MessageEventContent{
 		MsgType: event.MsgText,
 		Body:    text,
