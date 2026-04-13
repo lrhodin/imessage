@@ -1111,15 +1111,12 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		Logger()
 
 	// Suppress duplicate notices: only act when the state actually changes.
-	// Track silenced+mode together so DND→Sleep (both silenced) still fires.
-	// available=true means silenced in Apple's protocol (see goroutine below).
+	// Apple sends available=true for BOTH DND-on and DND-off; the real
+	// discriminator is whether mode is set. Track by mode string so that
+	// DND→Sleep (two different silenced modes) still fires two notices.
 	modeKey := "available"
-	if available {
-		if mode != nil && *mode != "" {
-			modeKey = *mode
-		} else {
-			modeKey = "silenced"
-		}
+	if mode != nil && *mode != "" {
+		modeKey = *mode
 	}
 	if prev, loaded := c.statusKitPresence.Load(user); loaded {
 		if prev.(string) == modeKey {
@@ -1146,20 +1143,14 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	go func() {
 		ctx := context.Background()
 
-		// NOTE: in Apple's StatusKit protocol "available" (= rustpush's
-		// is_available / allowed) is TRUE when a Focus/DND mode is ACTIVE
-		// (i.e. notifications are silenced), and FALSE when the person is
-		// in the normal/unrestricted state. The flag is named from the
-		// "is the Focus mode allowed to fire?" perspective, not from the
-		// "is the person available?" perspective. We invert here.
-		silenced := available // true = DND/Focus on = notifications silenced
+		// Apple sends available=true for both DND-on and DND-off; the mode
+		// field is the real signal. mode non-nil/non-empty = DND/Focus active.
+		silenced := modeCopy != nil && *modeCopy != ""
 		presence := event.PresenceOnline
 		statusMsg := ""
 		if silenced {
 			presence = event.PresenceUnavailable
-			if modeCopy != nil && *modeCopy != "" {
-				statusMsg = *modeCopy
-			}
+			statusMsg = *modeCopy
 		}
 
 		// findPortal returns an existing, active portal or nil.
