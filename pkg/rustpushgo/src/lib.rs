@@ -4890,22 +4890,20 @@ pub async fn new_client(
                     // identity keys, missing sender, or undecryptable payload).
                     let keys_before = sk.state.read().await.keys.len();
                     // handle() is async and may panic (statuskit.rs:736 "Channel not
-                    // found!"). Spawn a thread so the panic is contained there and
-                    // doesn't crash the async message loop. The Result is sent
-                    // across a oneshot channel to avoid UnwindSafe requirements.
-                    use tokio::sync::oneshot;
-                    let (tx, rx) = oneshot::channel();
+                    // found!"). Spawn as a tokio task on the main runtime so panics
+                    // surface as JoinError rather than crashing the loop, AND so the
+                    // task has access to the main runtime's tokio primitives — the
+                    // IDS identity manager, reqwest HTTP client, and background
+                    // refresh tasks are all bound to this runtime. Running handle()
+                    // on a separate runtime (prior implementation) caused
+                    // receive_message to silently fail its key lookups because the
+                    // HTTP requests and tokio mutexes couldn't complete properly in
+                    // an isolated current-thread runtime.
                     let sk_clone = sk.clone();
                     let msg_clone = msg.clone();
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("Failed to create runtime for StatusKit handle");
-                        let result = rt.block_on(sk_clone.handle(msg_clone));
-                        let _ = tx.send(result);
-                    });
-                    let handle_result = rx.await;
+                    let handle_result = tokio::task::spawn(async move {
+                        sk_clone.handle(msg_clone).await
+                    }).await;
                     match handle_result {
                         Ok(Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged { user, mode, allowed }))) => {
                             if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
