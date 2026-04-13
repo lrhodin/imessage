@@ -5209,10 +5209,15 @@ impl Client {
         // from silently skipping records encrypted with old/rotated keys.
         // Step 1: Fetch recoverable TLK shares for our identity — this pulls
         // in key shares that sync_keychain alone might not discover.
-        info!("Cloud client init: step 1 — refreshing recoverable TLK shares");
+        info!("Cloud client init: step 1 — refreshing recoverable TLK shares (30s timeout)");
         let _step1_start = std::time::Instant::now();
-        if let Err(e) = refresh_recoverable_tlk_shares(&keychain, "Cloud client init").await {
-            warn!("Cloud client init: TLK share refresh failed (non-fatal): {}", e);
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            refresh_recoverable_tlk_shares(&keychain, "Cloud client init"),
+        ).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Cloud client init: TLK share refresh failed (non-fatal): {}", e),
+            Err(_) => warn!("Cloud client init: TLK share refresh timed out after 30s (non-fatal)"),
         }
         info!("Cloud client init: step 1 done in {:?}", _step1_start.elapsed());
 
