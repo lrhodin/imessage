@@ -724,17 +724,17 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 	if c.client == nil {
 		return
 	}
-	// Debounce: skip if we subscribed less than 5 seconds ago. Multiple
-	// key-sharing messages can arrive in quick succession, and each one
-	// triggers OnKeysReceived → subscribeToContactPresence.
+	// Serialize concurrent calls so each one reads the freshest state.keys
+	// snapshot from the Rust side. A previous leading-edge debounce was
+	// swallowing re-subscriptions fired by OnKeysReceived: startup ran an
+	// initial subscribe with zero keys in state, then the key-sharing
+	// response arrived within the debounce window and the follow-up
+	// subscribe (which would have picked up the new channel) was skipped.
+	// No further key-sharing arrives for a contact who already shared, so
+	// the channel stayed unsubscribed until the next restart.
 	c.lastPresenceSubscribeLock.Lock()
-	if time.Since(c.lastPresenceSubscribe) < 5*time.Second {
-		c.lastPresenceSubscribeLock.Unlock()
-		log.Debug().Msg("Skipping presence re-subscription (debounced)")
-		return
-	}
+	defer c.lastPresenceSubscribeLock.Unlock()
 	c.lastPresenceSubscribe = time.Now()
-	c.lastPresenceSubscribeLock.Unlock()
 
 	ctx := context.Background()
 	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost")
