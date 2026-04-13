@@ -5566,6 +5566,26 @@ impl Client {
             msg: "StatusKit not initialized".into(),
         })?;
 
+        // Force-reset the keysharing IDS key cache entry for our handle before
+        // calling invite_to_channel. invite_to_channel uses cache_keys with
+        // refresh=false, which skips IDS queries for any participant whose last
+        // lookup returned empty identities and is still within the 1-hour empty
+        // cache TTL. By replacing our handle's CachedHandle with a fresh default
+        // (empty keys map), we ensure does_not_need_refresh returns false for all
+        // participants, triggering live IDS queries and actual invite delivery.
+        // CachedHandle derives Default, so *e = Default::default() zeroes the keys
+        // HashMap without naming the private type — the compiler infers the type
+        // from the &mut value obtained through the public KeyCache.cache field.
+        {
+            let mut cache_guard = sk.identity.cache.lock().await;
+            if let Some(service_map) = cache_guard.cache.get_mut("com.apple.private.alloy.status.keysharing") {
+                service_map.entry(sender_handle.clone()).and_modify(|e| {
+                    *e = Default::default();
+                });
+            }
+            cache_guard.save();
+        }
+
         let config_map: std::collections::HashMap<String, rustpush::statuskit::StatusKitPersonalConfig> =
             handles.iter()
                 .map(|h| (h.clone(), rustpush::statuskit::StatusKitPersonalConfig {
