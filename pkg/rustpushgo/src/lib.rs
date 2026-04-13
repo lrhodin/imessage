@@ -4907,6 +4907,22 @@ pub async fn new_client(
                     let handle_result = tokio::task::spawn(async move {
                         sk_clone.handle(msg_clone).await
                     }).await;
+                    // Build a human-readable topic label for diagnostic log lines.
+                    let topic_label = if let Some(t) = msg_topic {
+                        let ks: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
+                        let st: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.status".as_bytes());
+                        if t == ks { "keysharing" } else if t == st { "status" } else { "unknown" }
+                    } else {
+                        "no-topic"
+                    };
+                    let diag_cmd = if let rustpush::APSMessage::Notification { payload, .. } = &msg {
+                        plist::from_bytes::<plist::Value>(payload)
+                            .ok()
+                            .and_then(|v| v.into_dictionary())
+                            .and_then(|d| d.get("c").and_then(|c| c.as_unsigned_integer()).map(|v| v as u8))
+                    } else {
+                        None
+                    };
                     match handle_result {
                         Ok(Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged { user, mode, allowed }))) => {
                             if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
@@ -4950,12 +4966,20 @@ pub async fn new_client(
                                                 (None, None)
                                             };
                                         // c=255 = server ACK for our own outgoing invite; suppress.
+                                        // c=227 = peer re-invite for an existing channel (expected
+                                        //         re-key). HashMap::insert replaces the entry in
+                                        //         place, so HashSet diff yields no growth. Log at
+                                        //         INFO when keys_before is non-empty.
                                         // c=97  = unknown command on keysharing topic. Log all
                                         //         plist keys at WARN so we can see whether this is
                                         //         a real iOS keysharing message in a different format
                                         //         than the OpenBubbles c=227. Other commands also logged.
                                         let is_silent = cmd_byte.map(|c| c == 255).unwrap_or(false);
-                                        if !is_silent {
+                                        let is_reinvite = cmd_byte.map(|c| c == 227).unwrap_or(false)
+                                            && !keys_before.is_empty();
+                                        if is_reinvite {
+                                            info!("StatusKit peer re-invite received for existing channel (c=227) — keys replaced in place");
+                                        } else if !is_silent {
                                             let all_keys = if let rustpush::APSMessage::Notification { payload, .. } = &msg {
                                                 plist::from_bytes::<plist::Value>(payload)
                                                     .ok()
@@ -4981,13 +5005,13 @@ pub async fn new_client(
                             }
                         }
                         Ok(Err(rustpush::PushError::VerificationFailed)) => {
-                            warn!("StatusKit signature verification failed — key ratchet mismatch, will resolve on next key-sharing message");
+                            warn!("StatusKit signature verification failed (c={:?} topic={}) — key ratchet mismatch, will resolve on next keysharing message", diag_cmd, topic_label);
                         }
                         Ok(Err(e)) => {
-                            warn!("StatusKit handle error: {:?}", e);
+                            warn!("StatusKit handle error (c={:?} topic={}): {:?}", diag_cmd, topic_label, e);
                         }
                         Err(_) => {
-                            warn!("StatusKit handle panicked — channel may lack shared keys, waiting for key-sharing message");
+                            warn!("StatusKit handle panicked (c={:?} topic={}) — channel may lack shared keys", diag_cmd, topic_label);
                         }
                     }
                 }

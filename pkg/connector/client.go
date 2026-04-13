@@ -1110,7 +1110,9 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			return
 		}
 	}
-	c.statusKitPresence.Store(user, modeKey)
+	// NOTE: dedup key is stored AFTER successful send, not here. Storing
+	// before portal resolution / send poisons the map if the send fails
+	// transiently — all future state-identical updates would be skipped.
 
 	presence := event.PresenceUnavailable
 	statusMsg := ""
@@ -1222,19 +1224,44 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		}
 	}
 
-	// Send via bridge bot with m.notice + empty m.mentions to suppress
-	// push notifications. The m.mentions field (MSC 3952) with an empty
-	// user_ids array tells push rules "this intentionally mentions nobody,"
-	// which overrides the default DM notification rule in Beeper/Element.
-	_, err = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-		Parsed: &event.MessageEventContent{
-			MsgType:  event.MsgNotice,
-			Body:    notice,
-			Mentions: &event.Mentions{},
-		},
-	}, nil)
+	// Send via ghost intent so the notice appears as authored by the peer
+	// (not the bridge bot). In a 1:1 DM, an m.notice from the other member
+	// gives Matrix push rules the best chance to evaluate
+	// .m.rule.suppress_notices correctly — the bridge bot is a third-party
+	// actor, so Beeper's push path bypasses suppress_notices for bot-sent
+	// messages in DMs. Keep MsgNotice + empty Mentions as secondary hints.
+	if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
+		_, err = asIntent.Matrix.SendMessageEvent(ctx, portal.MXID, event.EventMessage, &event.Content{
+			Parsed: &event.MessageEventContent{
+				MsgType:  event.MsgNotice,
+				Body:    notice,
+				Mentions: &event.Mentions{},
+			},
+		})
+	} else {
+		// Fallback: bot send for non-appservice ghost types
+		_, err = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+			Parsed: &event.MessageEventContent{
+				MsgType:  event.MsgNotice,
+				Body:    notice,
+				Mentions: &event.Mentions{},
+			},
+		}, nil)
+	}
 	if err != nil {
 		log.Warn().Err(err).Str("portal_mxid", string(portal.MXID)).Msg("Failed to send presence notice to portal")
+		// Debug: send an error notice via the bridge bot so the failure
+		// is visible in the room instead of silently swallowed.
+		c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+			Parsed: &event.MessageEventContent{
+				MsgType: event.MsgNotice,
+				Body:   "⚠️ StatusKit presence notice delivery failed (see bridge logs for details)",
+			},
+		}, nil)
+	} else {
+		// Only store the dedup key after a successful send.
+		// Storing before the send would poison the map on transient failures.
+		c.statusKitPresence.Store(user, modeKey)
 	}
 }
 
