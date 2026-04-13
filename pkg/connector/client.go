@@ -1143,19 +1143,20 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	}
 		if portal == nil || portal.MXID == "" {
 			// If the portal lookup failed (common for mailto: handles whose DM
-			// portal was created under a tel: handle), try all other handles
-			// from the StatusKit state. A contact may have both
+			// portal was created under a tel: handle), try all other identifiers
+			// from the contact store. A contact may have both
 			// mailto:user@icloud.com and tel:+1... channels — their DM portal
-			// is likely under the tel: handle.
+			// is likely under the tel: handle. This uses the contact store rather
+			// than GetKnownHandles() because key-sharing messages may not have
+			// arrived for all of a contact's handles.
 			if c.client != nil {
-				sk, skErr := c.client.GetStatuskitClient()
-				if skErr == nil && sk != nil {
-					for _, handle := range sk.GetKnownHandles() {
-						if handle == user {
+				contact := c.lookupContact(user)
+				if contact != nil {
+					for _, altID := range contactPortalIDs(contact) {
+						if altID == normalizedUser {
 							continue // already tried
 						}
-						altNormalized := normalizeIdentifierForPortalID(handle)
-						altPortalID := c.resolveContactPortalID(altNormalized)
+						altPortalID := c.resolveContactPortalID(altID)
 						altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
 						altPortal, altErr := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
 							ID:       altPortalID,
@@ -1164,9 +1165,9 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 						if altErr == nil && altPortal != nil && altPortal.MXID != "" {
 							log.Info().
 								Str("original", normalizedUser).
-								Str("alt_handle", handle).
+								Str("alt_handle", altID).
 								Str("alt_portal_id", string(altPortalID)).
-								Msg("StatusKit: resolved DM portal via alternate handle")
+								Msg("StatusKit: resolved DM portal via contact store")
 							portal = altPortal
 							break
 						}
