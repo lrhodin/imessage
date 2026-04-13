@@ -1149,6 +1149,12 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		modeCopy = &s
 	}
 
+	// Optimistic dedup: store the new modeKey BEFORE dispatching so that
+	// rapid-fire re-deliveries of the same state (e.g. APNs replay on
+	// reconnect) are caught by the check above before the goroutine has
+	// had a chance to complete and store the key itself.
+	c.statusKitPresence.Store(user, modeKey)
+
 	// Dispatch ALL blocking work — ghost lookup, portal resolution, IDS
 	// fallback, and Matrix send — to a goroutine so this callback returns
 	// to Rust immediately and does not block the APNs receive loop.
@@ -1310,69 +1316,79 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		// room's last-activity timestamp — the chat won't jump to the top of
 		// the list as though a new message arrived from the contact.
 		noticeTS := time.Now().Add(-1 * time.Millisecond)
-		sendResp, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-			Parsed: &event.MessageEventContent{
-				MsgType:  event.MsgNotice,
-				Body:     notice,
-				Mentions: &event.Mentions{},
-			},
-			Raw: map[string]any{
-				"com.beeper.action_message": map[string]any{
-					"type": "presence_update",
+
+		var sendErr error
+		if c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
+			// Beeper/Hungry path: batch-send with SendNotification:false tells
+			// Hungry's proprietary push gateway to skip APNs dispatch entirely —
+			// this is the only mechanism that works on Hungry, which ignores
+			// standard Matrix push rules for DM rooms.  MarkReadBy atomically
+			// marks the event as read by the real user so no unread badge
+			// appears, replacing the separate m.read.private attempt.
+			batchEvt := &event.Event{
+				Type:      event.EventMessage,
+				Sender:    c.Main.Bridge.Bot.GetMXID(),
+				RoomID:    portal.MXID,
+				Timestamp: noticeTS.UnixMilli(),
+				Content: event.Content{
+					Parsed: &event.MessageEventContent{
+						MsgType:  event.MsgNotice,
+						Body:     notice,
+						Mentions: &event.Mentions{},
+					},
+					Raw: map[string]any{
+						"com.beeper.action_message": map[string]any{
+							"type": "presence_update",
+						},
+					},
 				},
-			},
-		}, &bridgev2.MatrixSendExtra{Timestamp: noticeTS})
+			}
+			batchReq := &mautrix.ReqBeeperBatchSend{
+				ForwardIfNoMessages: true,
+				SendNotification:    false,
+				Events:              []*event.Event{batchEvt},
+			}
+			if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
+				batchReq.MarkReadBy = dp.GetMXID()
+			}
+			_, sendErr = c.Main.Bridge.Matrix.BatchSend(ctx, portal.MXID, batchReq, nil)
+		} else {
+			// Fallback for homeservers without Beeper batch-send support.
+			// Push suppression relies on the sender push rules installed by
+			// ensureBotPushRuleSilenced (called at Connect time).
+			_, sendErr = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+				Parsed: &event.MessageEventContent{
+					MsgType:  event.MsgNotice,
+					Body:     notice,
+					Mentions: &event.Mentions{},
+				},
+				Raw: map[string]any{
+					"com.beeper.action_message": map[string]any{
+						"type": "presence_update",
+					},
+				},
+			}, &bridgev2.MatrixSendExtra{Timestamp: noticeTS})
+		}
 		if sendErr != nil {
 			log.Warn().Err(sendErr).Str("portal_mxid", string(portal.MXID)).Msg("StatusKit: failed to send presence notice")
 		} else {
-			// Store dedup key only after successful send to avoid poisoning
-			// on transient failures.
-			c.statusKitPresence.Store(user, modeKey)
-			// Keep push rules installed as a best-effort measure.
-			c.ensureBotPushRuleSilenced(ctx)
-			// Immediately mark the notice as *privately* read via the double
-			// puppet. Private read receipts (m.read.private) are:
-			//   • NOT forwarded to the iMessage contact — the bridge only
-			//     processes m.read, never m.read.private.
-			//   • NOT visible to other room members.
-			//   • Checked by Hungry's push gateway before dispatching to
-			//     APNs/FCM; if the private marker is ≥ the event's stream
-			//     order, the push is suppressed.
-			// We call SetBeeperInboxState / SetReadMarkers directly on the
-			// underlying Matrix client — not via ASIntent.MarkRead, which
-			// deliberately skips m.read.private and uses only m.read on
-			// Hungry.
-			if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
-				if asIntent, ok := dp.(*matrixfmt.ASIntent); ok {
-					req := &mautrix.ReqSetReadMarkers{
-						ReadPrivate: sendResp.EventID,
-					}
-					var rrErr error
-					if asIntent.Connector.SpecVersions.Supports(mautrix.BeeperFeatureInboxState) {
-						rrErr = asIntent.Matrix.SetBeeperInboxState(ctx, portal.MXID, &mautrix.ReqSetBeeperInboxState{
-							ReadMarkers: req,
-						})
-					} else {
-						rrErr = asIntent.Matrix.SetReadMarkers(ctx, portal.MXID, req)
-					}
-					if rrErr != nil {
-						log.Debug().Err(rrErr).Msg("StatusKit: failed to set private read marker for notice")
-					}
-				}
-			}
+			log.Info().Str("portal_mxid", string(portal.MXID)).Msg("StatusKit: sent silent presence notice")
 		}
 	}()
 }
 
 // ensureBotPushRuleSilenced installs push rules via the double puppet so
-// Beeper's push gateway never fires a notification for messages from the
-// bridge bot. Called eagerly at Connect() time and again as a fallback after
-// each StatusKit notice send.
+// that homeservers that respect Matrix push rules suppress notifications from
+// the bridge bot. Called eagerly at Connect() time as a one-shot install.
+//
+// Note: on Beeper/Hungry this is a no-op in practice — Hungry's proprietary
+// push gateway ignores Matrix push rules for DM rooms. Push suppression for
+// Hungry is instead achieved via ReqBeeperBatchSend.SendNotification:false
+// in the OnStatusUpdate send path.
 //
 // Two rules are installed for belt-and-suspenders coverage:
 //   - An override rule (evaluated first, before any DM-room override rules)
-//     with an event_match condition on the sender field. This wins over any
-//     Beeper default override rule that would otherwise say "notify for DMs".
+//     with an event_match condition on the sender field.
 //   - A sender rule (evaluated last) as a secondary catch-all.
 //
 // Both rules are durable on the homeserver and persist across restarts.
