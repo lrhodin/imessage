@@ -4931,7 +4931,23 @@ pub async fn new_client(
                                             cb.on_keys_received();
                                         }
                                     } else {
-                                        warn!("StatusKit keysharing APNs message arrived but state.keys did not grow (still {}) — IDS receive_message produced no decrypted payload; identity keys may be stale, sender unresolved, or message not addressed to this device", keys_after);
+                                        // Ignore c=255 send confirmations — they're ACKs for
+                                        // our own outgoing invites, not inbound peer messages.
+                                        // Only a non-ACK message that fails to populate
+                                        // state.keys indicates a real problem (peer invite
+                                        // not addressed to us / stale identity keys).
+                                        let is_server_ack = if let rustpush::APSMessage::Notification { payload, .. } = &msg {
+                                            plist::from_bytes::<plist::Value>(payload)
+                                                .ok()
+                                                .and_then(|v| v.as_dictionary().and_then(|d| d.get("c").and_then(|c| c.as_unsigned_integer())).map(|c| c as u8))
+                                                .map(|cmd| cmd == 255)
+                                                .unwrap_or(false)
+                                        } else {
+                                            false
+                                        };
+                                        if !is_server_ack {
+                                            warn!("StatusKit inbound keysharing message failed to populate state.keys — peer invite may be malformed or not addressed to this device");
+                                        }
                                     }
                                 }
                             }
