@@ -1167,82 +1167,113 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			}
 		}
 
-		// Resolve the DM portal — prefer tel: over mailto: by trying the
-		// contact store first (phones come before emails in contactPortalIDs).
+		// Resolve the DM portal, strongly preferring tel: over mailto:.
+		// A contact may have a mailto: portal (from messages on their Apple ID)
+		// AND a tel: portal (from messages on their phone number). The tel:
+		// portal is what the user actively uses. For mailto: handles that are
+		// not in the address book we cannot use the contact-store path, so we
+		// go straight to IDS correlation to find the tel: alias, and only
+		// fall back to the mailto: portal as a last resort.
 		normalizedUser := normalizeIdentifierForPortalID(user)
-		portalID := c.resolveContactPortalID(normalizedUser)
-		portalID = c.resolveExistingDMPortalID(string(portalID))
-		log.Info().
-			Str("normalized_user", normalizedUser).
-			Str("resolved_portal_id", string(portalID)).
-			Msg("StatusKit: resolved DM portal ID")
 
-		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-			ID:       portalID,
-			Receiver: c.UserLogin.ID,
-		})
-		if err != nil {
-			log.Warn().Err(err).Msg("StatusKit: failed to look up DM portal")
-			return
+		// findPortal returns a portal for the given portal ID, or nil.
+		findPortal := func(id networkid.PortalID) *bridgev2.Portal {
+			p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+				ID:       id,
+				Receiver: c.UserLogin.ID,
+			})
+			if err != nil || p == nil || p.MXID == "" {
+				return nil
+			}
+			return p
 		}
 
-		if portal == nil || portal.MXID == "" {
-			// Contact-store fallback: try all handles for the same person.
-			// contactPortalIDs returns phones before emails, so a tel: portal
-			// wins over a mailto: portal automatically.
+		var portal *bridgev2.Portal
+
+		if strings.HasPrefix(normalizedUser, "mailto:") {
+			// mailto: handle: prioritise tel: over the mailto: portal.
+			// Order: (1) address-book phones, (2) IDS correlation, (3) mailto: portal.
+
+			// (1) Address-book path — only works if contact is in address book.
 			contact := c.lookupContact(user)
 			if contact != nil {
 				for _, altID := range contactPortalIDs(contact) {
-					if altID == normalizedUser {
-						continue
+					if !strings.HasPrefix(altID, "tel:") {
+						continue // phones first; skip emails
 					}
-					altPortalID := c.resolveContactPortalID(altID)
-					altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
-					altPortal, altErr := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-						ID:       altPortalID,
-						Receiver: c.UserLogin.ID,
-					})
-					if altErr == nil && altPortal != nil && altPortal.MXID != "" {
-						log.Info().
-							Str("original", normalizedUser).
-							Str("alt_handle", altID).
-							Str("alt_portal_id", string(altPortalID)).
-							Msg("StatusKit: resolved DM portal via contact store")
-						portal = altPortal
+					if p := findPortal(networkid.PortalID(altID)); p != nil {
+						log.Info().Str("tel_handle", altID).Msg("StatusKit: resolved mailto→tel via address book")
+						portal = p
 						break
 					}
 				}
 			}
-		}
 
-		if portal == nil || portal.MXID == "" {
-			// IDS fallback: correlate via sender_correlation_identifier.
-			// ResolveHandle calls back into Rust FFI — safe here because we
-			// are in a goroutine, not the Rust callback stack. Use a 15s
-			// timeout so a slow IDS response does not leak this goroutine.
-			idsCtx, idsCancel := context.WithTimeout(ctx, 15*time.Second)
-			done := make(chan *bridgev2.Portal, 1)
-			go func() {
-				defer idsCancel()
-				done <- c.resolveStatusPortalViaIDS(idsCtx, log, user)
-			}()
-			select {
-			case altPortal := <-done:
-				if altPortal != nil {
-					portal = altPortal
+			// (2) IDS correlation — handles contacts not in the address book.
+			// Safe to call back into Rust here because we are in a goroutine,
+			// not the Rust FFI callback stack. 15s timeout to bound the wait.
+			if portal == nil {
+				idsCtx, idsCancel := context.WithTimeout(ctx, 15*time.Second)
+				done := make(chan *bridgev2.Portal, 1)
+				go func() {
+					defer idsCancel()
+					done <- c.resolveStatusPortalViaIDS(idsCtx, log, user)
+				}()
+				select {
+				case altPortal := <-done:
+					if altPortal != nil {
+						log.Info().Str("user", user).Msg("StatusKit: resolved mailto→tel via IDS correlation")
+						portal = altPortal
+					}
+				case <-idsCtx.Done():
+					log.Warn().Str("user", user).Msg("StatusKit: IDS portal resolution timed out after 15s")
 				}
-			case <-idsCtx.Done():
-				log.Warn().Str("user", user).Msg("StatusKit: IDS portal resolution timed out after 15s")
-				idsCancel()
+			}
+
+			// (3) Last resort: use the mailto: portal itself.
+			if portal == nil {
+				portal = findPortal(networkid.PortalID(normalizedUser))
+				if portal != nil {
+					log.Info().Str("portal_id", normalizedUser).Msg("StatusKit: using mailto: portal as last resort (no tel: found)")
+				}
+			}
+		} else {
+			// tel: or other handle: standard resolution chain.
+			portalID := c.resolveContactPortalID(normalizedUser)
+			portalID = c.resolveExistingDMPortalID(string(portalID))
+			portal = findPortal(portalID)
+
+			// Contact-store fallback.
+			if portal == nil {
+				contact := c.lookupContact(user)
+				if contact != nil {
+					for _, altID := range contactPortalIDs(contact) {
+						if altID == normalizedUser {
+							continue
+						}
+						altPortalID := c.resolveContactPortalID(altID)
+						altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
+						if p := findPortal(altPortalID); p != nil {
+							log.Info().Str("alt_handle", altID).Msg("StatusKit: resolved DM portal via contact store")
+							portal = p
+							break
+						}
+					}
+				}
 			}
 		}
 
 		if portal == nil || portal.MXID == "" {
 			log.Warn().
-				Str("portal_id", string(portalID)).
+				Str("user", normalizedUser).
 				Msg("StatusKit: no DM portal found for presence notice")
 			return
 		}
+
+		log.Info().
+			Str("normalized_user", normalizedUser).
+			Str("portal_id", string(portal.ID)).
+			Msg("StatusKit: sending presence notice to portal")
 
 		name := ghost.Name
 		if name == "" {
