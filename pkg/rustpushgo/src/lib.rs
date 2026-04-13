@@ -5130,10 +5130,17 @@ pub async fn new_client(
 
 impl Client {
     async fn get_or_init_cloud_messages_client(&self) -> Result<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+        info!("Cloud client init: acquiring cloud_messages_client lock");
+        let _lock_start = std::time::Instant::now();
         let mut locked = self.cloud_messages_client.lock().await;
+        if _lock_start.elapsed() > Duration::from_secs(1) {
+            info!("Cloud client init: waited {:?} for lock (another init was in progress)", _lock_start.elapsed());
+        }
         if let Some(client) = &*locked {
+            info!("Cloud client init: returning cached client");
             return Ok(client.clone());
         }
+        info!("Cloud client init: no cached client, initializing now");
 
         let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
             msg: "No TokenProvider available".into(),
@@ -5202,11 +5209,33 @@ impl Client {
         // from silently skipping records encrypted with old/rotated keys.
         // Step 1: Fetch recoverable TLK shares for our identity — this pulls
         // in key shares that sync_keychain alone might not discover.
+        info!("Cloud client init: step 1 — refreshing recoverable TLK shares");
+        let _step1_start = std::time::Instant::now();
         if let Err(e) = refresh_recoverable_tlk_shares(&keychain, "Cloud client init").await {
             warn!("Cloud client init: TLK share refresh failed (non-fatal): {}", e);
         }
-        // Step 2: Full keychain sync with retries.
-        sync_keychain_with_retries(&keychain, 6, "Cloud client init").await?;
+        info!("Cloud client init: step 1 done in {:?}", _step1_start.elapsed());
+
+        // Step 2: Full keychain sync with retries (non-fatal with timeout).
+        // If keychain sync hangs or fails, sync_records will encounter PCS key
+        // errors and trigger recover_cloud_pcs_state, which re-runs the sync.
+        // A 90s timeout and 3 attempts prevent an indefinite hang here.
+        info!("Cloud client init: step 2 — syncing keychain (3 attempts, 90s timeout)");
+        let _step2_start = std::time::Instant::now();
+        match tokio::time::timeout(
+            Duration::from_secs(90),
+            sync_keychain_with_retries(&keychain, 3, "Cloud client init"),
+        ).await {
+            Ok(Ok(())) => {
+                info!("Cloud client init: step 2 done in {:?}", _step2_start.elapsed());
+            }
+            Ok(Err(e)) => {
+                warn!("Cloud client init: keychain sync failed (non-fatal, PCS keys may be incomplete): {}", e);
+            }
+            Err(_elapsed) => {
+                warn!("Cloud client init: keychain sync timed out after 90s (non-fatal, PCS keys may be incomplete)");
+            }
+        }
 
         let cloud_messages = Arc::new(rustpush::cloud_messages::CloudMessagesClient::new(
             cloudkit, keychain.clone(),
@@ -5224,7 +5253,9 @@ impl Client {
         // already ran), we populate the container's in-memory zone key cache
         // with sync_keychain=false. All subsequent lazy calls find the key in
         // cache and skip the sync_keychain call entirely.
-        {
+        info!("Cloud client init: step 3 — pre-warming PCS zone keys (45s timeout)");
+        let _step3_start = std::time::Instant::now();
+        match tokio::time::timeout(Duration::from_secs(45), async {
             use rustpush::cloud_messages::MESSAGES_SERVICE;
             match cloud_messages.get_container().await {
                 Ok(container) => {
@@ -5243,18 +5274,30 @@ impl Client {
                 }
                 Err(e) => warn!("Cloud client init: container fetch for zone prewarm failed (non-fatal): {}", e),
             }
+        }).await {
+            Ok(()) => info!("Cloud client init: step 3 done in {:?}", _step3_start.elapsed()),
+            Err(_) => warn!("Cloud client init: zone key prewarm timed out after 45s (non-fatal)"),
         }
 
         // Step 4: Log server-side record counts for diagnostics.
-        match cloud_messages.count_records().await {
-            Ok(summary) => {
-                info!("CloudKit server record counts — messages: {}, chats: {}, attachments: {}",
-                    summary.messages_summary.len(), summary.chat_summary.len(), summary.attachment_summary.len());
+        info!("Cloud client init: step 4 — counting server records (30s timeout)");
+        let _step4_start = std::time::Instant::now();
+        match tokio::time::timeout(Duration::from_secs(30), cloud_messages.count_records()).await {
+            Ok(Ok(summary)) => {
+                info!(
+                    "Cloud client init: step 4 done in {:?} — CloudKit server record counts: messages={}, chats={}, attachments={}",
+                    _step4_start.elapsed(),
+                    summary.messages_summary.len(), summary.chat_summary.len(), summary.attachment_summary.len()
+                );
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Cloud client init: count_records failed (non-fatal): {}", e);
             }
+            Err(_elapsed) => {
+                warn!("Cloud client init: count_records timed out after 30s (non-fatal)");
+            }
         }
+        info!("Cloud client init: complete");
 
         *locked = Some(cloud_messages.clone());
         *self.cloud_keychain_client.lock().await = Some(keychain);
