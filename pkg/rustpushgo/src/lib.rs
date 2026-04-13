@@ -4884,6 +4884,11 @@ pub async fn new_client(
                     } else {
                         None
                     };
+                    // Snapshot state.keys before handle() so we can tell whether a
+                    // keysharing APNs message actually populated state.keys or was
+                    // silently dropped by IDS receive_message (e.g. due to stale
+                    // identity keys, missing sender, or undecryptable payload).
+                    let keys_before = sk.state.read().await.keys.len();
                     // handle() is async and may panic (statuskit.rs:736 "Channel not
                     // found!"). Spawn a thread so the panic is contained there and
                     // doesn't crash the async message loop. The Result is sent
@@ -4911,17 +4916,22 @@ pub async fn new_client(
                         }
                         Ok(Ok(None)) => {
                             // Not a StatusKit presence update — but check whether it
-                            // was a key-sharing message. When StatusKit receives a
-                            // key-sharing message, handle() adds the new encryption
-                            // key to its internal state but returns Ok(None) (no
-                            // StatusChanged event). The Go side needs to re-subscribe
-                            // so that APNs channels are created for the new keys.
+                            // was a key-sharing message. Only fire on_keys_received
+                            // if state.keys actually grew; otherwise IDS
+                            // receive_message silently dropped the message (a
+                            // common failure mode that leaves state.keys empty and
+                            // nothing subscribable).
                             let keysharing_topic: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
                             if let Some(topic) = msg_topic {
                                 if topic == keysharing_topic {
-                                    info!("StatusKit key-sharing message received — new presence keys available");
-                                    if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
-                                        cb.on_keys_received();
+                                    let keys_after = sk.state.read().await.keys.len();
+                                    if keys_after > keys_before {
+                                        info!("StatusKit key-sharing message received — state.keys grew {} → {}", keys_before, keys_after);
+                                        if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                            cb.on_keys_received();
+                                        }
+                                    } else {
+                                        warn!("StatusKit keysharing APNs message arrived but state.keys did not grow (still {}) — IDS receive_message produced no decrypted payload; identity keys may be stale, sender unresolved, or message not addressed to this device", keys_after);
                                     }
                                 }
                             }
