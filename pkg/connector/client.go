@@ -1337,12 +1337,18 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	}()
 }
 
-// ensureBotPushRuleSilenced installs a global sender push rule via the double
-// puppet that tells Beeper's push gateway never to send a notification for
-// messages from the bridge bot. Called eagerly at Connect() time and again as
-// a belt-and-suspenders fallback after each StatusKit notice send.
+// ensureBotPushRuleSilenced installs push rules via the double puppet so
+// Beeper's push gateway never fires a notification for messages from the
+// bridge bot. Called eagerly at Connect() time and again as a fallback after
+// each StatusKit notice send.
 //
-// The rule is durable on the homeserver, so it persists across bridge restarts.
+// Two rules are installed for belt-and-suspenders coverage:
+//   - An override rule (evaluated first, before any DM-room override rules)
+//     with an event_match condition on the sender field. This wins over any
+//     Beeper default override rule that would otherwise say "notify for DMs".
+//   - A sender rule (evaluated last) as a secondary catch-all.
+//
+// Both rules are durable on the homeserver and persist across restarts.
 // statusKitBotRulePushed guards against redundant API calls within a session.
 // A no-op if the double puppet is not available or the assertion fails.
 func (c *IMClient) ensureBotPushRuleSilenced(ctx context.Context) {
@@ -1359,16 +1365,37 @@ func (c *IMClient) ensureBotPushRuleSilenced(ctx context.Context) {
 	}
 	log := c.UserLogin.Log.With().Str("component", "statuskit").Logger()
 	botMXID := c.Main.Bridge.Bot.GetMXID().String()
-	err := asIntent.Matrix.PutPushRule(ctx, "global", pushrules.SenderRule, botMXID,
+
+	// Override rule (highest priority — evaluated before DM override rules).
+	overrideRuleID := botMXID + ".dont_notify"
+	err := asIntent.Matrix.PutPushRule(ctx, "global", pushrules.OverrideRule, overrideRuleID,
+		&mautrix.ReqPutPushRule{
+			Conditions: []pushrules.PushCondition{
+				{
+					Kind:    pushrules.KindEventMatch,
+					Key:     "sender",
+					Pattern: botMXID,
+				},
+			},
+			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+		})
+	if err != nil {
+		log.Debug().Err(err).Str("bot_mxid", botMXID).Msg("Failed to install bot override push rule")
+		return
+	}
+
+	// Sender rule (secondary catch-all for homeservers without override support).
+	err = asIntent.Matrix.PutPushRule(ctx, "global", pushrules.SenderRule, botMXID,
 		&mautrix.ReqPutPushRule{
 			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
 		})
 	if err != nil {
 		log.Debug().Err(err).Str("bot_mxid", botMXID).Msg("Failed to install bot sender push rule")
-		return
+		// Override rule succeeded; treat as partial success.
 	}
+
 	c.statusKitBotRulePushed.Store(true)
-	log.Debug().Str("bot_mxid", botMXID).Msg("Bot sender push rule installed — bridge bot messages will not notify")
+	log.Debug().Str("bot_mxid", botMXID).Msg("Bot push rules installed — bridge bot messages will not notify")
 }
 
 // resolveStatusPortalViaIDS is the last-resort portal resolver for StatusKit
