@@ -5533,46 +5533,64 @@ impl Client {
             msg: "no handle available".into(),
         })?.clone();
 
-        // Query IDS only for the incoming handle (not all known_handles).
-        // Querying hundreds of handles at once causes validate_targets to
-        // block for 15+ seconds; a single-handle query usually completes
-        // quickly. known_handles are already in the cache from message
-        // processing — we only need the correlation_id for the incoming handle.
-        // Apply a 5s tokio timeout so validate_targets cannot block forever.
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            self.client.identity.validate_targets(&[handle.clone()], "com.apple.madrid", &my_handle),
-        ).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => info!("resolve_handle: validate_targets failed for {}: {:?}", handle, e),
-            Err(_) => info!("resolve_handle: validate_targets timed out after 5s for {}", handle),
-        }
+        // Try two IDS services in order:
+        //   1. com.apple.madrid (iMessage) — the normal path
+        //   2. com.apple.private.alloy.status.keysharing (StatusKit) — fallback
+        //
+        // Contacts who use iMessage only via their phone number have zero
+        // Madrid keys for their Apple ID (mailto:) — IDS reports "zero keys".
+        // However, they DO have StatusKit-keysharing keys because their device
+        // sent us a key-sharing message using their Apple ID. The keysharing
+        // service uses the same sender_correlation_identifier as Madrid, so
+        // the same correlation-ID scan works; we just need the right service.
+        //
+        // Each validate_targets call is bounded to 5 s via tokio timeout so
+        // a single-handle IDS query cannot block the goroutine indefinitely.
+        const SERVICES: &[&str] = &[
+            "com.apple.madrid",
+            "com.apple.private.alloy.status.keysharing",
+        ];
 
-        let cache = self.client.identity.cache.lock().await;
-        let Some(correlation_id) = cache.get_correlation_id("com.apple.madrid", &my_handle, &handle) else {
-            info!("resolve_handle: no correlation ID for {} (cache miss after IDS query)", handle);
-            return Ok(vec![]);
-        };
-        if correlation_id.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Scan known handles from cache only — tel: handles from message
-        // processing are already cached and don't require a network call.
-        let mut aliases = vec![];
-        for known_handle in &known_handles {
-            if known_handle == &handle {
-                continue;
+        for &service in SERVICES {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.client.identity.validate_targets(&[handle.clone()], service, &my_handle),
+            ).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => info!("resolve_handle: validate_targets({}) failed for {}: {:?}", service, handle, e),
+                Err(_) => info!("resolve_handle: validate_targets({}) timed out after 5s for {}", service, handle),
             }
-            if let Some(cid) = cache.get_correlation_id("com.apple.madrid", &my_handle, known_handle) {
-                if cid == correlation_id {
-                    aliases.push(known_handle.clone());
+
+            let cache = self.client.identity.cache.lock().await;
+            let correlation_id = match cache.get_correlation_id(service, &my_handle, &handle) {
+                Some(cid) if !cid.is_empty() => cid,
+                _ => {
+                    info!("resolve_handle: no correlation ID for {} in {} — trying next service", handle, service);
+                    continue; // try next service
+                }
+            };
+
+            // Scan known handles for matching correlation IDs in this service.
+            // known_handles are pre-populated from message processing (tel:) and
+            // StatusKit invite responses (mailto:), so no extra IDS calls needed.
+            let mut aliases = vec![];
+            for known_handle in &known_handles {
+                if known_handle == &handle {
+                    continue;
+                }
+                if let Some(cid) = cache.get_correlation_id(service, &my_handle, known_handle) {
+                    if cid == correlation_id {
+                        aliases.push(known_handle.clone());
+                    }
                 }
             }
+
+            info!("resolve_handle: {} → {} alias(es) via {} (correlation {})", handle, aliases.len(), service, correlation_id);
+            return Ok(aliases);
         }
 
-        info!("resolve_handle: {} → {} alias(es) (correlation {})", handle, aliases.len(), correlation_id);
-        Ok(aliases)
+        info!("resolve_handle: no correlation ID for {} in any IDS service", handle);
+        Ok(vec![])
     }
 
     /// Like resolve_handle but reads ONLY from the in-memory IDS cache —
