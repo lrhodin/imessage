@@ -147,6 +147,14 @@ type IMClient struct {
 	// when StatusKit re-delivers the same presence state on reconnect.
 	statusKitPresence sync.Map // map[string]bool
 
+	// lastPresenceSubscribe timestamps the most recent call to
+	// subscribeToContactPresence. OnKeysReceived triggers re-subscription
+	// when new keys arrive, but multiple key-sharing messages can arrive in
+	// quick succession — the debounce prevents redundant APNs subscription
+	// storms.
+	lastPresenceSubscribe     time.Time
+	lastPresenceSubscribeLock sync.Mutex
+
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool
 	contactsReadyLock sync.RWMutex
@@ -1212,6 +1220,17 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	if err != nil {
 		log.Warn().Err(err).Str("portal_mxid", string(portal.MXID)).Msg("Failed to send presence notice to portal")
 	}
+}
+
+// OnKeysReceived is called by StatusKit when a key-sharing message arrives.
+// New encryption keys mean we can now subscribe to APNs presence channels
+// for handles that previously had no keys. Re-subscribe to pick them up.
+func (c *IMClient) OnKeysReceived() {
+	log := c.UserLogin.Log.With().
+		Str("component", "statuskit").
+		Logger()
+	log.Info().Msg("StatusKit: key-sharing message received — re-subscribing to presence")
+	go c.subscribeToContactPresence(log)
 }
 
 // OnMessage is called by rustpush when a message is received via APNs.

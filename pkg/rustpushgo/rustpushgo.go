@@ -1825,6 +1825,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_statuscallback_on_keys_received(uniffiStatus)
+		})
+		if checksum != 53322 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_statuscallback_on_keys_received: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_updateuserscallback_update_users(uniffiStatus)
 		})
 		if checksum != 85 {
@@ -7865,6 +7874,8 @@ func (FfiDestroyerCallbackInterfaceMessageCallback) Destroy(value MessageCallbac
 
 type StatusCallback interface {
 	OnStatusUpdate(user string, mode *string, available bool)
+
+	OnKeysReceived()
 }
 
 // foreignCallbackCallbackInterfaceStatusCallback cannot be callable be a compiled function at a same time
@@ -7886,6 +7897,11 @@ func rustpushgo_cgo_StatusCallback(handle C.uint64_t, method C.int32_t, argsPtr 
 		args := unsafe.Slice((*byte)(argsPtr), argsLen)
 		result = foreignCallbackCallbackInterfaceStatusCallback{}.InvokeOnStatusUpdate(cb, args, outBuf)
 		return C.int32_t(result)
+	case 2:
+		var result uniffiCallbackResult
+		args := unsafe.Slice((*byte)(argsPtr), argsLen)
+		result = foreignCallbackCallbackInterfaceStatusCallback{}.InvokeOnKeysReceived(cb, args, outBuf)
+		return C.int32_t(result)
 
 	default:
 		// This should never happen, because an out of bounds method index won't
@@ -7898,6 +7914,11 @@ func rustpushgo_cgo_StatusCallback(handle C.uint64_t, method C.int32_t, argsPtr 
 func (foreignCallbackCallbackInterfaceStatusCallback) InvokeOnStatusUpdate(callback StatusCallback, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
 	reader := bytes.NewReader(args)
 	callback.OnStatusUpdate(FfiConverterStringINSTANCE.Read(reader), FfiConverterOptionalStringINSTANCE.Read(reader), FfiConverterBoolINSTANCE.Read(reader))
+
+	return uniffiCallbackResultSuccess
+}
+func (foreignCallbackCallbackInterfaceStatusCallback) InvokeOnKeysReceived(callback StatusCallback, args []byte, outBuf *C.RustBuffer) uniffiCallbackResult {
+	callback.OnKeysReceived()
 
 	return uniffiCallbackResultSuccess
 }

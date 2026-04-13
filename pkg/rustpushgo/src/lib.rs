@@ -3108,6 +3108,10 @@ pub trait UpdateUsersCallback: Send + Sync {
 #[uniffi::export(callback_interface)]
 pub trait StatusCallback: Send + Sync {
     fn on_status_update(&self, user: String, mode: Option<String>, available: bool);
+    /// Called when StatusKit receives a key-sharing message, which adds new
+    /// encryption keys to the internal state. The Go side should re-subscribe
+    /// to presence so that APNs channels are created for the newly-available keys.
+    fn on_keys_received(&self);
 }
 
 // ============================================================================
@@ -4872,6 +4876,14 @@ pub async fn new_client(
                 // handling. Only active when init_statuskit() has been
                 // called; otherwise falls through.
                 if let Some(sk) = sk_for_recv.read().await.as_ref().cloned() {
+                    // Extract the APNs topic before spawning the thread so we can
+                    // check it later for key-sharing detection (msg is moved into
+                    // the spawned thread and unavailable afterwards).
+                    let msg_topic = if let rustpush::APSMessage::Notification { topic, .. } = &msg {
+                        Some(*topic)
+                    } else {
+                        None
+                    };
                     // handle() is async and may panic (statuskit.rs:736 "Channel not
                     // found!"). Spawn a thread so the panic is contained there and
                     // doesn't crash the async message loop. The Result is sent
@@ -4897,7 +4909,23 @@ pub async fn new_client(
                             pending.fetch_sub(1, Ordering::Relaxed);
                             continue;
                         }
-                        Ok(Ok(None)) => {} // not a StatusKit message — fall through
+                        Ok(Ok(None)) => {
+                            // Not a StatusKit presence update — but check whether it
+                            // was a key-sharing message. When StatusKit receives a
+                            // key-sharing message, handle() adds the new encryption
+                            // key to its internal state but returns Ok(None) (no
+                            // StatusChanged event). The Go side needs to re-subscribe
+                            // so that APNs channels are created for the new keys.
+                            let keysharing_topic: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
+                            if let Some(topic) = msg_topic {
+                                if topic == keysharing_topic {
+                                    info!("StatusKit key-sharing message received — new presence keys available");
+                                    if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                        cb.on_keys_received();
+                                    }
+                                }
+                            }
+                        }
                         Ok(Err(rustpush::PushError::VerificationFailed)) => {
                             warn!("StatusKit signature verification failed — key ratchet mismatch, will resolve on next key-sharing message");
                         }
@@ -5413,7 +5441,7 @@ impl Client {
         })?;
         let token = sk.request_handles(&handles).await;
         self.statuskit_interest_tokens.lock().await.push(token);
-        info!("Subscribed to presence for {} handle(s)", handles.len());
+        info!("Requested presence subscription for {} handle(s) — APNs channels are created as key-sharing messages arrive", handles.len());
         Ok(())
     }
 

@@ -724,6 +724,18 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 	if c.client == nil {
 		return
 	}
+	// Debounce: skip if we subscribed less than 5 seconds ago. Multiple
+	// key-sharing messages can arrive in quick succession, and each one
+	// triggers OnKeysReceived → subscribeToContactPresence.
+	c.lastPresenceSubscribeLock.Lock()
+	if time.Since(c.lastPresenceSubscribe) < 5*time.Second {
+		c.lastPresenceSubscribeLock.Unlock()
+		log.Debug().Msg("Skipping presence re-subscription (debounced)")
+		return
+	}
+	c.lastPresenceSubscribe = time.Now()
+	c.lastPresenceSubscribeLock.Unlock()
+
 	ctx := context.Background()
 	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost")
 	if err != nil {
