@@ -4949,29 +4949,32 @@ pub async fn new_client(
                                             } else {
                                                 (None, None)
                                             };
-                                        // c=255 = server ACK for our own outgoing invite.
-                                        // c=97  = non-encrypted APNs notification on this topic
-                                        //         (no IDS envelope fields); upstream has no handler
-                                        //         for it and it never populates state.keys by design.
-                                        // Both are expected noise — suppress silently.
-                                        let is_silent = cmd_byte.map(|c| c == 255 || c == 97).unwrap_or(false);
+                                        // c=255 = server ACK for our own outgoing invite; suppress.
+                                        // c=97  = unknown command on keysharing topic. Log all
+                                        //         plist keys at WARN so we can see whether this is
+                                        //         a real iOS keysharing message in a different format
+                                        //         than the OpenBubbles c=227. Other commands also logged.
+                                        let is_silent = cmd_byte.map(|c| c == 255).unwrap_or(false);
                                         if !is_silent {
-                                            if let Some((sp, tp, p, t, e)) = ids_fields {
-                                                warn!(
-                                                    "StatusKit inbound keysharing message (c={}) did not grow state.keys — IDS fields present: sP={} tP={} P={} t={} E={}",
-                                                    cmd_byte.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
-                                                    if sp { "Y" } else { "N" },
-                                                    if tp { "Y" } else { "N" },
-                                                    if p  { "Y" } else { "N" },
-                                                    if t  { "Y" } else { "N" },
-                                                    if e  { "Y" } else { "N" },
-                                                );
+                                            let all_keys = if let rustpush::APSMessage::Notification { payload, .. } = &msg {
+                                                plist::from_bytes::<plist::Value>(payload)
+                                                    .ok()
+                                                    .and_then(|v| v.into_dictionary())
+                                                    .map(|d| d.keys().cloned().collect::<Vec<_>>().join(", "))
+                                                    .unwrap_or_else(|| "<unparseable>".into())
                                             } else {
-                                                warn!(
-                                                    "StatusKit inbound keysharing message (c={}) did not grow state.keys — could not parse payload",
-                                                    cmd_byte.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
-                                                );
-                                            }
+                                                "<not a notification>".into()
+                                            };
+                                            warn!(
+                                                "StatusKit inbound keysharing message (c={}) did not grow state.keys — plist keys: [{}]  IDS fields: sP={} tP={} P={} t={} E={}",
+                                                cmd_byte.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                                                all_keys,
+                                                ids_fields.map(|(sp,_,_,_,_)| if sp {"Y"} else {"N"}).unwrap_or("?"),
+                                                ids_fields.map(|(_,tp,_,_,_)| if tp {"Y"} else {"N"}).unwrap_or("?"),
+                                                ids_fields.map(|(_,_,p,_,_)|  if p  {"Y"} else {"N"}).unwrap_or("?"),
+                                                ids_fields.map(|(_,_,_,t,_)|  if t  {"Y"} else {"N"}).unwrap_or("?"),
+                                                ids_fields.map(|(_,_,_,_,e)|  if e  {"Y"} else {"N"}).unwrap_or("?"),
+                                            );
                                         }
                                     }
                                 }
