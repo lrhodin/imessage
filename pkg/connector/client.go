@@ -1212,21 +1212,13 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			// (2) IDS correlation — handles contacts not in the address book.
 			// Safe to call back into Rust here because we are in a goroutine,
 			// not the Rust FFI callback stack. 15s timeout to bound the wait.
+			// (2) IDS correlation — handles contacts not in the address book.
+			// ResolveHandle now queries IDS only for the mailto: handle with
+			// an internal 5s tokio timeout, so this call is self-bounding.
 			if portal == nil {
-				idsCtx, idsCancel := context.WithTimeout(ctx, 15*time.Second)
-				done := make(chan *bridgev2.Portal, 1)
-				go func() {
-					defer idsCancel()
-					done <- c.resolveStatusPortalViaIDS(idsCtx, log, user)
-				}()
-				select {
-				case altPortal := <-done:
-					if altPortal != nil {
-						log.Info().Str("user", user).Msg("StatusKit: resolved mailto→tel via IDS correlation")
-						portal = altPortal
-					}
-				case <-idsCtx.Done():
-					log.Warn().Str("user", user).Msg("StatusKit: IDS portal resolution timed out after 15s")
+				if altPortal := c.resolveStatusPortalViaIDS(ctx, log, user); altPortal != nil {
+					log.Info().Str("user", user).Msg("StatusKit: resolved mailto→tel via IDS correlation")
+					portal = altPortal
 				}
 			}
 

@@ -5534,31 +5534,33 @@ impl Client {
             msg: "no handle available".into(),
         })?.clone();
 
-        // Batch IDS lookup: query the incoming handle plus all known ghost
-        // handles in a single Madrid call so every correlation_id lands in
-        // the cache at once. StatusKit subscription doesn't populate the IDS
-        // cache, so without this batch the known_handles would be missing.
-        let mut targets: Vec<String> = Vec::with_capacity(known_handles.len() + 1);
-        targets.push(handle.clone());
-        for k in &known_handles {
-            if k != &handle {
-                targets.push(k.clone());
-            }
-        }
-        if let Err(e) = self.client.identity.validate_targets(&targets, "com.apple.madrid", &my_handle).await {
-            info!("resolve_handle: validate_targets for {} handles failed: {:?}", targets.len(), e);
+        // Query IDS only for the incoming handle (not all known_handles).
+        // Querying hundreds of handles at once causes validate_targets to
+        // block for 15+ seconds; a single-handle query usually completes
+        // quickly. known_handles are already in the cache from message
+        // processing — we only need the correlation_id for the incoming handle.
+        // Apply a 5s tokio timeout so validate_targets cannot block forever.
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.client.identity.validate_targets(&[handle.clone()], "com.apple.madrid", &my_handle),
+        ).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => info!("resolve_handle: validate_targets failed for {}: {:?}", handle, e),
+            Err(_) => info!("resolve_handle: validate_targets timed out after 5s for {}", handle),
         }
 
         let cache = self.client.identity.cache.lock().await;
         let Some(correlation_id) = cache.get_correlation_id("com.apple.madrid", &my_handle, &handle) else {
-            info!("resolve_handle: no correlation ID for {}", handle);
-            return Ok(vec![handle]);
+            info!("resolve_handle: no correlation ID for {} (cache miss after IDS query)", handle);
+            return Ok(vec![]);
         };
         if correlation_id.is_empty() {
-            return Ok(vec![handle]);
+            return Ok(vec![]);
         }
 
-        let mut aliases = vec![handle.clone()];
+        // Scan known handles from cache only — tel: handles from message
+        // processing are already cached and don't require a network call.
+        let mut aliases = vec![];
         for known_handle in &known_handles {
             if known_handle == &handle {
                 continue;
@@ -5570,7 +5572,7 @@ impl Client {
             }
         }
 
-        info!("resolve_handle: {} → {} aliases (correlation {})", handle, aliases.len(), correlation_id);
+        info!("resolve_handle: {} → {} alias(es) (correlation {})", handle, aliases.len(), correlation_id);
         Ok(aliases)
     }
 
