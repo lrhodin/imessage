@@ -1098,6 +1098,12 @@ func statusKitModeLabel(mode *string) string {
 // Posts an m.notice in the DM portal so the user sees a subtle inline notice
 // (the way Apple shows "has notifications silenced" at the bottom of the chat).
 // Also sets Matrix ghost presence for clients that render it.
+//
+// IMPORTANT: this function is called from a Rust FFI callback (inside the APNs
+// receive loop). It must return quickly — any blocking work, especially any
+// call back into Rust (e.g. ResolveHandle), would block the receive loop and
+// can deadlock on a single-threaded tokio runtime. All non-trivial work is
+// therefore dispatched to a goroutine immediately after the fast dedup check.
 func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	log := c.UserLogin.Log.With().
 		Str("component", "statuskit").
@@ -1118,153 +1124,166 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			return
 		}
 	}
-	// NOTE: dedup key is stored AFTER successful send, not here. Storing
-	// before portal resolution / send poisons the map if the send fails
-	// transiently — all future state-identical updates would be skipped.
 
-	presence := event.PresenceUnavailable
-	statusMsg := ""
-	if available {
-		presence = event.PresenceOnline
-	} else if mode != nil && *mode != "" {
-		statusMsg = *mode
-	}
 	log.Info().
 		Bool("available", available).
-		Str("status_msg", statusMsg).
-		Msg("StatusKit: received presence update")
+		Str("mode_key", modeKey).
+		Msg("StatusKit: received presence update — dispatching to goroutine")
 
-	ctx := context.Background()
-	ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
-	if err != nil || ghost == nil || ghost.Intent == nil {
-		log.Warn().Err(err).Msg("No ghost found for presence update — ignoring")
-		return
+	// Capture values for the goroutine (mode is a pointer; copy the string).
+	var modeCopy *string
+	if mode != nil {
+		s := *mode
+		modeCopy = &s
 	}
 
-	// Set Matrix presence for clients that render it (not Beeper, but others may).
-	if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
-		if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
-			Presence:  presence,
-			StatusMsg: statusMsg,
-		}); err != nil {
-			log.Warn().Err(err).Msg("Failed to set Matrix presence for ghost")
+	// Dispatch ALL blocking work — ghost lookup, portal resolution, IDS
+	// fallback, and Matrix send — to a goroutine so this callback returns
+	// to Rust immediately and does not block the APNs receive loop.
+	go func() {
+		ctx := context.Background()
+
+		ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
+		if err != nil || ghost == nil || ghost.Intent == nil {
+			log.Warn().Err(err).Msg("StatusKit: no ghost found for presence update — ignoring")
+			return
 		}
-	}
 
-	// Post an m.notice in the DM portal — this is what actually shows up in
-	// Beeper as the inline "notifications silenced" indicator.
-	// Use the full DM resolution chain (normalize → contact merge → phone
-	// variant) to match the same portal ID that makePortalKey would produce.
-	normalizedUser := normalizeIdentifierForPortalID(user)
-	portalID := c.resolveContactPortalID(normalizedUser)
-	portalID = c.resolveExistingDMPortalID(string(portalID))
-	log.Info().
-		Str("normalized_user", normalizedUser).
-		Str("resolved_portal_id", string(portalID)).
-		Msg("StatusKit: resolved DM portal ID")
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-		ID:       portalID,
-		Receiver: c.UserLogin.ID,
-	})
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to look up DM portal for presence notice")
-		return
-	}
+		presence := event.PresenceUnavailable
+		statusMsg := ""
+		if available {
+			presence = event.PresenceOnline
+		} else if modeCopy != nil && *modeCopy != "" {
+			statusMsg = *modeCopy
+		}
+
+		// Set Matrix presence for clients that render it.
+		if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
+			if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
+				Presence:  presence,
+				StatusMsg: statusMsg,
+			}); err != nil {
+				log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
+			}
+		}
+
+		// Resolve the DM portal — prefer tel: over mailto: by trying the
+		// contact store first (phones come before emails in contactPortalIDs).
+		normalizedUser := normalizeIdentifierForPortalID(user)
+		portalID := c.resolveContactPortalID(normalizedUser)
+		portalID = c.resolveExistingDMPortalID(string(portalID))
+		log.Info().
+			Str("normalized_user", normalizedUser).
+			Str("resolved_portal_id", string(portalID)).
+			Msg("StatusKit: resolved DM portal ID")
+
+		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+			ID:       portalID,
+			Receiver: c.UserLogin.ID,
+		})
+		if err != nil {
+			log.Warn().Err(err).Msg("StatusKit: failed to look up DM portal")
+			return
+		}
+
 		if portal == nil || portal.MXID == "" {
-			// If the portal lookup failed (common for mailto: handles whose DM
-			// portal was created under a tel: handle), try all other identifiers
-			// from the contact store. A contact may have both
-			// mailto:user@icloud.com and tel:+1... channels — their DM portal
-			// is likely under the tel: handle. This uses the contact store rather
-			// than GetKnownHandles() because key-sharing messages may not have
-			// arrived for all of a contact's handles.
-			if c.client != nil {
-				contact := c.lookupContact(user)
-				if contact != nil {
-					for _, altID := range contactPortalIDs(contact) {
-						if altID == normalizedUser {
-							continue // already tried
-						}
-						altPortalID := c.resolveContactPortalID(altID)
-						altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
-						altPortal, altErr := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
-							ID:       altPortalID,
-							Receiver: c.UserLogin.ID,
-						})
-						if altErr == nil && altPortal != nil && altPortal.MXID != "" {
-							log.Info().
-								Str("original", normalizedUser).
-								Str("alt_handle", altID).
-								Str("alt_portal_id", string(altPortalID)).
-								Msg("StatusKit: resolved DM portal via contact store")
-							portal = altPortal
-							break
-						}
+			// Contact-store fallback: try all handles for the same person.
+			// contactPortalIDs returns phones before emails, so a tel: portal
+			// wins over a mailto: portal automatically.
+			contact := c.lookupContact(user)
+			if contact != nil {
+				for _, altID := range contactPortalIDs(contact) {
+					if altID == normalizedUser {
+						continue
+					}
+					altPortalID := c.resolveContactPortalID(altID)
+					altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
+					altPortal, altErr := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+						ID:       altPortalID,
+						Receiver: c.UserLogin.ID,
+					})
+					if altErr == nil && altPortal != nil && altPortal.MXID != "" {
+						log.Info().
+							Str("original", normalizedUser).
+							Str("alt_handle", altID).
+							Str("alt_portal_id", string(altPortalID)).
+							Msg("StatusKit: resolved DM portal via contact store")
+						portal = altPortal
+						break
 					}
 				}
 			}
-			if portal == nil || portal.MXID == "" {
-				if altPortal := c.resolveStatusPortalViaIDS(ctx, log, user); altPortal != nil {
+		}
+
+		if portal == nil || portal.MXID == "" {
+			// IDS fallback: correlate via sender_correlation_identifier.
+			// ResolveHandle calls back into Rust FFI — safe here because we
+			// are in a goroutine, not the Rust callback stack. Use a 15s
+			// timeout so a slow IDS response does not leak this goroutine.
+			idsCtx, idsCancel := context.WithTimeout(ctx, 15*time.Second)
+			done := make(chan *bridgev2.Portal, 1)
+			go func() {
+				defer idsCancel()
+				done <- c.resolveStatusPortalViaIDS(idsCtx, log, user)
+			}()
+			select {
+			case altPortal := <-done:
+				if altPortal != nil {
 					portal = altPortal
 				}
-			}
-			if portal == nil || portal.MXID == "" {
-				log.Warn().
-					Str("portal_id", string(portalID)).
-					Msg("No DM portal with MXID found for presence notice")
-				return
+			case <-idsCtx.Done():
+				log.Warn().Str("user", user).Msg("StatusKit: IDS portal resolution timed out after 15s")
+				idsCancel()
 			}
 		}
 
-	name := ghost.Name
-	if name == "" {
-		name = user
-	}
-	var notice string
-	if available {
-		notice = name + " has notifications turned on."
-	} else {
-		label := statusKitModeLabel(mode)
-		if label != "" {
-			notice = "🔕 " + name + " has notifications silenced (" + label + ")."
+		if portal == nil || portal.MXID == "" {
+			log.Warn().
+				Str("portal_id", string(portalID)).
+				Msg("StatusKit: no DM portal found for presence notice")
+			return
+		}
+
+		name := ghost.Name
+		if name == "" {
+			name = user
+		}
+		var notice string
+		if available {
+			notice = name + " has notifications turned on."
 		} else {
-			notice = "🔕 " + name + " has notifications silenced."
+			label := statusKitModeLabel(modeCopy)
+			if label != "" {
+				notice = "🔕 " + name + " has notifications silenced (" + label + ")."
+			} else {
+				notice = "🔕 " + name + " has notifications silenced."
+			}
 		}
-	}
 
-	// Send via ghost intent so the notice appears as authored by the peer
-	// (not the bridge bot). In a 1:1 DM, an m.notice from the other member
-	// gives Matrix push rules the best chance to evaluate
-	// .m.rule.suppress_notices correctly — the bridge bot is a third-party
-	// actor, so Beeper's push path bypasses suppress_notices for bot-sent
-	// messages in DMs. Run in a goroutine to avoid deadlocking — the ghost
-	// intent's SendMessageEvent may trigger EnsureJoined which acquires a
-	// portal lock already held by the caller.
-	go func() {
+		// Send via ghost intent so the notice appears authored by the peer.
 		var sendErr error
 		if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
 			_, sendErr = asIntent.Matrix.SendMessageEvent(ctx, portal.MXID, event.EventMessage, &event.Content{
 				Parsed: &event.MessageEventContent{
 					MsgType:  event.MsgNotice,
-					Body:    notice,
+					Body:     notice,
 					Mentions: &event.Mentions{},
 				},
 			})
 		} else {
-			// Fallback: bot send for non-appservice ghost types
 			_, sendErr = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
 				Parsed: &event.MessageEventContent{
 					MsgType:  event.MsgNotice,
-					Body:    notice,
+					Body:     notice,
 					Mentions: &event.Mentions{},
 				},
 			}, nil)
 		}
 		if sendErr != nil {
-			log.Warn().Err(sendErr).Str("portal_mxid", string(portal.MXID)).Msg("Failed to send presence notice to portal")
+			log.Warn().Err(sendErr).Str("portal_mxid", string(portal.MXID)).Msg("StatusKit: failed to send presence notice")
 		} else {
-			// Only store the dedup key after a successful send.
-			// Storing before the send would poison the map on transient failures.
+			// Store dedup key only after successful send to avoid poisoning
+			// on transient failures.
 			c.statusKitPresence.Store(user, modeKey)
 		}
 	}()
