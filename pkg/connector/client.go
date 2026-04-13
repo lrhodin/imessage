@@ -1312,10 +1312,25 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			notice = name + " has notifications turned on."
 		}
 
-		// Send the notice 1ms in the past so Hungry does not use it as the
-		// room's last-activity timestamp — the chat won't jump to the top of
-		// the list as though a new message arrived from the contact.
+		// Anchor the notice timestamp 1ms before the last real iMessage in
+		// this portal.  When Hungry evaluates room-list ordering it uses
+		// origin_server_ts; by placing our notice just before the last real
+		// message the room's effective "latest event" stays at the real
+		// message's timestamp, so the DM won't jump to the top of the chat
+		// list as though a new iMessage arrived.
+		//
+		// If no prior messages exist, or the last message is older than 24 h
+		// (the room is already near the bottom of the list so a bump is
+		// harmless), or the DB query fails, fall back to now-1ms.
 		noticeTS := time.Now().Add(-1 * time.Millisecond)
+		if lastMsg, dbErr := c.Main.Bridge.DB.Message.GetLastNonFakePartAtOrBeforeTime(
+			ctx, portal.PortalKey, time.Now(),
+		); dbErr != nil {
+			log.Warn().Err(dbErr).Msg("StatusKit: failed to query last message timestamp, using now-1ms")
+		} else if lastMsg != nil && !lastMsg.Timestamp.IsZero() &&
+			time.Since(lastMsg.Timestamp) < 24*time.Hour {
+			noticeTS = lastMsg.Timestamp.Add(-1 * time.Millisecond)
+		}
 
 		var sendErr error
 		if c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
