@@ -5451,6 +5451,63 @@ impl Client {
         info!("Unsubscribed from all presence channels");
     }
 
+    /// Resolve a handle to all known handles for the same person by querying
+    /// the IDS cache for a matching sender_correlation_identifier. If the handle
+    /// isn't in the cache yet, triggers an IDS query to populate it.
+    ///
+    /// Returns a list of handles that share the same Apple ID as the input.
+    /// For example, if the input is "mailto:user@icloud.com", the result might
+    /// include "tel:+12012337620" if they belong to the same person.
+    ///
+    /// The `known_handles` parameter is a list of ghost handles from the bridge
+    /// database — we check each one against the IDS cache for a matching
+    /// correlation ID.
+    pub async fn resolve_handle(&self, handle: String, known_handles: Vec<String>) -> Result<Vec<String>, WrappedError> {
+        let my_handles = self.client.identity.get_handles().await;
+        let my_handle = my_handles.first().ok_or(WrappedError::GenericError {
+            msg: "no handle available".into(),
+        })?.clone();
+
+        // Batch IDS lookup: query the incoming handle plus all known ghost
+        // handles in a single Madrid call so every correlation_id lands in
+        // the cache at once. StatusKit subscription doesn't populate the IDS
+        // cache, so without this batch the known_handles would be missing.
+        let mut targets: Vec<String> = Vec::with_capacity(known_handles.len() + 1);
+        targets.push(handle.clone());
+        for k in &known_handles {
+            if k != &handle {
+                targets.push(k.clone());
+            }
+        }
+        if let Err(e) = self.client.identity.validate_targets(&targets, "com.apple.madrid", &my_handle).await {
+            info!("resolve_handle: validate_targets for {} handles failed: {:?}", targets.len(), e);
+        }
+
+        let cache = self.client.identity.cache.lock().await;
+        let Some(correlation_id) = cache.get_correlation_id("com.apple.madrid", &my_handle, &handle) else {
+            info!("resolve_handle: no correlation ID for {}", handle);
+            return Ok(vec![handle]);
+        };
+        if correlation_id.is_empty() {
+            return Ok(vec![handle]);
+        }
+
+        let mut aliases = vec![handle.clone()];
+        for known_handle in &known_handles {
+            if known_handle == &handle {
+                continue;
+            }
+            if let Some(cid) = cache.get_correlation_id("com.apple.madrid", &my_handle, known_handle) {
+                if cid == correlation_id {
+                    aliases.push(known_handle.clone());
+                }
+            }
+        }
+
+        info!("resolve_handle: {} → {} aliases (correlation {})", handle, aliases.len(), correlation_id);
+        Ok(aliases)
+    }
+
     /// Reset all StatusKit APNs channel cursors (last_msg_ns) to 1 in the
     /// persisted state file. Must be called BEFORE init_statuskit() so the
     /// StatusKit client loads the reset cursors on startup. Resetting to 1

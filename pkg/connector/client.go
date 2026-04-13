@@ -147,6 +147,12 @@ type IMClient struct {
 	// when StatusKit re-delivers the same presence state on reconnect.
 	statusKitPresence sync.Map // map[string]bool
 
+	// statusKitPortalCache memoizes the resolved DM portal ID for a StatusKit
+	// presence handle. Populated after a successful IDS correlation lookup
+	// (see resolveStatusPortalViaIDS) so we only pay the IDS round trip once
+	// per unresolved handle per session. Values are networkid.PortalID.
+	statusKitPortalCache sync.Map // map[string]networkid.PortalID
+
 	// lastPresenceSubscribe timestamps the most recent call to
 	// subscribeToContactPresence. OnKeysReceived triggers re-subscription
 	// when new keys arrive, but multiple key-sharing messages can arrive in
@@ -1183,6 +1189,11 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 				}
 			}
 			if portal == nil || portal.MXID == "" {
+				if altPortal := c.resolveStatusPortalViaIDS(ctx, log, user); altPortal != nil {
+					portal = altPortal
+				}
+			}
+			if portal == nil || portal.MXID == "" {
 				log.Warn().
 					Str("portal_id", string(portalID)).
 					Msg("No DM portal with MXID found for presence notice")
@@ -1220,6 +1231,81 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	if err != nil {
 		log.Warn().Err(err).Str("portal_mxid", string(portal.MXID)).Msg("Failed to send presence notice to portal")
 	}
+}
+
+// resolveStatusPortalViaIDS is the last-resort portal resolver for StatusKit
+// presence. When a contact's iCloud Apple ID (e.g. mailto:aap724@icloud.com)
+// doesn't appear in the contact store but still shares a person with a handle
+// we do have a portal for (e.g. tel:+12012337620), the only link between them
+// lives in IDS — specifically the sender_correlation_identifier returned by a
+// Madrid lookup. We batch-lookup the incoming handle plus every known ghost in
+// a single IDS query, then match on correlation ID to find the aliased portal.
+// Results are memoized in statusKitPortalCache so we only pay the IDS round
+// trip once per unresolved handle per session.
+func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Logger, user string) *bridgev2.Portal {
+	if c.client == nil {
+		return nil
+	}
+	if cached, ok := c.statusKitPortalCache.Load(user); ok {
+		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+			ID:       cached.(networkid.PortalID),
+			Receiver: c.UserLogin.ID,
+		})
+		if err == nil && portal != nil && portal.MXID != "" {
+			return portal
+		}
+	}
+
+	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost WHERE bridge_id=$1", c.Main.Bridge.ID)
+	if err != nil {
+		log.Warn().Err(err).Msg("StatusKit IDS fallback: failed to query ghosts")
+		return nil
+	}
+	var knownHandles []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			continue
+		}
+		if id == user {
+			continue
+		}
+		knownHandles = append(knownHandles, id)
+	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("StatusKit IDS fallback: ghost row iteration error")
+	}
+	rows.Close()
+	if len(knownHandles) == 0 {
+		return nil
+	}
+
+	aliases, err := c.client.ResolveHandle(user, knownHandles)
+	if err != nil {
+		log.Warn().Err(err).Str("user", user).Msg("StatusKit IDS fallback: ResolveHandle failed")
+		return nil
+	}
+	for _, alias := range aliases {
+		if alias == user {
+			continue
+		}
+		aliasPortalID := c.resolveContactPortalID(alias)
+		aliasPortalID = c.resolveExistingDMPortalID(string(aliasPortalID))
+		altPortal, altErr := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+			ID:       aliasPortalID,
+			Receiver: c.UserLogin.ID,
+		})
+		if altErr == nil && altPortal != nil && altPortal.MXID != "" {
+			log.Info().
+				Str("original", user).
+				Str("alias", alias).
+				Str("resolved_portal_id", string(aliasPortalID)).
+				Msg("StatusKit: resolved DM portal via IDS correlation")
+			c.statusKitPortalCache.Store(user, aliasPortalID)
+			return altPortal
+		}
+	}
+	return nil
 }
 
 // OnKeysReceived is called by StatusKit when a key-sharing message arrives.

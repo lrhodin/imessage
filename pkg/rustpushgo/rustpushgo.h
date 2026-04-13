@@ -258,6 +258,13 @@ void uniffi_rustpushgo_fn_method_client_reset_statuskit_cursors(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_resolve_handle(
+	void* ptr,
+	RustBuffer handle,
+	RustBuffer known_handles,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_restore_cloud_chat(
 	void* ptr,
 	RustBuffer record_name,
@@ -1664,6 +1671,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_reset_cloud_client(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_reset_statuskit_cursors(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_resolve_handle(
 	RustCallStatus* out_status
 );
 

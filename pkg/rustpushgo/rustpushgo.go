@@ -763,6 +763,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_resolve_handle(uniffiStatus)
+		})
+		if checksum != 29605 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_resolve_handle: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_restore_cloud_chat(uniffiStatus)
 		})
 		if checksum != 36876 {
@@ -2937,6 +2946,31 @@ func (_self *Client) ResetStatuskitCursors() {
 			_pointer, _uniffiStatus)
 		return false
 	})
+}
+
+func (_self *Client) ResolveHandle(handle string, knownHandles []string) ([]string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_resolve_handle(
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)), rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(knownHandles)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterSequenceStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
 }
 
 func (_self *Client) RestoreCloudChat(recordName string, chatIdentifier string, groupId string, style int64, service string, displayName *string, participants []string) error {
