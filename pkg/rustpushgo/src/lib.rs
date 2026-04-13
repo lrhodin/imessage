@@ -5565,12 +5565,13 @@ impl Client {
             msg: "StatusKit not initialized".into(),
         })?;
 
-        // Query IDS with strong flags (required_for_message=true, result_expected=true)
-        // before calling invite_to_channel. invite_to_channel uses cache_keys with
-        // refresh=false and weak flags, which can short-circuit on cached empty results.
-        // targets_for_handles forces a live IDS query and populates the push-token cache
-        // so that (a) the invite reaches real devices and (b) when peers respond,
-        // get_key_for_sender can find their token and decrypt the response.
+        // Prime the IDS cache for the keysharing topic with strong flags
+        // (required_for_message=true, result_expected=true) before calling
+        // invite_to_channel. invite_to_channel internally re-does cache_keys
+        // with refresh=false and WEAK flags; that call is now idempotent
+        // (does_not_need_refresh returns true for any freshly-primed entry).
+        // After priming, get_participants_targets gives us the peer push-tokens
+        // also needed by get_key_for_sender to decrypt their keysharing response.
         let targets = sk.identity.targets_for_handles(
             "com.apple.private.alloy.status.keysharing",
             &handles,
@@ -5579,6 +5580,32 @@ impl Client {
             msg: format!("StatusKit targets_for_handles failed: {:?}", e),
         })?;
         info!("StatusKit: IDS found {} delivery target(s) for {} handle(s)", targets.len(), handles.len());
+
+        // Zero targets here means the cache has stale empty entries from a
+        // prior session (they're considered "not dirty" for up to 1 hour by
+        // cache_keys_once even when identities.is_empty()). Invalidate the
+        // entire IDS cache so the next call hits IDS live. This is a one-off
+        // cost: it only triggers when a prior query returned empty, and the
+        // next call will refill caches for all services/handles on demand.
+        let targets = if targets.is_empty() {
+            warn!("StatusKit: IDS returned zero targets for keysharing topic — invalidating stale cache and retrying");
+            sk.identity.invalidate_id_cache().await;
+            sk.identity.targets_for_handles(
+                "com.apple.private.alloy.status.keysharing",
+                &handles,
+                &sender_handle,
+            ).await.map_err(|e| WrappedError::GenericError {
+                msg: format!("StatusKit targets_for_handles (retry) failed: {:?}", e),
+            })?
+        } else {
+            targets
+        };
+        info!("StatusKit: IDS resolved {} delivery target(s) for {} handle(s) (after cache check)", targets.len(), handles.len());
+        if targets.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: "StatusKit invite aborted: IDS returned zero targets after cache invalidation — peers may not be registered for keysharing topic".into(),
+            });
+        }
 
         let config_map: std::collections::HashMap<String, rustpush::statuskit::StatusKitPersonalConfig> =
             handles.iter()
