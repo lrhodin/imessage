@@ -5207,18 +5207,10 @@ impl Client {
             client: cloudkit.clone(),
         });
 
-        // Step 1: Fetch recoverable TLK shares (30s timeout, non-fatal).
-        info!("Cloud client init: step 1 — refreshing recoverable TLK shares (30s timeout)");
-        let _step1_start = std::time::Instant::now();
-        match tokio::time::timeout(
-            Duration::from_secs(30),
-            refresh_recoverable_tlk_shares(&keychain, "Cloud client init"),
-        ).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("Cloud client init: TLK share refresh failed (non-fatal): {}", e),
-            Err(_) => warn!("Cloud client init: TLK share refresh timed out after 30s (non-fatal)"),
-        }
-        info!("Cloud client init: step 1 done in {:?}", _step1_start.elapsed());
+        // Step 1 (TLK share refresh) removed: fetch_shares_for blocks the
+        // tokio executor thread (synchronous network I/O inside the future),
+        // so tokio::time::timeout cannot fire — causing an indefinite hang.
+        // keychain sync in step 2 covers the same key material.
 
         // Step 2: Keychain sync (3 attempts, 90s timeout, non-fatal).
         // PCS key errors during sync_records trigger recover_cloud_pcs_state.
