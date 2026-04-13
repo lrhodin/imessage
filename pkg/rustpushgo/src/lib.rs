@@ -4872,24 +4872,23 @@ pub async fn new_client(
                 // handling. Only active when init_statuskit() has been
                 // called; otherwise falls through.
                 if let Some(sk) = sk_for_recv.read().await.as_ref().cloned() {
-                    // Wrap handle() in catch_unwind to prevent upstream panics
-                    // (statuskit.rs:736 panics with "Channel not found!" if a
-                    // status update arrives for a channel with no shared keys).
-                    // Catching the panic prevents the message loop from crashing;
-                    // we log and continue so the message can be retried if keys
-                    // arrive via a subsequent key-sharing IDS message.
-                    let handle_result = tokio::task::spawn_blocking({
-                        let sk = sk.clone();
-                        let msg = msg.clone();
-                        move || std::panic::catch_unwind(|| {
-                            // Use a single-threaded runtime to drive the async handle()
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .expect("Failed to create runtime for StatusKit handle");
-                            rt.block_on(sk.handle(msg))
-                        })
-                    }).await;
+                    // handle() is async and may panic (statuskit.rs:736 "Channel not
+                    // found!"). Spawn a thread so the panic is contained there and
+                    // doesn't crash the async message loop. The Result is sent
+                    // across a oneshot channel to avoid UnwindSafe requirements.
+                    use tokio::sync::oneshot;
+                    let (tx, rx) = oneshot::channel();
+                    let sk_clone = sk.clone();
+                    let msg_clone = msg.clone();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("Failed to create runtime for StatusKit handle");
+                        let result = rt.block_on(sk_clone.handle(msg_clone));
+                        let _ = tx.send(result);
+                    });
+                    let handle_result = rx.await;
                     match handle_result {
                         Ok(Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged { user, mode, allowed }))) => {
                             if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
