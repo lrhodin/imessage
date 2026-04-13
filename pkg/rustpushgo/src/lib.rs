@@ -4884,11 +4884,14 @@ pub async fn new_client(
                     } else {
                         None
                     };
-                    // Snapshot state.keys before handle() so we can tell whether a
-                    // keysharing APNs message actually populated state.keys or was
-                    // silently dropped by IDS receive_message (e.g. due to stale
-                    // identity keys, missing sender, or undecryptable payload).
-                    let keys_before = sk.state.read().await.keys.len();
+                    // Snapshot the set of channel IDs in state.keys before handle()
+                    // so we can detect whether a keysharing APNs message added a new
+                    // channel. Using a HashSet (not len()) so that a re-key — where
+                    // invite_to_channel replaces an existing channel id via
+                    // HashMap::insert — is also detected even though len() would not
+                    // change.
+                    let keys_before: std::collections::HashSet<String> =
+                        sk.state.read().await.keys.keys().cloned().collect();
                     // handle() is async and may panic (statuskit.rs:736 "Channel not
                     // found!"). Spawn as a tokio task on the main runtime so panics
                     // surface as JoinError rather than crashing the loop, AND so the
@@ -4915,35 +4918,60 @@ pub async fn new_client(
                         Ok(Ok(None)) => {
                             // Not a StatusKit presence update — but check whether it
                             // was a key-sharing message. Only fire on_keys_received
-                            // if state.keys actually grew; otherwise IDS
-                            // receive_message silently dropped the message (a
-                            // common failure mode that leaves state.keys empty and
-                            // nothing subscribable).
+                            // if state.keys gained a new channel id.
                             let keysharing_topic: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
                             if let Some(topic) = msg_topic {
                                 if topic == keysharing_topic {
-                                    let keys_after = sk.state.read().await.keys.len();
-                                    if keys_after > keys_before {
-                                        info!("StatusKit key-sharing message received — state.keys grew {} → {}", keys_before, keys_after);
+                                    let keys_after: std::collections::HashSet<String> =
+                                        sk.state.read().await.keys.keys().cloned().collect();
+                                    let new_channels: Vec<&String> = keys_after.difference(&keys_before).collect();
+                                    if !new_channels.is_empty() {
+                                        info!("StatusKit key-sharing message received — state.keys gained {} new channel(s)", new_channels.len());
                                         if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
                                             cb.on_keys_received();
                                         }
                                     } else {
-                                        // Ignore c=255 send confirmations — they're ACKs for
-                                        // our own outgoing invites, not inbound peer messages.
-                                        // Only a non-ACK message that fails to populate
-                                        // state.keys indicates a real problem (peer invite
-                                        // not addressed to us / stale identity keys).
-                                        let cmd_byte = if let rustpush::APSMessage::Notification { payload, .. } = &msg {
-                                            plist::from_bytes::<plist::Value>(payload)
-                                                .ok()
-                                                .and_then(|v| v.as_dictionary().and_then(|d| d.get("c").and_then(|c| c.as_unsigned_integer())).map(|c| c as u8))
-                                        } else {
-                                            None
-                                        };
-                                        let is_server_ack = cmd_byte.map(|c| c == 255).unwrap_or(false);
-                                        if !is_server_ack {
-                                            warn!("StatusKit inbound keysharing message (c={}) failed to populate state.keys — peer invite may be malformed or not addressed to this device", cmd_byte.map(|c| c.to_string()).unwrap_or_else(|| "?".into()));
+                                        // Parse the command byte and IDS envelope field presence
+                                        // from the raw payload for diagnostics.
+                                        let (cmd_byte, ids_fields) =
+                                            if let rustpush::APSMessage::Notification { payload, .. } = &msg {
+                                                if let Ok(plist::Value::Dictionary(d)) = plist::from_bytes::<plist::Value>(payload) {
+                                                    let c = d.get("c").and_then(|v| v.as_unsigned_integer()).map(|v| v as u8);
+                                                    let sp = d.contains_key("sP");
+                                                    let tp = d.contains_key("tP");
+                                                    let p  = d.contains_key("P");
+                                                    let t  = d.contains_key("t");
+                                                    let e  = d.contains_key("E");
+                                                    (c, Some((sp, tp, p, t, e)))
+                                                } else {
+                                                    (None, None)
+                                                }
+                                            } else {
+                                                (None, None)
+                                            };
+                                        // c=255 = server ACK for our own outgoing invite.
+                                        // c=97  = non-encrypted APNs notification on this topic
+                                        //         (no IDS envelope fields); upstream has no handler
+                                        //         for it and it never populates state.keys by design.
+                                        // Both are expected noise — suppress silently.
+                                        let is_silent = cmd_byte.map(|c| c == 255 || c == 97).unwrap_or(false);
+                                        if !is_silent {
+                                            if let Some((sp, tp, p, t, e)) = ids_fields {
+                                                warn!(
+                                                    "StatusKit inbound keysharing message (c={}) did not grow state.keys — IDS fields present: sP={} tP={} P={} t={} E={}",
+                                                    cmd_byte.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                                                    if sp { "Y" } else { "N" },
+                                                    if tp { "Y" } else { "N" },
+                                                    if p  { "Y" } else { "N" },
+                                                    if t  { "Y" } else { "N" },
+                                                    if e  { "Y" } else { "N" },
+                                                );
+                                            } else {
+                                                warn!(
+                                                    "StatusKit inbound keysharing message (c={}) did not grow state.keys — could not parse payload",
+                                                    cmd_byte.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                                                );
+                                            }
                                         }
                                     }
                                 }
