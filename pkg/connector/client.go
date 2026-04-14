@@ -962,6 +962,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	c.stopChan = make(chan struct{})
 	c.msgBuffer = &messageBuffer{client: c}
 	go c.periodicStateSave(log)
+	go c.periodicStatusSharingReinvite(log)
 
 	// Ensure CloudKit backfill schema/storage is available.
 	cloudStoreReady := true
@@ -3074,7 +3075,6 @@ func restoreRetryDelay(attempt int) time.Duration {
 	}
 }
 
-
 func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 	defer c.finishRestoreBackfillPipeline(opts.PortalID)
 
@@ -3915,7 +3915,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 			Msg("Unfiltered scan complete")
 		diag = &restoreFetchDiagnostic{
 			UnfilteredTotal: len(unfiltered),
-			SampleChatIDs:  sampleIDs,
+			SampleChatIDs:   sampleIDs,
 		}
 	}
 
@@ -6975,6 +6975,24 @@ func (c *IMClient) periodicStateSave(log zerolog.Logger) {
 		case <-c.stopChan:
 			c.persistState(log)
 			log.Debug().Msg("Final state save on disconnect")
+			return
+		}
+	}
+}
+
+// periodicStatusSharingReinvite re-invites ghosts whose devices haven't
+// responded to our StatusKit key invite. Tick cadence (1h) is deliberately
+// short, but the per-ghost backoff inside reinvitePendingStatusSharingGhosts
+// keeps worst-case IDS keysharing load bounded. First tick fires after the
+// full interval so we don't pile on top of the startup invite.
+func (c *IMClient) periodicStatusSharingReinvite(log zerolog.Logger) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.reinvitePendingStatusSharingGhosts(log)
+		case <-c.stopChan:
 			return
 		}
 	}

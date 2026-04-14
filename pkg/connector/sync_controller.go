@@ -837,6 +837,105 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 	}
 }
 
+// statusKitLastInviteKeyPrefix is the KV store key prefix for per-ghost
+// last-invite timestamps. Stored as RFC3339 strings, parallel to the
+// statuskit.presence.<handle> keys used by OnStatusUpdate.
+const statusKitLastInviteKeyPrefix = "statuskit.last_invite."
+
+// statusKitReinviteMinSpacing is the minimum time between re-invites to the
+// same ghost. Bounds worst-case IDS keysharing calls per non-responder to
+// 6/day. Apple's per-target rate limits for keysharing are not documented,
+// but this leaves a comfortable margin.
+const statusKitReinviteMinSpacing = 4 * time.Hour
+
+// reinvitePendingStatusSharingGhosts re-sends StatusKit key invites only to
+// ghosts who have NOT yet responded with their own key. Addresses contacts
+// whose devices never responded to the initial invite (Apple-side rate limit,
+// device offline when invite arrived, or trust-gated). Complements
+// inviteContactsToStatusSharing, which runs at startup and after backfill.
+func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
+	if c.client == nil || c.handle == "" {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warn().Interface("panic", r).Msg("reinvitePendingStatusSharingGhosts panicked — skipped")
+		}
+	}()
+	ctx := context.Background()
+	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost WHERE bridge_id=$1", c.Main.Bridge.ID)
+	if err != nil {
+		log.Warn().Err(err).Msg("StatusKit re-invite: failed to query ghosts")
+		return
+	}
+	var allHandles []string
+	for rows.Next() {
+		var ghostID string
+		if err := rows.Scan(&ghostID); err != nil {
+			continue
+		}
+		allHandles = append(allHandles, ghostID)
+	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("StatusKit re-invite: ghost row iteration error")
+	}
+	rows.Close()
+	if len(allHandles) == 0 {
+		return
+	}
+
+	sk, err := c.client.GetStatuskitClient()
+	if err != nil || sk == nil {
+		log.Warn().Err(err).Msg("StatusKit re-invite: no statuskit client available")
+		return
+	}
+	known := sk.GetKnownHandles()
+	knownSet := make(map[string]struct{}, len(known))
+	for _, h := range known {
+		knownSet[h] = struct{}{}
+	}
+
+	now := time.Now()
+	var pending []string
+	for _, h := range allHandles {
+		if _, responded := knownSet[h]; responded {
+			continue
+		}
+		last := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitLastInviteKeyPrefix+h))
+		if last != "" {
+			if ts, parseErr := time.Parse(time.RFC3339, last); parseErr == nil && now.Sub(ts) < statusKitReinviteMinSpacing {
+				continue
+			}
+		}
+		pending = append(pending, h)
+	}
+
+	if len(pending) == 0 {
+		log.Debug().Int("total", len(allHandles)).Int("responded", len(known)).Msg("StatusKit re-invite: no pending ghosts")
+		return
+	}
+
+	// SetStatus allocates our channel if not already; safe to call repeatedly.
+	if err := c.client.SetStatus(true); err != nil {
+		log.Warn().Err(err).Msg("StatusKit re-invite: channel not ready")
+		return
+	}
+	if err := c.client.InviteToStatusSharing(c.handle, pending); err != nil {
+		log.Warn().Err(err).Int("count", len(pending)).Msg("StatusKit re-invite: failed")
+		return
+	}
+
+	nowStr := now.Format(time.RFC3339)
+	for _, h := range pending {
+		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+h), nowStr)
+	}
+	log.Info().
+		Int("total", len(allHandles)).
+		Int("responded", len(known)).
+		Int("pending", len(pending)).
+		Msg("Sent periodic StatusKit re-invite to pending ghosts")
+}
+
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	if c.contacts == nil {
 		return
