@@ -4529,37 +4529,72 @@ impl WrappedStatusKitClient {
         self.inner.reset_keys().await;
     }
 
-    /// Returns all known contact handles from the StatusKit shared device state.
-    /// Each entry is a "from" handle (e.g. "mailto:user@icloud.com" or "tel:+1...")
-    /// associated with a StatusKit channel. Used by the Go layer to resolve
-    /// mailto: handles to their tel: counterpart when the DM portal was created
-    /// under the phone number.
+    /// Returns contact handles with a confirmed-live StatusKit channel — i.e.
+    /// at least one channel for that peer has delivered a real status message
+    /// (recent_channels.last_msg_ns > 1). A peer with only placeholder
+    /// channels (last_msg_ns == 1) is NOT returned here, because that state
+    /// typically indicates the ratchet has drifted: the peer rotated to a
+    /// channel id the bridge hasn't discovered, and the stored channels
+    /// will never carry a status. Excluding them lets the Go-side re-invite
+    /// loop re-key that peer on its next tick (bounded by the per-peer 4h
+    /// KV backoff). Peers who have genuinely never toggled Focus since
+    /// keying will incur at most one extra invite every 4h, which upstream
+    /// processes as a c=227 no-op.
+    ///
+    /// Each returned entry is a "from" handle (e.g. "mailto:user@icloud.com"
+    /// or "tel:+1..."). Used by the Go layer both to suppress re-invites for
+    /// already-keyed peers and to resolve mailto:/tel: aliases via the IDS
+    /// correlation cache.
     ///
     /// Since upstream's StatusKitSharedDevice::from is private, this reads
-    /// the plist file directly and extracts the "from" strings.
+    /// the plist file directly.
     pub async fn get_known_handles(&self) -> Vec<String> {
         let state_path = subsystem_state_path("statuskit-state.plist");
         let data = match std::fs::read(&state_path) {
             Ok(d) => d,
             Err(_) => return Vec::new(),
         };
-        // Parse the plist and extract "from" values from the keys dict.
-        // The plist structure is: keys -> { channel_id -> { from: "..." } }
         let value = match plist::from_bytes::<plist::Value>(&data) {
             Ok(v) => v,
             Err(_) => return Vec::new(),
         };
         let Some(dict) = value.as_dictionary() else { return Vec::new() };
-        let Some(keys_dict) = dict.get("keys") else { return Vec::new() };
-        let Some(keys_dict) = keys_dict.as_dictionary() else { return Vec::new() };
+        let Some(keys_dict) = dict.get("keys").and_then(|v| v.as_dictionary()) else {
+            return Vec::new();
+        };
 
-        let mut handles = Vec::new();
-        for (_channel_id, entry) in keys_dict {
-            let Some(entry_dict) = entry.as_dictionary() else { continue };
-            if let Some(from_val) = entry_dict.get("from") {
-                if let Some(from_str) = from_val.as_string() {
-                    handles.push(from_str.to_string());
+        // Collect channel ids (base64-encoded, matching the keys-dict key
+        // format) that have received a real status message. recent_channels
+        // stores the id as plist::Data; the keys dict uses its base64 form.
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use std::collections::HashSet;
+        let mut confirmed_ids: HashSet<String> = HashSet::new();
+        if let Some(rc) = dict.get("recent_channels").and_then(|v| v.as_array()) {
+            for entry in rc {
+                let Some(d) = entry.as_dictionary() else { continue };
+                let last_ns = d.get("last_msg_ns").and_then(|v| v.as_unsigned_integer()).unwrap_or(0);
+                if last_ns <= 1 {
+                    continue;
                 }
+                let Some(ident) = d.get("identifier").and_then(|v| v.as_dictionary()) else { continue };
+                let Some(id_data) = ident.get("id").and_then(|v| v.as_data()) else { continue };
+                confirmed_ids.insert(B64.encode(id_data));
+            }
+        }
+
+        // A handle is reported as known if ANY of its channels is confirmed.
+        // Dedup by handle so a single confirmed channel still covers peers
+        // with duplicate placeholder entries.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut handles = Vec::new();
+        for (channel_id, entry) in keys_dict {
+            if !confirmed_ids.contains(channel_id) {
+                continue;
+            }
+            let Some(entry_dict) = entry.as_dictionary() else { continue };
+            let Some(from_str) = entry_dict.get("from").and_then(|v| v.as_string()) else { continue };
+            if seen.insert(from_str.to_string()) {
+                handles.push(from_str.to_string());
             }
         }
         handles
