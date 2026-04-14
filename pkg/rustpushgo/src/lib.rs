@@ -5056,9 +5056,21 @@ pub async fn new_client(
                                         let is_silent = cmd_byte.map(|c| c == 255).unwrap_or(false);
                                         let is_reinvite = cmd_byte.map(|c| c == 227).unwrap_or(false)
                                             && !keys_before.is_empty();
+                                        // Non-Notification APS frames (ACKs, connection state,
+                                        // keepalives) flow through the keysharing subscription and
+                                        // reach this path, but they can never carry a real
+                                        // keysharing invite payload — cmd_byte and IDS fields are
+                                        // all unknown, and the diagnostic just adds noise. Only
+                                        // warn when the msg actually is a Notification and we
+                                        // managed to parse a command byte (else there is nothing
+                                        // informative to say).
+                                        let is_notification = matches!(
+                                            &msg,
+                                            rustpush::APSMessage::Notification { payload: plist::Value::Data(_), .. }
+                                        );
                                         if is_reinvite {
                                             info!("StatusKit peer re-invite received for existing channel (c=227) — keys replaced in place");
-                                        } else if !is_silent {
+                                        } else if !is_silent && is_notification && cmd_byte.is_some() {
                                             let all_keys = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
                                                 plist::from_bytes::<plist::Value>(payload)
                                                     .ok()
