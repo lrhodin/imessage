@@ -897,8 +897,18 @@ func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
 
 	now := time.Now()
 	var pending []string
+	var aliasSkipped int
 	for _, h := range allHandles {
 		if _, responded := knownSet[h]; responded {
+			continue
+		}
+		// Peers key back under whichever handle form their device advertises
+		// (typically tel:) regardless of which form the bridge's ghost row
+		// takes (mailto: or tel:). Ask the IDS correlation cache whether this
+		// ghost aliases to any already-keyed handle; if so, they've responded
+		// under another form and re-inviting would just earn a duplicate-drop.
+		if aliases := c.client.ResolveHandleCached(h, known); len(aliases) > 0 {
+			aliasSkipped++
 			continue
 		}
 		last := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitLastInviteKeyPrefix+h))
@@ -911,7 +921,11 @@ func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
 	}
 
 	if len(pending) == 0 {
-		log.Debug().Int("total", len(allHandles)).Int("responded", len(known)).Msg("StatusKit re-invite: no pending ghosts")
+		log.Debug().
+			Int("total", len(allHandles)).
+			Int("responded", len(known)).
+			Int("alias_skipped", aliasSkipped).
+			Msg("StatusKit re-invite: no pending ghosts")
 		return
 	}
 
@@ -932,6 +946,7 @@ func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
 	log.Info().
 		Int("total", len(allHandles)).
 		Int("responded", len(known)).
+		Int("alias_skipped", aliasSkipped).
 		Int("pending", len(pending)).
 		Msg("Sent periodic StatusKit re-invite to pending ghosts")
 }
