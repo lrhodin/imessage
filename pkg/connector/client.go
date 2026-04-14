@@ -639,6 +639,13 @@ func (c *IMClient) onForwardBackfillDone() {
 		if contactsReady {
 			go c.refreshGhostNamesFromContacts(log.Logger)
 		}
+
+		// Send StatusKit keysharing invites now that ghosts exist.
+		// On fresh reset, subscribeAfterInit runs before CloudKit sync
+		// creates ghosts, so it returns early with no handles. This
+		// post-backfill call ensures invites go out once we have
+		// handles to invite.
+		go c.inviteContactsToStatusSharing(log.Logger)
 	}
 }
 
