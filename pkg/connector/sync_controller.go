@@ -1376,21 +1376,14 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 		log.Warn().
 			Int("sync_version", cloudSyncVersion).
 			Msg("CloudKit sync returned 0 records — NOT saving version (will retry on next restart)")
-		// Diagnostic: run a separate full-count sync to check if CloudKit
-		// actually has records. This paginates from scratch independently
-		// and helps identify whether the changes feed is empty vs. data exists.
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Warn().Interface("panic", r).Msg("CloudKit diagnostic full count panicked — ignored")
-				}
-			}()
-			if diagResult, diagErr := c.client.CloudDiagFullCount(); diagErr != nil {
-				log.Warn().Err(diagErr).Msg("CloudKit diagnostic full count failed")
-			} else {
-				log.Info().Str("diag_result", diagResult).Msg("CloudKit diagnostic full count (post-sync check)")
-			}
-		}()
+		// (Previously ran CloudDiagFullCount here as a diagnostic. Removed:
+		// it spans hundreds of anisette-authed pages and tripped an
+		// upstream `panic!()` in omnisette's remote_anisette_v3 that, when
+		// unwound across the FFI boundary, left the shared anisette
+		// tokio::sync::Mutex in an inconsistent state and deadlocked every
+		// subsequent operation that needed anisette — including message
+		// send. The diagnostic was non-essential; dropping it entirely
+		// avoids the trigger.)
 	}
 
 	return nil
