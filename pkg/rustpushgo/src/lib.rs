@@ -1747,6 +1747,53 @@ impl WrappedTokenProvider {
     }
 }
 
+/// Reshape a stored MobileMe delegate plist value so that deserializing it as
+/// upstream's `MobileMeDelegateResponse` puts the *inner* iCloud service dict
+/// (the one keyed by `com.apple.Dataclass.KeychainSync`,
+/// `com.apple.Dataclass.Files`, etc.) into the `config` field.
+///
+/// We accept three stored shapes and normalize to a single output:
+///   1. **Current (post-a7fab47 double-wrapped)**:
+///      `{tokens, "com.apple.mobileme": {tokens, "com.apple.mobileme": {KeychainSync: ...}}}`
+///      — produced by our serialize path below after upstream's "fix" made
+///      `mobileme.config` hold the entire delegate service_data.
+///   2. **Legacy (pre-a7fab47)**:
+///      `{tokens, "com.apple.mobileme": {KeychainSync: ...}}`
+///      — produced when `config` was deserialized via
+///      `#[serde(rename = "com.apple.mobileme")]` and held the inner dict directly.
+///   3. **Already-normalized**:
+///      `{tokens, config: {KeychainSync: ...}}` — ideal shape going forward.
+///
+/// Output: `{tokens, config: {KeychainSync: ...}}` every time, which matches
+/// the new `#[serde(default)] pub config: Dictionary` field on
+/// `MobileMeDelegateResponse` and keeps `KeychainClientState::new`
+/// (which does `delegate.config.get("com.apple.Dataclass.KeychainSync")`)
+/// working.
+fn normalize_mme_delegate_dict(value: plist::Value) -> plist::Value {
+    let Some(mut root) = value.into_dictionary() else {
+        return plist::Value::Dictionary(plist::Dictionary::new());
+    };
+    if root.contains_key("config") {
+        return plist::Value::Dictionary(root);
+    }
+    let Some(outer_mm) = root.remove("com.apple.mobileme") else {
+        return plist::Value::Dictionary(root);
+    };
+    let Some(outer_dict) = outer_mm.as_dictionary() else {
+        return plist::Value::Dictionary(root);
+    };
+    // If the outer has a nested `com.apple.mobileme`, that's shape 1 (double-wrap)
+    // and the nested dict is the real iCloud config. Otherwise it's shape 2 (legacy)
+    // and the outer IS the iCloud config.
+    let inner = outer_dict
+        .get("com.apple.mobileme")
+        .and_then(|v| v.as_dictionary())
+        .cloned()
+        .unwrap_or_else(|| outer_dict.clone());
+    root.insert("config".to_string(), plist::Value::Dictionary(inner));
+    plist::Value::Dictionary(root)
+}
+
 // Non-uniffi impl block: internal helpers used by other wrapper code that need
 // to read state previously available via `TokenProvider::get_xxx()` methods that
 // OpenBubbles upstream doesn't expose. These are not exported as FFI symbols.
@@ -1769,13 +1816,22 @@ impl WrappedTokenProvider {
     /// `T` is inferred from the receiving function's signature at the call site —
     /// we intentionally do NOT name the type here because it's not reachable from
     /// outside the rustpush crate in OpenBubbles upstream (`mod auth` is private).
+    ///
+    /// Normalizes the dict shape before deserialization so `config` ends up as
+    /// the inner iCloud service dict (the one holding `com.apple.Dataclass.KeychainSync`
+    /// etc.) regardless of which shape was stored. See `normalize_mme_delegate_dict`
+    /// below for the three shapes we accept.
     pub(crate) async fn parse_mme_delegate<T: serde::de::DeserializeOwned>(&self) -> Result<T, WrappedError> {
         let bytes_guard = self.mme_delegate_bytes.lock().await;
         let bytes = bytes_guard.as_ref().ok_or(WrappedError::GenericError {
             msg: "MobileMe delegate not seeded — call seed_mme_delegate_json first".into(),
         })?;
-        plist::from_bytes::<T>(bytes).map_err(|e| WrappedError::GenericError {
-            msg: format!("Failed to parse MobileMe delegate: {}", e),
+        let value: plist::Value = plist::from_bytes(bytes).map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to parse MobileMe delegate bytes: {}", e),
+        })?;
+        let normalized = normalize_mme_delegate_dict(value);
+        plist::from_value::<T>(&normalized).map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to deserialize MobileMe delegate: {}", e),
         })
     }
 
