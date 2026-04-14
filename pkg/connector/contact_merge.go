@@ -68,7 +68,7 @@ func (c *IMClient) resolveContactPortalID(identifier string) networkid.PortalID 
 }
 
 // resolveSendTarget determines the best identifier to send to for a DM portal.
-func (c *IMClient) resolveSendTarget(portalID string) string {
+func (c *IMClient) resolveSendTarget(portalID string) (target string) {
 	if c.client == nil || strings.Contains(portalID, ",") {
 		return portalID
 	}
@@ -77,6 +77,17 @@ func (c *IMClient) resolveSendTarget(portalID string) string {
 	if contact == nil || len(contactPortalIDs(contact)) <= 1 {
 		return portalID
 	}
+	// ValidateTargets crosses into the identity-manager FFI path. Upstream
+	// has reachable panic sites (identity_manager.rs:249/335/542/555); fall
+	// back to the original portalID if the FFI call panics rather than
+	// crashing the send path.
+	defer func() {
+		if r := recover(); r != nil {
+			c.UserLogin.Log.Error().Interface("panic", r).Str("portal_id", portalID).
+				Msg("resolveSendTarget panicked in FFI path — falling back to original portalID")
+			target = portalID
+		}
+	}()
 
 	valid := c.client.ValidateTargets([]string{portalID}, c.handle)
 	if len(valid) > 0 {

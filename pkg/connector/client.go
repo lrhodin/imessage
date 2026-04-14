@@ -3309,6 +3309,15 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 	if c.client == nil || c.cloudStore == nil {
 		return
 	}
+	// Guard the CloudKit FFI calls below (upstream cloudkit.rs has
+	// reachable panic sites via type assertions). Missing one metadata
+	// refresh is strictly safer than crashing the bridge.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Interface("panic", r).Str("portal_id", portalID).
+				Msg("refreshRecoveredChatMetadata panicked — skipped")
+		}
+	}()
 
 	ctx := context.Background()
 	targetGroupID := ""
@@ -3547,6 +3556,14 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 	if c.client == nil || c.cloudStore == nil {
 		return
 	}
+	// CloudKit FFI path — guard against upstream panics (cloudkit.rs type
+	// assertions). Dropping one restore pass is safer than crashing.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Interface("panic", r).Str("portal_id", portalID).
+				Msg("recoverMessagesFromRecycleBin panicked — skipped")
+		}
+	}()
 
 	ctx := context.Background()
 
@@ -5367,10 +5384,22 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 	return ui, nil
 }
 
-func (c *IMClient) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
+func (c *IMClient) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (resp *bridgev2.ResolveIdentifierResponse, err error) {
 	if c.client == nil {
 		return nil, bridgev2.ErrNotLoggedIn
 	}
+	// ValidateTargets crosses into the identity-manager FFI path, which has
+	// reachable panic sites upstream (identity_manager.rs:249/335/542/555).
+	// This is a user-triggered call (start-chat flow), so a panic here
+	// would crash the bridge on a normal user action. Convert to error.
+	defer func() {
+		if r := recover(); r != nil {
+			c.UserLogin.Log.Error().Interface("panic", r).Str("identifier", identifier).
+				Msg("ResolveIdentifier panicked in FFI path")
+			resp = nil
+			err = fmt.Errorf("identity lookup panicked: %v", r)
+		}
+	}()
 
 	valid := c.client.ValidateTargets([]string{identifier}, c.handle)
 	if len(valid) == 0 {

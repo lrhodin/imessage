@@ -200,6 +200,17 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 	if c.client == nil || c.cloudStore == nil {
 		return
 	}
+	// ListRecoverableChats / ListRecoverableMessageGuids cross into the
+	// CloudKit FFI path, which has reachable panic sites upstream
+	// (cloudkit.rs type assertions). A leaf-level recover here lets the
+	// sync controller goroutine continue to setCloudSyncDone() even if one
+	// seed pass panics — unblocking the APNs buffer is more important than
+	// crashing the whole process over a seed-pass failure.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Interface("panic", r).Msg("seedDeletedChatsFromRecycleBin panicked — skipped this pass")
+		}
+	}()
 
 	ctx := context.Background()
 	candidateMap := make(map[string]recycleBinCandidate)
