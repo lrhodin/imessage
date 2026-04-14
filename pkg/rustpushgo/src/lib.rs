@@ -802,6 +802,26 @@ mod manual_ford {
 // Mac running `tools/nac-relay`.
 
 // ---------------------------------------------------------------------------
+// rustls 0.23 CryptoProvider initialization.
+//
+// Upstream rustpush pulled in rustls 0.23 transitively. Unlike 0.21/0.22,
+// rustls 0.23 does not auto-install a process-wide CryptoProvider when
+// multiple provider crates are present in the dep graph; the first TLS
+// connection panics with "Could not automatically determine the
+// process-level CryptoProvider from Rustls crate features." We install
+// aws-lc-rs explicitly the first time any FFI entry point that may open
+// a TLS connection is called. install_default() returns Err if a provider
+// is already installed; that's fine — we ignore it.
+// ---------------------------------------------------------------------------
+fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+// ---------------------------------------------------------------------------
 // RelayOSConfig — wraps MacOSConfig for Apple Silicon hardware keys.
 //
 // Copies master's relay logic: generate_validation_data() calls the relay
@@ -3544,6 +3564,7 @@ pub async fn connect(
     config: &WrappedOSConfig,
     state: &WrappedAPSState,
 ) -> Arc<WrappedAPSConnection> {
+    ensure_crypto_provider();
     let config = config.config.clone();
     let state = state.inner.clone();
     let (connection, error) = APSConnectionResource::new(config, state).await;
@@ -3569,6 +3590,7 @@ pub async fn login_start(
     config: &WrappedOSConfig,
     connection: &WrappedAPSConnection,
 ) -> Result<Arc<LoginSession>, WrappedError> {
+    ensure_crypto_provider();
     let os_config = config.config.clone();
     let conn = connection.inner.clone();
 
@@ -4709,6 +4731,7 @@ pub async fn new_client(
     message_callback: Box<dyn MessageCallback>,
     update_users_callback: Box<dyn UpdateUsersCallback>,
 ) -> Result<Arc<Client>, WrappedError> {
+    ensure_crypto_provider();
     let conn = connection.inner.clone();
     let users_clone = users.inner.clone();
     let identity_clone = identity.inner.clone();
