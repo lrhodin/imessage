@@ -770,6 +770,10 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 		}
 		handles = append(handles, ghostID)
 	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("Ghost row iteration error during presence subscription — subscription may be incomplete")
+		return
+	}
 	if len(handles) == 0 {
 		return
 	}

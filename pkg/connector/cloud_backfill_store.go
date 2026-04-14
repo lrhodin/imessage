@@ -667,6 +667,9 @@ func (s *cloudBackfillStore) lookupPortalIDsByRecordNames(ctx context.Context, r
 			result[rn] = pid
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
 	}
 	return result, nil
 }
