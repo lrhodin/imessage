@@ -724,6 +724,13 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 	if c.client == nil {
 		return
 	}
+	// Guard against panics inside the SubscribeToStatus FFI call (upstream
+	// StatusKit path has several panic sites, e.g. statuskit.rs:736).
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warn().Interface("panic", r).Msg("subscribeToContactPresence panicked — skipped")
+		}
+	}()
 	// Serialize concurrent calls so each one reads the freshest state.keys
 	// snapshot from the Rust side. A previous leading-edge debounce was
 	// swallowing re-subscriptions fired by OnKeysReceived: startup ran an
@@ -771,6 +778,14 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 	if c.client == nil || c.handle == "" {
 		return
 	}
+	// Function-level panic guard. SetStatus/InviteToStatusSharing both
+	// cross into Rust and upstream has several reachable panic sites in
+	// the keysharing path (see audit).
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warn().Interface("panic", r).Msg("inviteContactsToStatusSharing panicked — skipped")
+		}
+	}()
 	ctx := context.Background()
 	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost WHERE bridge_id=$1", c.Main.Bridge.ID)
 	if err != nil {
@@ -800,11 +815,6 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 		log.Warn().Err(err).Msg("StatusKit invite: channel not ready (will retry on next restart)")
 		return
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			log.Warn().Str("panic", fmt.Sprintf("%v", r)).Msg("StatusKit invite panicked")
-		}
-	}()
 	if err := c.client.InviteToStatusSharing(c.handle, handles); err != nil {
 		log.Warn().Err(err).Int("count", len(handles)).Msg("StatusKit invite failed")
 	} else {

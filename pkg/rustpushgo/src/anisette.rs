@@ -1,18 +1,27 @@
 //! Linux anisette wrapper around upstream's `RemoteAnisetteProviderV3`.
 //!
-//! Upstream's provisioning has two bugs we work around here:
+//! Upstream's provisioning has three bugs we work around here:
 //!   1. The `ProvisionInput` enum is missing `EndProvisioningError`, so a
 //!      transient Apple rejection crashes serde instead of returning an error.
 //!   2. The provision() loop (`let Some(Ok(data)) = ... else { continue }`)
 //!      spins forever if the WebSocket stream closes.
+//!   3. `get_anisette_headers` contains a bare `panic!()` for any
+//!      non-`AnisetteNotProvisioned` error from `get_headers` (see
+//!      `remote_anisette_v3.rs:417`). If that panic unwinds across the
+//!      uniffi FFI boundary while the caller holds the shared
+//!      `tokio::sync::Mutex<anisette>` (TokenProvider, CloudKitClient,
+//!      KeychainClient all share it), every subsequent anisette-touching
+//!      operation deadlocks — including message send.
 //!
 //! This wrapper catches those failures, cleans state, retries, and adds a
 //! timeout. All Apple-facing requests go through upstream's code unchanged.
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use futures::FutureExt;
 use log::{info, warn};
 use omnisette::remote_anisette_v3::RemoteAnisetteProviderV3;
 use omnisette::{AnisetteError, AnisetteProvider, LoginClientInfo};
@@ -61,14 +70,14 @@ impl AnisetteProvider for BridgeAnisetteProvider {
                     self.state_path.clone(),
                 );
 
-                match tokio::time::timeout(
-                    PROVISION_TIMEOUT,
-                    upstream.get_anisette_headers(),
-                )
-                .await
-                {
-                    Ok(Ok(headers)) => return Ok(headers),
-                    Ok(Err(AnisetteError::SerdeError(ref e))) => {
+                // AssertUnwindSafe + catch_unwind turns upstream's bare
+                // `panic!()` into a caught panic payload. Without this the
+                // panic unwinds into the caller's critical section and can
+                // leave shared mutexes locked.
+                let inner = AssertUnwindSafe(upstream.get_anisette_headers()).catch_unwind();
+                match tokio::time::timeout(PROVISION_TIMEOUT, inner).await {
+                    Ok(Ok(Ok(headers))) => return Ok(headers),
+                    Ok(Ok(Err(AnisetteError::SerdeError(ref e)))) => {
                         // Upstream's ProvisionInput enum is missing variants
                         // (e.g. EndProvisioningError). Clear state and retry —
                         // the rejection may be transient.
@@ -87,9 +96,35 @@ impl AnisetteProvider for BridgeAnisetteProvider {
                             e
                         )));
                     }
-                    Ok(Err(e)) => {
+                    Ok(Ok(Err(e))) => {
                         // Non-serde error — don't retry blindly.
                         return Err(e);
+                    }
+                    Ok(Err(panic_payload)) => {
+                        // Upstream `RemoteAnisetteProviderV3::get_anisette_headers`
+                        // contains `panic!()` for non-`AnisetteNotProvisioned`
+                        // errors. Convert to a retryable error so the panic
+                        // doesn't unwind past this point.
+                        let msg = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic payload".into()
+                        };
+                        warn!(
+                            "anisette: upstream panicked on attempt {}/{}: {}",
+                            attempt + 1,
+                            MAX_RETRIES,
+                            msg
+                        );
+                        self.clear_state();
+                        last_err = Some(AnisetteError::InvalidArgument(format!(
+                            "Anisette call panicked (attempt {}/{}): {}",
+                            attempt + 1,
+                            MAX_RETRIES,
+                            msg
+                        )));
                     }
                     Err(_) => {
                         // Timeout — likely the upstream infinite-loop bug.

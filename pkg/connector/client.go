@@ -918,6 +918,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 		defer cancel()
 		done := make(chan error, 1)
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warn().Interface("panic", r).Msg("StatusKit init panicked — treating as init failure")
+					done <- fmt.Errorf("statuskit init panicked: %v", r)
+				}
+			}()
 			done <- c.client.InitStatuskit(c)
 		}()
 		subscribeAfterInit := func(err error) {
@@ -6902,6 +6908,15 @@ func decodeCloudBackfillCursor(cursor networkid.PaginationCursor) (*cloudBackfil
 // ============================================================================
 
 func (c *IMClient) persistState(log zerolog.Logger) {
+	// Guard against panics crossing the FFI boundary from any of the four
+	// rustpushgo calls below. A panic here would otherwise kill the bridge
+	// on a non-essential periodic persist; skipping one cycle is strictly
+	// safer than crashing the process.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warn().Interface("panic", r).Msg("persistState panicked — skipped this cycle")
+		}
+	}()
 	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 	if c.connection != nil {
 		meta.APSState = c.connection.State().ToString()
