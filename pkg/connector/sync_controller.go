@@ -1380,6 +1380,11 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 		// actually has records. This paginates from scratch independently
 		// and helps identify whether the changes feed is empty vs. data exists.
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warn().Interface("panic", r).Msg("CloudKit diagnostic full count panicked — ignored")
+				}
+			}()
 			if diagResult, diagErr := c.client.CloudDiagFullCount(); diagErr != nil {
 				log.Warn().Err(diagErr).Msg("CloudKit diagnostic full count failed")
 			} else {
