@@ -3929,16 +3929,14 @@ async fn fetch_imessage_mmcs_authorize_body(
         signature: mmcs.signature.to_vec().into(),
     };
 
-    // Encode as binary plist — same as upstream's `plist_to_bin`.
-    let mut binary = Vec::new();
-    plist::to_writer_binary(&mut binary, &request_download)
-        .map_err(|e| format!("plist encode: {e}"))?;
-
     // Subscribe BEFORE send to avoid the race where the response arrives
     // before the receiver is registered.
     let recv = conn.subscribe().await;
 
-    conn.send_message("com.apple.madrid", binary, Some(msg_id))
+    // Upstream's send_message now takes `impl Serialize` and handles plist
+    // encoding internally (was: pre-serialized Vec<u8> + plist_to_bin at the
+    // call site). The id parameter is also i32 now, not u32.
+    conn.send_message("com.apple.madrid", request_download, Some(msg_id as i32))
         .await
         .map_err(|e| format!("APNs send_message: {e}"))?;
 
@@ -3948,7 +3946,9 @@ async fn fetch_imessage_mmcs_authorize_body(
     // check the parsed payload fields directly and trust APNs routing
     // to only deliver com.apple.madrid messages on this subscription.
     let predicate = move |msg: rustpush::APSMessage| -> Option<Value> {
-        if let rustpush::APSMessage::Notification { payload, .. } = msg {
+        // After the packed-APS-encoding refactor, payload is plist::Value
+        // (Value::Data variant when it carries bytes) instead of Vec<u8>.
+        if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = msg {
             if let Ok(parsed) = plist::from_bytes::<Value>(&payload) {
                 let dict = parsed.as_dictionary()?;
                 let c = dict.get("c")?.as_unsigned_integer()?;
@@ -4915,7 +4915,7 @@ pub async fn new_client(
                     } else {
                         "no-topic"
                     };
-                    let diag_cmd = if let rustpush::APSMessage::Notification { payload, .. } = &msg {
+                    let diag_cmd = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
                         plist::from_bytes::<plist::Value>(payload)
                             .ok()
                             .and_then(|v| v.into_dictionary())
@@ -4950,7 +4950,7 @@ pub async fn new_client(
                                         // Parse the command byte and IDS envelope field presence
                                         // from the raw payload for diagnostics.
                                         let (cmd_byte, ids_fields) =
-                                            if let rustpush::APSMessage::Notification { payload, .. } = &msg {
+                                            if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
                                                 if let Ok(plist::Value::Dictionary(d)) = plist::from_bytes::<plist::Value>(payload) {
                                                     let c = d.get("c").and_then(|v| v.as_unsigned_integer()).map(|v| v as u8);
                                                     let sp = d.contains_key("sP");
@@ -4980,7 +4980,7 @@ pub async fn new_client(
                                         if is_reinvite {
                                             info!("StatusKit peer re-invite received for existing channel (c=227) — keys replaced in place");
                                         } else if !is_silent {
-                                            let all_keys = if let rustpush::APSMessage::Notification { payload, .. } = &msg {
+                                            let all_keys = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
                                                 plist::from_bytes::<plist::Value>(payload)
                                                     .ok()
                                                     .and_then(|v| v.into_dictionary())
