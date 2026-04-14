@@ -2600,11 +2600,11 @@ func (s *cloudBackfillStore) debugFindPortalsByIdentifierSuffix(ctx context.Cont
 // record has synced, and whether it's filtered/deleted). Used by !msg-debug
 // to distinguish "chat not synced yet" from "chat synced but messages missing".
 type debugChatInfo struct {
-	Found      bool
-	Deleted    bool
-	IsFiltered int64
+	Found       bool
+	Deleted     bool
+	IsFiltered  int64
 	CloudChatID string
-	GroupID    string
+	GroupID     string
 }
 
 func (s *cloudBackfillStore) debugChatInfo(ctx context.Context, portalID string) (debugChatInfo, error) {

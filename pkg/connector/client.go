@@ -2326,7 +2326,6 @@ func restoreRetryDelay(attempt int) time.Duration {
 	}
 }
 
-
 func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 	defer c.finishRestoreBackfillPipeline(opts.PortalID)
 
@@ -3150,7 +3149,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 			Msg("Unfiltered scan complete")
 		diag = &restoreFetchDiagnostic{
 			UnfilteredTotal: len(unfiltered),
-			SampleChatIDs:  sampleIDs,
+			SampleChatIDs:   sampleIDs,
 		}
 	}
 
