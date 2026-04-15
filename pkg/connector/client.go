@@ -4636,9 +4636,23 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	if conv.IsSms {
 		return fmt.Errorf("edits are not supported for SMS conversations")
 	}
-	targetGUID := string(msg.EditTarget.ID)
+	rawTargetID := string(msg.EditTarget.ID)
+	targetGUID, targetPart := extractTapbackTarget(rawTargetID)
 
-	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
+	zerolog.Ctx(ctx).Info().
+		Str("op", "edit").
+		Str("portal_id", string(msg.Portal.ID)).
+		Str("handle", c.handle).
+		Strs("conv_participants", conv.Participants).
+		Interface("conv_sender_guid", conv.SenderGuid).
+		Bool("conv_is_sms", conv.IsSms).
+		Str("raw_target_id", rawTargetID).
+		Str("extracted_guid", targetGUID).
+		Uint64("extracted_part", targetPart).
+		Int("body_len", len(msg.Content.Body)).
+		Msg("DIAG: SendEdit invocation")
+
+	_, err := c.client.SendEdit(conv, rawTargetID, 0, msg.Content.Body, c.handle)
 	if err == nil {
 		// Work around mautrix-go bridgev2 not incrementing EditCount before saving.
 		msg.EditTarget.EditCount++
@@ -4662,7 +4676,20 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// separate part index. Sending the suffixed string as the tuuid means
 	// the recipient finds no matching GUID and silently drops the unsend.
 	// Same pattern as HandleMatrixReaction and HandleMatrixReadReceipt.
-	targetGUID, targetPart := extractTapbackTarget(string(msg.TargetMessage.ID))
+	rawTargetID := string(msg.TargetMessage.ID)
+	targetGUID, targetPart := extractTapbackTarget(rawTargetID)
+
+	zerolog.Ctx(ctx).Info().
+		Str("op", "unsend").
+		Str("portal_id", string(msg.Portal.ID)).
+		Str("handle", c.handle).
+		Strs("conv_participants", conv.Participants).
+		Interface("conv_sender_guid", conv.SenderGuid).
+		Bool("conv_is_sms", conv.IsSms).
+		Str("raw_target_id", rawTargetID).
+		Str("extracted_guid", targetGUID).
+		Uint64("extracted_part", targetPart).
+		Msg("DIAG: SendUnsend invocation")
 
 	// Track outbound unsend so we can suppress the APNs echo.
 	c.trackOutboundUnsend(targetGUID)
