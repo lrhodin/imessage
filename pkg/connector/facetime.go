@@ -252,32 +252,29 @@ func fnFaceTime(ce *commands.Event) {
 }
 
 // fnFaceTimeCallInPortal handles the portal-room variant of !facetime: post
-// facetime:// and facetime-audio:// deep links targeting the DM contact's bare
-// handle. Tapping on iOS / macOS hands off to the user's own FaceTime app,
-// which handles dial-out, ringing, and media entirely client-side using the
-// logged-in Apple ID — the bridge is not in the audio/video path at all.
+// facetime:// and facetime-audio:// URLs with the contact's bare handle baked
+// into the URL itself (facetime://<handle> / facetime-audio://<handle>).
+// Tapping either URL opens FaceTime pre-populated with that contact — one tap
+// to dial, one URL carries all the parameters.
 //
 // Returns true if the command was handled; false to fall through to the
 // link-only branch (group portal, no usable target handle, etc.).
 //
 // Why not create_session + web join link?
 //
-// The bridge's Apple-ID login is headless: there is no FaceTime client on our
-// side that can stream AV. Calling ft.CreateSession registers bridge.handle
-// as a session member ("caller") and propps up the call via prop_up_conv,
-// causing Apple's servers to expect AV from that participant. When the callee
-// picks up they never see media from the caller slot, so even though the
-// caller's web tap and the callee's pickup both register as joins, the call
-// never actually connects — media stays locked on the never-arriving
-// bridge.handle participant. Upstream rustpush only unprop_convs the session
-// when a `temp:` (link pseud) joins (facetime.rs:1316), which is racy with
-// callee pickup and not exposed as an FFI the Go side can call directly.
+// The earlier session-link flow (96bb794 / f168c0d) called
+// ft.CreateSession(sessionID, bridge.handle, [target]), which registers
+// bridge.handle as an active session member. The bridge is a headless IDS
+// login with no FaceTime client — it cannot provide AV. Apple's servers
+// wait on that ghost participant and the media handshake never completes,
+// giving the user-reported symptom: "rings, I join, they pick up, it never
+// connects." Upstream's only escape hatch (auto-unprop on temp: join at
+// facetime.rs:1316) races with callee pickup and isn't exposed via the FFI
+// for us to force.
 //
-// The facetime:// scheme sidesteps all of this: the user's own device is the
-// caller, Apple's servers never see a headless participant, and ringing only
-// happens once the user has actually tapped Call. Browser / Android clients
-// that don't register the facetime:// scheme should use !facetime-send, which
-// iMessages a plain FaceTime web link to the contact.
+// facetime:// schemes sidestep the whole session machinery — the handle is
+// a URL parameter, the user's own device places the call, and the bridge
+// is never in the media path.
 func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 	portalID := string(ce.Portal.ID)
 	// Group portals fall through — direct-dial URLs only make sense for DMs.
@@ -321,11 +318,10 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 	ce.Reply(
 		"[**📹 FaceTime Video %s**](%s)\n\n"+
 			"[**📞 FaceTime Audio %s**](%s)\n\n"+
-			"Tapping a button opens FaceTime on iOS / macOS and dials %s directly from your own Apple ID — the bridge is not in the media path.\n\n"+
-			"**On browser / Android clients** where `facetime://` links aren't handled, use `!im facetime-send` instead — it iMessages a FaceTime web join link to %s.",
+			"Raw URLs: `%s` · `%s`",
 		bare, videoURL,
 		bare, audioURL,
-		bare, bare,
+		videoURL, audioURL,
 	)
 	return true
 }
