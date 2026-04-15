@@ -4522,10 +4522,12 @@ resolved:
 }
 
 func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	if msg.IsStoredMessage {
-		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored delivery receipt")
-		return
-	}
+	// Don't gate on IsStoredMessage. Delivery receipts arrive within seconds
+	// of a send — almost always inside the 30s post-reconnect window — and
+	// SendMessageStatus is idempotent, so dropping them only erases the
+	// "delivered" tick from genuinely live messages. Read receipts naturally
+	// land later (after the user actually reads), which is why the same gate
+	// on handleReadReceipt didn't have the same visible regression.
 	ctx := context.Background()
 
 	// Mirror handleReadReceipt's portal-resolution chain. Without these
