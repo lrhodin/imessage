@@ -359,7 +359,14 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		createErr = ft.CreateSession(sessionID, client.handle, []string{target})
 	}
 	if createErr != nil {
-		ce.Reply("Failed to start FaceTime call: %v\n\nSend-ack timeouts usually clear on a second try — run `!im facetime` again.", createErr)
+		switch {
+		case isNonRetryableResourceClosed(createErr):
+			ce.Reply("Failed to start FaceTime call: %v\n\nThe bridge's iMessage connection is in a terminal state — retrying this command won't help. The bridge needs to reconnect (try again in a minute, or log out and back in if it persists).", createErr)
+		case isLikelyDeliveredSendTimeout(createErr):
+			ce.Reply("Failed to start FaceTime call: %v\n\nSend-ack timeouts usually clear on a second try — run `!im facetime` again.", createErr)
+		default:
+			ce.Reply("Failed to start FaceTime call: %v", createErr)
+		}
 		return true
 	}
 
@@ -497,6 +504,21 @@ func isLikelyDeliveredSendTimeout(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "send timeout; try again") ||
 		strings.Contains(msg, "sendtimedout")
+}
+
+// isNonRetryableResourceClosed matches upstream's
+// PushError::DoNotRetry(ResourceClosed) — a terminal failure of the bridge's
+// IdentityManager resource loop (util.rs ResourceManager goes to
+// ResourceState::Closed after a DoNotRetry generate error). Once that
+// happens, every identity.cache_keys / send_message call fails identically
+// until the bridge reconnects; retrying the same command is pointless.
+func isNonRetryableResourceClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Resource has been closed") ||
+		strings.Contains(msg, "Do not retry")
 }
 
 func faceTimeClientAndCandidates(ce *commands.Event) (client *IMClient, handles []string, explicit bool, ok bool) {
