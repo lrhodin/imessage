@@ -306,14 +306,29 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return true
 	}
 
-	if err := ft.CreateSession(sessionID, client.handle, []string{target}); err != nil {
-		ce.Reply("Failed to create FaceTime session: %v", err)
+	// CreateSession and GetSessionLink each do an APNs round-trip that
+	// occasionally times out waiting for the server ack. Both upstream error
+	// messages literally say "try again", so we retry once with a short
+	// backoff before surfacing the error to the user. Reusing the same
+	// sessionID on retry is safe: create_session's APNs announcement is
+	// idempotent on the group_id, and GetSessionLink only reads state.
+	createErr := ft.CreateSession(sessionID, client.handle, []string{target})
+	if createErr != nil && isLikelyDeliveredSendTimeout(createErr) {
+		time.Sleep(500 * time.Millisecond)
+		createErr = ft.CreateSession(sessionID, client.handle, []string{target})
+	}
+	if createErr != nil {
+		ce.Reply("Failed to create FaceTime session: %v\n\nSend-ack timeouts usually clear on a second try — run `!im facetime` again. If it keeps failing, `!im facetime-state` dumps the client state for debugging.", createErr)
 		return true
 	}
 
-	link, err := ft.GetSessionLink(sessionID)
-	if err != nil {
-		ce.Reply("Session created but link fetch failed: %v", err)
+	link, linkErr := ft.GetSessionLink(sessionID)
+	if linkErr != nil && isLikelyDeliveredSendTimeout(linkErr) {
+		time.Sleep(500 * time.Millisecond)
+		link, linkErr = ft.GetSessionLink(sessionID)
+	}
+	if linkErr != nil {
+		ce.Reply("Session created but link fetch failed: %v", linkErr)
 		return true
 	}
 
