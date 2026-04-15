@@ -755,11 +755,6 @@ void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_delete_shared_item(
 	RustCallStatus* out_status
 );
 
-void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_export_state_bytes(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
 void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_export_state_json(
 	void* ptr,
 	RustCallStatus* out_status
@@ -767,12 +762,6 @@ void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_export_state_json(
 
 void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_sync_item_positions(
 	void* ptr,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedfindmyclient_sync_items(
-	void* ptr,
-	int8_t fetch_shares,
 	RustCallStatus* out_status
 );
 
@@ -945,30 +934,10 @@ void uniffi_rustpushgo_fn_free_wrappedsharedstreamsclient(
 	RustCallStatus* out_status
 );
 
-void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_create_asset_from_bytes(
-	void* ptr,
-	RustBuffer album,
-	RustBuffer filename,
-	RustBuffer data,
-	uint64_t width,
-	uint64_t height,
-	RustBuffer uti_type,
-	RustBuffer video_type,
-	RustCallStatus* out_status
-);
-
 void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_delete_assets(
 	void* ptr,
 	RustBuffer album,
 	RustBuffer assets,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_download_file_bytes(
-	void* ptr,
-	RustBuffer checksum_hex,
-	RustBuffer token,
-	RustBuffer url,
 	RustCallStatus* out_status
 );
 
@@ -1023,11 +992,6 @@ void uniffi_rustpushgo_fn_free_wrappedstatuskitclient(
 	RustCallStatus* out_status
 );
 
-void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_clear_interest_tokens(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
 void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_export_state_json(
 	void* ptr,
 	RustCallStatus* out_status
@@ -1035,36 +999,6 @@ void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_export_state_json(
 
 void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_get_known_handles(
 	void* ptr,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_invite_to_channel(
-	void* ptr,
-	RustBuffer sender_handle,
-	RustBuffer handles,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_request_handles(
-	void* ptr,
-	RustBuffer handles,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_reset_keys(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_roll_keys(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_share_status(
-	void* ptr,
-	int8_t active,
-	RustBuffer mode,
 	RustCallStatus* out_status
 );
 
@@ -1915,19 +1849,11 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_delete_shared_ite
 	RustCallStatus* out_status
 );
 
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_export_state_bytes(
-	RustCallStatus* out_status
-);
-
 uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_export_state_json(
 	RustCallStatus* out_status
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_sync_item_positions(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedfindmyclient_sync_items(
 	RustCallStatus* out_status
 );
 
@@ -2019,15 +1945,7 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedpasswordsclient_upsert_passwor
 	RustCallStatus* out_status
 );
 
-uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_create_asset_from_bytes(
-	RustCallStatus* out_status
-);
-
 uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_delete_assets(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_download_file_bytes(
 	RustCallStatus* out_status
 );
 
@@ -2063,35 +1981,11 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_unsubscrib
 	RustCallStatus* out_status
 );
 
-uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_clear_interest_tokens(
-	RustCallStatus* out_status
-);
-
 uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_export_state_json(
 	RustCallStatus* out_status
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_get_known_handles(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_invite_to_channel(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_request_handles(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_reset_keys(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_roll_keys(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_share_status(
 	RustCallStatus* out_status
 );
 

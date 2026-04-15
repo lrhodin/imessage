@@ -2249,12 +2249,6 @@ pub struct WrappedShareProfileData {
 }
 
 #[derive(uniffi::Record, Clone)]
-pub struct WrappedStatusKitInviteHandle {
-    pub handle: String,
-    pub allowed_modes: Vec<String>,
-}
-
-#[derive(uniffi::Record, Clone)]
 pub struct WrappedPasswordEntryRef {
     pub id: String,
     pub group: Option<String>,
@@ -4489,16 +4483,6 @@ impl WrappedFindMyClient {
         serialize_state_json(&*state)
     }
 
-    pub async fn export_state_bytes(&self) -> Result<Vec<u8>, WrappedError> {
-        let state = self.inner.state.state.lock().await;
-        Ok(state.encode()?)
-    }
-
-    pub async fn sync_items(&self, fetch_shares: bool) -> Result<(), WrappedError> {
-        self.inner.sync_items(fetch_shares).await?;
-        Ok(())
-    }
-
     pub async fn sync_item_positions(&self) -> Result<(), WrappedError> {
         self.inner.sync_item_positions().await?;
         Ok(())
@@ -4799,7 +4783,6 @@ impl WrappedPasswordsClient {
 #[derive(uniffi::Object)]
 pub struct WrappedStatusKitClient {
     inner: Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>,
-    interests: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -4807,14 +4790,6 @@ impl WrappedStatusKitClient {
     pub async fn export_state_json(&self) -> Result<String, WrappedError> {
         let state = self.inner.state.read().await;
         serialize_state_json(&*state)
-    }
-
-    pub async fn roll_keys(&self) {
-        self.inner.roll_keys().await;
-    }
-
-    pub async fn reset_keys(&self) {
-        self.inner.reset_keys().await;
     }
 
     /// Returns contact handles with a confirmed-live StatusKit channel — i.e.
@@ -4888,46 +4863,6 @@ impl WrappedStatusKitClient {
         handles
     }
 
-    pub async fn share_status(&self, active: bool, mode: Option<String>) -> Result<(), WrappedError> {
-        let status = if active {
-            rustpush::statuskit::StatusKitStatus::new_active()
-        } else {
-            rustpush::statuskit::StatusKitStatus::new_away(mode.ok_or(WrappedError::GenericError {
-                msg: "Mode is required when sharing away status".into(),
-            })?)
-        };
-        self.inner.share_status(&status).await?;
-        Ok(())
-    }
-
-    pub async fn invite_to_channel(
-        &self,
-        sender_handle: String,
-        handles: Vec<WrappedStatusKitInviteHandle>,
-    ) -> Result<(), WrappedError> {
-        let mapped = handles
-            .into_iter()
-            .map(|h| {
-                (
-                    h.handle,
-                    rustpush::statuskit::StatusKitPersonalConfig {
-                        allowed_modes: h.allowed_modes,
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        self.inner.invite_to_channel(&sender_handle, mapped).await?;
-        Ok(())
-    }
-
-    pub async fn request_handles(&self, handles: Vec<String>) {
-        let token = self.inner.request_handles(&handles).await;
-        self.interests.lock().await.push(token);
-    }
-
-    pub async fn clear_interest_tokens(&self) {
-        self.interests.lock().await.clear();
-    }
 }
 
 #[derive(uniffi::Object)]
@@ -4977,69 +4912,9 @@ impl WrappedSharedStreamsClient {
         })
     }
 
-    pub async fn create_asset_from_bytes(
-        &self,
-        album: String,
-        filename: String,
-        data: Vec<u8>,
-        width: u64,
-        height: u64,
-        uti_type: String,
-        video_type: Option<String>,
-    ) -> Result<(), WrappedError> {
-        let file = rustpush::sharedstreams::PreparedFile::new(
-            Cursor::new(data),
-            rustpush::sharedstreams::FileMetadata {
-                width: width as usize,
-                height: height as usize,
-                uti_type,
-                video_type: video_type.clone(),
-                asset_metadata: None,
-            },
-        )
-        .await?;
-
-        let asset = rustpush::sharedstreams::PreparedAsset {
-            files: vec![file],
-            name: filename,
-            date_created: std::time::SystemTime::now(),
-            video_duration: None,
-            guid: uuid::Uuid::new_v4().to_string().to_uppercase(),
-        };
-
-        self.inner
-            .create_asset(&album, vec![asset], |_current, _total| {})
-            .await?;
-        Ok(())
-    }
-
     pub async fn delete_assets(&self, album: String, assets: Vec<String>) -> Result<(), WrappedError> {
         self.inner.delete_asset(&album, assets).await?;
         Ok(())
-    }
-
-    pub async fn download_file_bytes(
-        &self,
-        checksum_hex: String,
-        token: String,
-        url: String,
-    ) -> Result<Vec<u8>, WrappedError> {
-        let file = rustpush::sharedstreams::AssetFile {
-            size: "0".to_string(),
-            checksum: checksum_hex,
-            width: "0".to_string(),
-            height: "0".to_string(),
-            file_type: "public.data".to_string(),
-            metadata: None,
-            url,
-            token,
-            video_type: None,
-        };
-
-        let writer = SharedWriter::new();
-        let mut files = vec![(&file, writer.clone())];
-        self.inner.get_file(&mut files, |_current, _total| {}).await?;
-        Ok(writer.into_bytes())
     }
 }
 
@@ -6129,7 +6004,6 @@ impl Client {
                 self.client.identity.clone(),
             )
             .await,
-            interests: tokio::sync::Mutex::new(Vec::new()),
         });
 
         // Write path: re-acquire briefly to store result; handle race.

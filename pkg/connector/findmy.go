@@ -17,8 +17,6 @@
 package connector
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -45,17 +43,6 @@ var cmdFindMy = &commands.FullHandler{
 	Help: commands.HelpMeta{
 		Section:     HelpSectionFindMy,
 		Description: "List your Find My accessories (AirTags, etc.) with current location, accuracy, and a Maps link.",
-	},
-	RequiresLogin: true,
-}
-
-var cmdFindMySyncItems = &commands.FullHandler{
-	Name: "findmy-sync-items",
-	Func: fnFindMySyncItems,
-	Help: commands.HelpMeta{
-		Section:     HelpSectionFindMy,
-		Description: "Re-fetch Find My items metadata from iCloud; --fetch-shares also pulls shared-item invites.",
-		Args:        "[--fetch-shares]",
 	},
 	RequiresLogin: true,
 }
@@ -99,16 +86,6 @@ var cmdFindMyStateJSON = &commands.FullHandler{
 	Help: commands.HelpMeta{
 		Section:     HelpSectionFindMy,
 		Description: "Dump raw Find My state as JSON — debugging only.",
-	},
-	RequiresLogin: true,
-}
-
-var cmdFindMyStateBytes = &commands.FullHandler{
-	Name: "findmy-state-bytes",
-	Func: fnFindMyStateBytes,
-	Help: commands.HelpMeta{
-		Section:     HelpSectionFindMy,
-		Description: "Show the Find My state blob size and a hash — debugging only.",
 	},
 	RequiresLogin: true,
 }
@@ -257,19 +234,6 @@ func findMyClientFromEvent(ce *commands.Event) (*rustpushgo.WrappedFindMyClient,
 	return fm, true
 }
 
-func fnFindMySyncItems(ce *commands.Event) {
-	fm, ok := findMyClientFromEvent(ce)
-	if !ok {
-		return
-	}
-	fetchShares := len(ce.Args) > 0 && strings.EqualFold(strings.TrimSpace(ce.Args[0]), "--fetch-shares")
-	if err := fm.SyncItems(fetchShares); err != nil {
-		ce.Reply("Failed to sync Find My items: %v", err)
-		return
-	}
-	ce.Reply("Find My items synced (fetch_shares=%v).", fetchShares)
-}
-
 func fnFindMyAcceptShare(ce *commands.Event) {
 	if len(ce.Args) < 1 {
 		ce.Reply("Usage: `!findmy-accept-share <circle-id>`")
@@ -351,18 +315,4 @@ func fnFindMyStateJSON(ce *commands.Event) {
 		state = state[:12000] + "\n... (truncated)"
 	}
 	ce.Reply("```json\n%s\n```", state)
-}
-
-func fnFindMyStateBytes(ce *commands.Event) {
-	fm, ok := findMyClientFromEvent(ce)
-	if !ok {
-		return
-	}
-	blob, err := fm.ExportStateBytes()
-	if err != nil {
-		ce.Reply("Failed to export Find My state bytes: %v", err)
-		return
-	}
-	sum := sha256.Sum256(blob)
-	ce.Reply("Find My state bytes: %d bytes, sha256 `%s`", len(blob), hex.EncodeToString(sum[:]))
 }

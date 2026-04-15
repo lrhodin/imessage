@@ -18,11 +18,7 @@ package connector
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -119,28 +115,6 @@ var cmdSharedDeleteAssets = &commands.FullHandler{
 		Section:     HelpSectionSharedStreams,
 		Description: "Delete specific assets from a shared album by asset GUID.",
 		Args:        "<album-id> <asset-guid...>",
-	},
-	RequiresLogin: true,
-}
-
-var cmdSharedDownloadFile = &commands.FullHandler{
-	Name: "shared-download-file",
-	Func: fnSharedDownloadFile,
-	Help: commands.HelpMeta{
-		Section:     HelpSectionSharedStreams,
-		Description: "Fetch a Shared Streams file by checksum/token/url and report its size and hash — debugging only.",
-		Args:        "<checksum-hex> <token> <url>",
-	},
-	RequiresLogin: true,
-}
-
-var cmdSharedCreateAssetB64 = &commands.FullHandler{
-	Name: "shared-create-asset-b64",
-	Func: fnSharedCreateAssetB64,
-	Help: commands.HelpMeta{
-		Section:     HelpSectionSharedStreams,
-		Description: "Upload an asset from base64-encoded bytes into a shared album — admin/debug only.",
-		Args:        "<album-id> <filename> <width> <height> <uti-type> <base64-data> [video-type]",
 	},
 	RequiresLogin: true,
 }
@@ -514,66 +488,4 @@ func fnSharedDeleteAssets(ce *commands.Event) {
 		return
 	}
 	ce.Reply("Deleted %d asset(s) from `%s`.", len(assets), albumID)
-}
-
-func fnSharedDownloadFile(ce *commands.Event) {
-	if len(ce.Args) < 3 {
-		ce.Reply("Usage: `!shared-download-file <checksum-hex> <token> <url>`")
-		return
-	}
-	ss, ok := sharedStreamsClientFromEvent(ce)
-	if !ok {
-		return
-	}
-	checksum := strings.TrimSpace(ce.Args[0])
-	token := strings.TrimSpace(ce.Args[1])
-	url := strings.TrimSpace(ce.Args[2])
-	blob, err := ss.DownloadFileBytes(checksum, token, url)
-	if err != nil {
-		ce.Reply("Failed to download shared file: %v", err)
-		return
-	}
-	sum := sha256.Sum256(blob)
-	ce.Reply("Downloaded shared file: %d bytes, sha256 `%s`", len(blob), hex.EncodeToString(sum[:]))
-}
-
-func fnSharedCreateAssetB64(ce *commands.Event) {
-	if len(ce.Args) < 6 {
-		ce.Reply("Usage: `!shared-create-asset-b64 <album-id> <filename> <width> <height> <uti-type> <base64-data> [video-type]`")
-		return
-	}
-	ss, ok := sharedStreamsClientFromEvent(ce)
-	if !ok {
-		return
-	}
-	albumID := strings.TrimSpace(ce.Args[0])
-	filename := strings.TrimSpace(ce.Args[1])
-	width, err := strconv.ParseUint(strings.TrimSpace(ce.Args[2]), 10, 64)
-	if err != nil {
-		ce.Reply("Invalid width: %v", err)
-		return
-	}
-	height, err := strconv.ParseUint(strings.TrimSpace(ce.Args[3]), 10, 64)
-	if err != nil {
-		ce.Reply("Invalid height: %v", err)
-		return
-	}
-	utiType := strings.TrimSpace(ce.Args[4])
-	data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(ce.Args[5]))
-	if err != nil {
-		ce.Reply("Invalid base64 data: %v", err)
-		return
-	}
-	var videoType *string
-	if len(ce.Args) > 6 {
-		v := strings.TrimSpace(ce.Args[6])
-		if v != "" {
-			videoType = &v
-		}
-	}
-	if err := ss.CreateAssetFromBytes(albumID, filename, data, width, height, utiType, videoType); err != nil {
-		ce.Reply("Failed to create shared asset: %v", err)
-		return
-	}
-	ce.Reply("Created shared asset `%s` in `%s` (%d bytes).", filename, albumID, len(data))
 }

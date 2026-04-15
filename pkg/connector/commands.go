@@ -70,12 +70,10 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdFaceTimeAddMembers,
 		cmdFaceTimeRemoveMembers,
 		cmdFindMy,
-		cmdFindMySyncItems,
 		cmdFindMyAcceptShare,
 		cmdFindMyDeleteItem,
 		cmdFindMyRenameBeacon,
 		cmdFindMyStateJSON,
-		cmdFindMyStateBytes,
 		cmdFindMyDevices,
 		cmdFindMyFriends,
 		cmdFindMyFriendsImport,
@@ -87,15 +85,7 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdSharedState,
 		cmdSharedAssetsJSON,
 		cmdSharedDeleteAssets,
-		cmdSharedDownloadFile,
-		cmdSharedCreateAssetB64,
 		cmdStatuskitState,
-		cmdStatuskitClearInterest,
-		cmdStatuskitRequestHandles,
-		cmdStatuskitInviteToChannel,
-		cmdStatuskitResetKeys,
-		cmdStatuskitRollKeys,
-		cmdStatuskitShare,
 	}
 	return cmds
 }
