@@ -2880,6 +2880,15 @@ func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.W
 		}
 	}
 
+	// Pre-fill the caller's display name on the FaceTime web join page
+	// so tapping the answer button drops them straight into the call
+	// without the "enter your name" prompt.
+	if link != "" {
+		if slug := displayNameForHandle(c.handle); slug != "" {
+			link = appendFaceTimeLinkName(link, slug)
+		}
+	}
+
 	// Build the notice as markdown so the join link renders as a tappable
 	// anchor in the formatted_body. Plain-URL notices aren't autolinked by
 	// every Matrix client; wrapping the URL in [text](url) guarantees an
@@ -2940,22 +2949,37 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 	if name == "" {
 		name = "someone"
 	}
-	notice := "📞 Missed FaceTime call from " + name + "."
+
+	// Build callback buttons that target the caller directly via Apple's
+	// facetime:// URL scheme. We already have the caller's IDS handle in
+	// msg.Sender (mailto:<email> or tel:<E.164>) — strip the prefix and
+	// pass the bare handle to FaceTime so tapping the link dials THEM,
+	// not a generic bridge session. Works on iOS / macOS native clients;
+	// browser/Android clients won't honor the scheme and will see the
+	// raw URL (still useful as a phone-number / email reference).
+	bare := stripIdentifierPrefix(senderHandle)
+	noticeMarkdown := "📞 **Missed FaceTime call from " + name + ".**"
+	if bare != "" {
+		videoURL := "facetime://" + bare
+		audioURL := "facetime-audio://" + bare
+		noticeMarkdown += "\n\n[**📹 Call back (Video)**](" + videoURL + ") · [**📞 Call back (Audio)**](" + audioURL + ")"
+		noticeMarkdown += "\n\nDirect dial: " + bare
+	}
+
 	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	sendNotice := func(roomID id.RoomID) error {
+		content := format.RenderMarkdown(noticeMarkdown, true, false)
+		content.MsgType = event.MsgNotice
+		content.Mentions = &event.Mentions{}
 		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
-			Parsed: &event.MessageEventContent{
-				MsgType:  event.MsgNotice,
-				Body:     notice,
-				Mentions: &event.Mentions{},
-			},
+			Parsed: &content,
 		}, nil)
 		return sendErr
 	}
 	if err == nil && portal != nil && portal.MXID != "" {
 		if sendErr := sendNotice(portal.MXID); sendErr == nil {
-			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Msg("FaceTimeMissed: posted missed call notice to portal")
+			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Bool("has_callback", bare != "").Msg("FaceTimeMissed: posted missed call notice to portal")
 			return
 		}
 	}
@@ -2968,7 +2992,7 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 		log.Warn().Err(sendErr).Msg("FaceTimeMissed: failed to send management room notice")
 		return
 	}
-	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Msg("FaceTimeMissed: posted missed call notice to management room")
+	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Bool("has_callback", bare != "").Msg("FaceTimeMissed: posted missed call notice to management room")
 }
 
 func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
