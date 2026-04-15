@@ -2834,11 +2834,27 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
 /// iOS partners send profile keys piggybacked on regular text messages
 /// when Name & Photo Sharing is enabled, so the standalone control message
 /// alone is not sufficient to discover all shared profiles.
-fn populate_share_profile_keys(w: &mut WrappedMessage, profile: &rustpush::ShareProfileMessage) {
+///
+/// `kind` describes which message variant produced the profile, and is
+/// logged so the embedded path is observable. The standalone-variant
+/// "received Message::ShareProfile" log already covers those cases; this
+/// log catches NormalMessage/ReactMessage embedded arrivals which would
+/// otherwise be silent in the receive-loop log stream.
+fn populate_share_profile_keys(
+    w: &mut WrappedMessage,
+    profile: &rustpush::ShareProfileMessage,
+    kind: &'static str,
+) {
     w.is_share_profile = true;
     w.share_profile_record_key = Some(profile.cloud_kit_record_key.clone());
     w.share_profile_decryption_key = Some(profile.cloud_kit_decryption_record_key.clone());
     w.share_profile_has_poster = profile.poster.is_some();
+    info!(
+        "populated share_profile_keys from {} (record_key_len={}, has_poster={})",
+        kind,
+        profile.cloud_kit_record_key.len(),
+        profile.poster.is_some()
+    );
 }
 
 fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
@@ -2943,7 +2959,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             // messages from contacts who have sharing enabled; lift them so
             // the receive loop's inline download still fires.
             if let Some(profile) = &normal.embedded_profile {
-                populate_share_profile_keys(&mut w, profile);
+                populate_share_profile_keys(&mut w, profile, "NormalMessage.embedded_profile");
             }
 
             for indexed_part in &normal.parts.0 {
@@ -3070,7 +3086,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             // Reactions can also carry a piggybacked profile (same pattern
             // as text messages). Surface it for inline download.
             if let Some(profile) = &react.embedded_profile {
-                populate_share_profile_keys(&mut w, profile);
+                populate_share_profile_keys(&mut w, profile, "ReactMessage.embedded_profile");
             }
         }
         Message::Edit(edit) => {
@@ -3155,13 +3171,13 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.is_notify_anyways = true;
         }
         Message::ShareProfile(profile) => {
-            populate_share_profile_keys(&mut w, profile);
+            populate_share_profile_keys(&mut w, profile, "Message::ShareProfile");
         }
         Message::UpdateProfile(update) => {
             w.is_update_profile = true;
             w.update_profile_share_contacts = Some(update.share_contacts);
             if let Some(profile) = &update.profile {
-                populate_share_profile_keys(&mut w, profile);
+                populate_share_profile_keys(&mut w, profile, "Message::UpdateProfile.profile");
             }
         }
         Message::UpdateProfileSharing(update) => {

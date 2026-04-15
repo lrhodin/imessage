@@ -319,13 +319,16 @@ func (c *IMClient) lookupSharedProfile(identifier string) *rustpushgo.WrappedPro
 	return nil
 }
 
-// refreshSharedProfilesWithContacts is fired from setContactsReady so the
-// shared-profile refresh runs on the same cadence as CardDAV: once on the
-// initial contact sync and again on every periodic CardDAV re-sync. First
-// pushes every cached row to its Matrix ghost (no network — handles warm
-// restarts) and then re-fetches each row from CloudKit so profile edits
-// we missed while offline propagate.
-func (c *IMClient) refreshSharedProfilesWithContacts(log zerolog.Logger) {
+// refreshSharedProfilesOnConnect runs the startup share-profile refresh
+// independently of CardDAV: first pushes every cached row to its Matrix
+// ghost (no network — handles warm restarts), then re-fetches each row
+// from CloudKit so profile edits we missed while offline propagate. The
+// CloudKit fetch only needs ProfilesClient (keychain), not contacts.
+// periodicCloudContactSync re-runs refreshAllSharedProfiles on each tick
+// so we keep one ticker but don't gate the share-profile path behind
+// CardDAV success (which can lag for minutes if MobileMe delegate
+// expired and we're on the retry path).
+func (c *IMClient) refreshSharedProfilesOnConnect(log zerolog.Logger) {
 	c.applyCachedSharedProfilesToGhosts(log)
 	c.refreshAllSharedProfiles(log)
 }

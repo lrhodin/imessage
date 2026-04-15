@@ -965,8 +965,6 @@ func (c *IMClient) Connect(ctx context.Context) {
 	c.msgBuffer = &messageBuffer{client: c}
 	go c.periodicStateSave(log)
 	go c.periodicStatusSharingReinvite(log)
-	// Shared iMessage profile refresh now rides setContactsReady — same
-	// cadence as CardDAV. No standalone goroutine needed.
 
 	// Ensure shared-profile schema and hydrate the in-memory cache from the
 	// DB. Runs on every bridge start so existing installs pick up the table
@@ -975,6 +973,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 		log.Warn().Err(err).Msg("Failed to ensure shared_profiles schema")
 	} else {
 		c.loadSharedProfilesIntoCache(context.Background(), log)
+		// Independent of CardDAV: push cached state to ghosts immediately
+		// and re-fetch each row from CloudKit. Decoupled from
+		// setContactsReady so a slow MobileMe-delegate retry doesn't gate
+		// the share-profile path (it only depends on ProfilesClient /
+		// keychain init, not on contacts).
+		go c.refreshSharedProfilesOnConnect(log)
 	}
 
 	// Ensure CloudKit backfill schema/storage is available.
@@ -7012,7 +7016,11 @@ func (c *IMClient) periodicStatusSharingReinvite(log zerolog.Logger) {
 	}
 }
 
-// periodicCloudContactSync re-fetches contacts from iCloud CardDAV every 15 minutes.
+// periodicCloudContactSync re-fetches contacts from iCloud CardDAV every
+// 15 minutes. Also re-runs the shared iMessage profile re-fetch on the
+// same tick so we keep one ticker but don't gate the share-profile path
+// behind CardDAV success — refreshAllSharedProfiles only needs CloudKit
+// (ProfilesClient) and runs independently even if SyncContacts errors.
 func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
 	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
@@ -7025,6 +7033,7 @@ func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
 				c.setContactsReady(log)
 				c.persistMmeDelegate(log)
 			}
+			c.refreshAllSharedProfiles(log)
 		case <-c.stopChan:
 			return
 		}
