@@ -1455,10 +1455,9 @@ async fn create_keychain_clients(
     // `get_escrow_devices` calls don't race into two separate ckAppInit POSTs.
     let mut cache = wp.keychain_clients_cache.lock().await;
     if let Some(pair) = &*cache {
-        info!("create_keychain_clients: cache HIT — reusing existing keychain+cloudkit pair (skipping ckAppInit)");
+        debug!("create_keychain_clients: reusing cached keychain/cloudkit pair");
         return Ok(pair.clone());
     }
-    info!("create_keychain_clients: cache MISS — building fresh keychain+cloudkit pair (will trigger ckAppInit)");
 
     let (dsid, adsid, anisette) = {
         let account = wp.account.lock().await;
@@ -1533,7 +1532,6 @@ async fn create_keychain_clients(
 
     let pair = (keychain, cloudkit);
     *cache = Some(pair.clone());
-    info!("create_keychain_clients: cached fresh keychain+cloudkit pair on WrappedTokenProvider");
     Ok(pair)
 }
 
