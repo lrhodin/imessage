@@ -4599,7 +4599,50 @@ impl WrappedFaceTimeClient {
     }
 
     pub async fn create_session(&self, group_id: String, handle: String, participants: Vec<String>) -> Result<(), WrappedError> {
-        self.inner.create_session(group_id, handle, &participants).await?;
+        self.inner.create_session(group_id.clone(), handle, &participants).await?;
+
+        // Suppress the call UI on the user's other Apple devices (Mac, etc.).
+        //
+        // Upstream's create_session chains the caller's own handle into
+        // session.members (facetime.rs:598), so prop_up_conv(ring=true) fans
+        // the wire message out to every device under that handle — including
+        // the user's Mac, which with Continuity treats it as actionable and
+        // can auto-answer. The line-759 Invitation-type suppression only
+        // strips the explicit Invitation marker; the wire body still has
+        // is_initiator_key=true + full call context, which is enough.
+        //
+        // prop_up_conv(ring=false) on a session where is_ringing_inaccurate
+        // is still true (set in create_session, never cleared) emits the
+        // RespondedElsewhere branch (facetime.rs:708-726) which sends a
+        // ConversationMessageType::RespondedElsewhere scoped only to the
+        // caller's own handle. Receiving devices set
+        // is_ringing_inaccurate=false (handle path at facetime.rs:1241-1250)
+        // and drop the call UI. This is the same mechanism Apple uses when
+        // you pick up an incoming call on iPhone and Mac stops ringing.
+        //
+        // The branch then continues into the main wire_message send with
+        // ring=false, which fans an extra command:207 to every member. The
+        // target already received the ring=true message a moment ago and
+        // should treat the duplicate as an idempotent state update.
+        //
+        // If this side effect ever breaks the callee's experience the
+        // alternative is to patch upstream to re-export IDSSendMessage so
+        // the overlay can craft the RespondedElsewhere send by itself.
+        let nudge = {
+            let mut state = self.inner.state.write().await;
+            if let Some(session) = state.sessions.get_mut(&group_id) {
+                self.inner.prop_up_conv(session, false).await
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(e) = nudge {
+            warn!(
+                "FaceTime own-device nudge (RespondedElsewhere) failed for group {}: {:?}",
+                group_id, e,
+            );
+        }
+
         Ok(())
     }
 
