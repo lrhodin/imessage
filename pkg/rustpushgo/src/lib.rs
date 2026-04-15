@@ -5062,12 +5062,25 @@ pub async fn new_client(
 
     let _ = std::fs::create_dir_all("state");
 
+    // FACETIME + VIDEO are in the bundle so the IdentityResource's `services`
+    // slice contains them. Without that, upstream's `get_main_service` (called
+    // on every FT `cache_keys`) hits its `expect("Topic {topic} not found!")`
+    // and panics out of the FFI. The earlier best-effort separate-register
+    // workaround registered FT/Video in the IDSUser but didn't update
+    // `services`, so the panic still fired.
+    //
+    // Trade-off: `register()` is all-or-nothing, so an Apple non-zero status
+    // for any service in this bundle fails the whole call. For status 6005
+    // upstream wraps that in `PushError::DoNotRetry`, and the ResourceManager
+    // transitions the shared IdentityResource to `Closed` — which would
+    // permanently break iMessage send too. We accept this risk because Apple
+    // has not been observed to 6005 FT/Video for this account.
     let client = Arc::new(
         IMClient::new(
             conn.clone(),
             users_clone,
             identity_clone,
-            &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
+            &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
             "state/id_cache.plist".into(),
             config_clone.clone(),
             Box::new(move |updated_keys| {
@@ -5079,45 +5092,6 @@ pub async fn new_client(
         )
         .await,
     );
-
-    // Best-effort FaceTime + Video IDS service registration.
-    //
-    // These are registered *outside* the IdentityResource's ResourceManager
-    // generate loop. If we included them in the services list passed to
-    // IMClient::new above, a non-zero status from Apple for either service
-    // (status 6005 on accounts where FaceTime isn't eligible — phone-only
-    // logins in some regions, etc.) would cause upstream's
-    // `register()` to fail, `IdentityResource::generate` to wrap the error
-    // in `PushError::DoNotRetry` (identity_manager.rs:372-375), and the
-    // whole IdentityResource to transition permanently to
-    // `ResourceState::Closed`. That closes the *shared* identity handle
-    // used by iMessage send too, so every subsequent
-    // `identity.cache_keys` / `send_message` fails with
-    // "Do not retry Resource has been closed!" until a fresh Client is
-    // constructed — which a restart cannot provide because the same
-    // services list is retried every boot.
-    //
-    // Registering here in a best-effort block lets FaceTime registration
-    // fail silently without killing iMessage. If it succeeds, FaceTime
-    // pushes work; if it doesn't, FaceTime is unavailable but the rest of
-    // the bridge keeps functioning.
-    {
-        let mut users_lock = client.identity.resource.users.write().await;
-        let aps_state_guard = conn.state.read().await;
-        match register(
-            config_clone.as_ref(),
-            &*aps_state_guard,
-            &[&FACETIME_SERVICE, &VIDEO_SERVICE],
-            &mut *users_lock,
-            &client.identity.resource.identity,
-        ).await {
-            Ok(()) => info!("Best-effort FaceTime/Video IDS registration succeeded"),
-            Err(e) => warn!(
-                "Best-effort FaceTime/Video IDS registration failed (iMessage unaffected): {:?}",
-                e,
-            ),
-        }
-    }
 
     // Start receive loop.
     //
