@@ -6524,6 +6524,14 @@ func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.E
 	return nil
 }
 
+// isPluginPayloadAttachment reports whether the row is a rich-link plugin
+// payload sideband (the binary plist Apple stores alongside a URL-bubble
+// message). Filename-based because that's the only signal CloudKit reliably
+// preserves; the plist always uses the .pluginPayloadAttachment extension.
+func isPluginPayloadAttachment(att cloudAttachmentRow) bool {
+	return strings.HasSuffix(att.Filename, ".pluginPayloadAttachment")
+}
+
 // cloudAttachmentResult holds the result of a concurrent attachment download+upload.
 type cloudAttachmentResult struct {
 	Index   int
@@ -6551,9 +6559,18 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 	}
 	var downloadable []indexedAtt
 	for i, att := range atts {
-		if att.RecordName != "" {
-			downloadable = append(downloadable, indexedAtt{index: i, att: att})
+		if att.RecordName == "" {
+			continue
 		}
+		// Skip rich-link plugin payload sidebands. The URL itself is in the
+		// message text and the preview card renders from it; bridging the
+		// plist as a file is noise. We deliberately do NOT filter on
+		// HideAttachment broadly because Live Photo MOV companions also
+		// carry that flag and we intentionally bridge them.
+		if isPluginPayloadAttachment(att) {
+			continue
+		}
+		downloadable = append(downloadable, indexedAtt{index: i, att: att})
 	}
 
 	// Live Photo handling: when HasAvid is true on an attachment, the download
@@ -7109,6 +7126,11 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		hasText := strings.TrimSpace(strings.Trim(row.Text, "\ufffc \n")) != ""
 		for i, att := range atts {
 			if att.RecordName == "" {
+				continue
+			}
+			// Mirror the filter in cloudAttachmentsToBackfill — don't waste a
+			// CloudKit download on rich-link plugin payloads we'll never bridge.
+			if isPluginPayloadAttachment(att) {
 				continue
 			}
 			if _, ok := c.attachmentContentCache.Load(att.RecordName); ok {
