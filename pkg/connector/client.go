@@ -11,7 +11,6 @@ package connector
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -8331,34 +8330,10 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		participants = []string{sendTo}
 	}
 
-	// Stable sender_guid (chat group ID) for the DM, derived deterministically
-	// from the portal ID. Without this, prepare_send in upstream rustpush
-	// generates a fresh random sender_guid per call. The recipient's Apple
-	// Messages app then sees each outbound message under a different chat
-	// group ID, and operations that need a chat-context match (notably
-	// unsend, which has no body content for the recipient to associate with
-	// a chat any other way) get silently dropped. Same purpose as the
-	// imGroupGuids cache for groups.
-	dmGuid := stableDMSenderGuid(cleanPortalID)
-
 	return rustpushgo.WrappedConversation{
 		Participants: participants,
-		SenderGuid:   &dmGuid,
 		IsSms:        isSms,
 	}
-}
-
-// stableDMSenderGuid returns a deterministic UUID-shaped string derived from
-// the DM portal ID, used as the chat group identifier in the iMessage wire
-// envelope for outbound DM traffic. Stable across restarts and across
-// send/edit/unsend invocations to the same recipient.
-func stableDMSenderGuid(portalID string) string {
-	h := sha1.Sum([]byte("mautrix-imessage:dm:" + portalID))
-	// Set RFC 4122 version 5 (name-based, SHA-1) and variant bits.
-	h[6] = (h[6] & 0x0f) | 0x50
-	h[8] = (h[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08X-%04X-%04X-%04X-%012X",
-		h[0:4], h[4:6], h[6:8], h[8:10], h[10:16])
 }
 
 // resolveGroupMembers returns the participant list for a group portal.
