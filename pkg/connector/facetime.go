@@ -19,7 +19,6 @@ package connector
 import (
 	"bytes"
 	"context"
-	cryptoRand "crypto/rand"
 	"fmt"
 	"html"
 	"net/url"
@@ -252,16 +251,23 @@ func fnFaceTime(ce *commands.Event) {
 	ce.Reply("Failed to get FaceTime link: %v\n\nAvailable handles: `%s`", lastErr, strings.Join(handles, "`, `"))
 }
 
-// fnFaceTimeCallInPortal handles the portal-room variant of !facetime: create
-// a new session for the caller + the DM contact, return the join link, and
-// queue a ring that fires the instant the caller's JoinEvent arrives. Returns
-// true if it handled the command (reply already sent); false to signal that
-// the caller should fall through to the link-only branch (group portal, etc.).
+// fnFaceTimeCallInPortal handles the portal-room variant of !facetime: post a
+// facetime:// deep link targeting the DM contact. Tapping the link on iOS or
+// macOS opens the FaceTime app and dials the contact directly, using the
+// caller's Apple ID profile (no "enter your name" prompt, video by default).
+// On Android or other clients the URL falls through to the browser. Returns
+// true if it handled the command; false to fall through to the generic
+// link-only branch (group portals, no usable target handle, etc.).
+//
+// We deliberately do NOT call ft.CreateSession here: upstream's create_session
+// invokes prop_up_conv(ring=true), which ships an Invitation to the target
+// before the caller has done anything — so any session-based flow rings the
+// contact immediately. The facetime:// URL sidesteps that by using Apple's
+// native dial-by-handle UX: the contact only rings once the caller has tapped
+// the link and FaceTime actually places the call.
 func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 	portalID := string(ce.Portal.ID)
-	// Group portals fall through to link behavior — ringing a group with
-	// the pending-ring flow would need per-participant tracking that we
-	// don't wire up yet.
+	// Group portals fall through — direct-dial URLs only make sense for DMs.
 	if strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",") {
 		return false
 	}
@@ -290,79 +296,31 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		}
 	}
 	if target == "" {
-		ce.Reply("Could not determine the iMessage contact in this portal.")
-		return true
+		// Couldn't resolve a contact handle — fall through to link behavior.
+		return false
 	}
 
-	ft, err := client.client.GetFacetimeClient()
-	if err != nil {
-		ce.Reply("Failed to initialize FaceTime client: %v", err)
-		return true
+	// Strip the mailto:/tel: prefix — Apple's facetime:// scheme wants the
+	// bare email or E.164 phone number.
+	bare := stripIdentifierPrefix(target)
+	if bare == "" {
+		return false
 	}
 
-	sessionID, err := newFaceTimeSessionID()
-	if err != nil {
-		ce.Reply("Failed to generate session ID: %v", err)
-		return true
-	}
+	videoURL := "facetime://" + bare
+	audioURL := "facetime-audio://" + bare
+	recipient := bare
 
-	// CreateSession and GetSessionLink each do an APNs round-trip that
-	// occasionally times out waiting for the server ack. Both upstream error
-	// messages literally say "try again", so we retry once with a short
-	// backoff before surfacing the error to the user. Reusing the same
-	// sessionID on retry is safe: create_session's APNs announcement is
-	// idempotent on the group_id, and GetSessionLink only reads state.
-	createErr := ft.CreateSession(sessionID, client.handle, []string{target})
-	if createErr != nil && isLikelyDeliveredSendTimeout(createErr) {
-		time.Sleep(500 * time.Millisecond)
-		createErr = ft.CreateSession(sessionID, client.handle, []string{target})
-	}
-	if createErr != nil {
-		ce.Reply("Failed to create FaceTime session: %v\n\nSend-ack timeouts usually clear on a second try — run `!im facetime` again. If it keeps failing, `!im facetime-state` dumps the client state for debugging.", createErr)
-		return true
-	}
-
-	link, linkErr := ft.GetSessionLink(sessionID)
-	if linkErr != nil && isLikelyDeliveredSendTimeout(linkErr) {
-		time.Sleep(500 * time.Millisecond)
-		link, linkErr = ft.GetSessionLink(sessionID)
-	}
-	if linkErr != nil {
-		ce.Reply("Session created but link fetch failed: %v", linkErr)
-		return true
-	}
-
-	if err := ft.RegisterPendingRing(sessionID, client.handle, []string{target}, 60); err != nil {
-		ce.Reply("Session and link are ready, but ring registration failed: %v", err)
-		return true
-	}
-
-	recipient := stripIdentifierPrefix(target)
 	ce.Reply(
-		"[**Join FaceTime call**](%s)\n\n"+
-			"⚠️ **Tapping this link will ring %s's phone.** The ring only fires once you've actually joined the session — so open the link when you're ready to be on camera. "+
-			"If you don't tap within 60 seconds the session is dropped and nothing rings.\n\n"+
-			"Raw link (if the button above doesn't open): %s",
-		link, recipient, link,
+		"[**📹 FaceTime Video %s**](%s)\n\n"+
+			"[**📞 FaceTime Audio %s**](%s)\n\n"+
+			"Tapping a button opens FaceTime on iOS / macOS and dials %s directly. "+
+			"On Android or other clients the link will open in a browser.",
+		recipient, videoURL,
+		recipient, audioURL,
+		recipient,
 	)
 	return true
-}
-
-// newFaceTimeSessionID returns a random uppercase UUID v4 — Apple's FaceTime
-// session GUID format. Used by the portal !facetime flow to mint a fresh
-// group_id per call.
-func newFaceTimeSessionID() (string, error) {
-	var b [16]byte
-	if _, err := cryptoRand.Read(b[:]); err != nil {
-		return "", err
-	}
-	b[6] = (b[6] & 0x0f) | 0x40 // RFC 4122 version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // variant 1
-	return strings.ToUpper(fmt.Sprintf(
-		"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-		b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-		b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-	)), nil
 }
 
 // fnFaceTimeSend is the handler for !facetime-send. It generates a FaceTime
