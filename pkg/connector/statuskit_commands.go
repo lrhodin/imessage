@@ -17,7 +17,6 @@
 package connector
 
 import (
-	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -77,28 +76,6 @@ var cmdStatuskitRequestHandles = &commands.FullHandler{
 	RequiresLogin: true,
 }
 
-var cmdStatuskitRequestChannels = &commands.FullHandler{
-	Name: "statuskit-request-channels",
-	Func: fnStatuskitRequestChannels,
-	Help: commands.HelpMeta{
-		Section:     HelpSectionStatusKit,
-		Description: "Ask Apple to push StatusKit updates for each listed channel (format: topic:hexid).",
-		Args:        "<topic:hexid...>",
-	},
-	RequiresLogin: true,
-}
-
-var cmdStatuskitUpdateChannels = &commands.FullHandler{
-	Name: "statuskit-update-channels",
-	Func: fnStatuskitUpdateChannels,
-	Help: commands.HelpMeta{
-		Section:     HelpSectionStatusKit,
-		Description: "Replace the bridge's tracked StatusKit channel list with the given set (format: topic:hexid).",
-		Args:        "<topic:hexid...>",
-	},
-	RequiresLogin: true,
-}
-
 var cmdStatuskitInviteToChannel = &commands.FullHandler{
 	Name: "statuskit-invite-channel",
 	Func: fnStatuskitInviteToChannel,
@@ -135,8 +112,8 @@ var cmdStatuskitShare = &commands.FullHandler{
 	Func: fnStatuskitShare,
 	Help: commands.HelpMeta{
 		Section:     HelpSectionStatusKit,
-		Description: "Publish or retract your StatusKit shared-status (on/off, optional mode string).",
-		Args:        "<on|off> [mode]",
+		Description: "Publish your StatusKit shared-status. Use `on` to mark yourself available; use `off <mode>` where <mode> is the iOS Focus UUID to publish as away in that mode.",
+		Args:        "on | off <mode>",
 	},
 	RequiresLogin: true,
 }
@@ -158,28 +135,6 @@ func statusKitClientFromEvent(ce *commands.Event) (*rustpushgo.WrappedStatusKitC
 		return nil, false
 	}
 	return sk, true
-}
-
-func parseStatusKitChannels(raw []string) ([]rustpushgo.WrappedApsChannelIdentifier, error) {
-	parts := parseListArgs(raw)
-	if len(parts) == 0 {
-		return nil, fmt.Errorf("no channel identifiers provided")
-	}
-	channels := make([]rustpushgo.WrappedApsChannelIdentifier, 0, len(parts))
-	for _, p := range parts {
-		idx := strings.LastIndex(p, ":")
-		if idx <= 0 || idx >= len(p)-1 {
-			return nil, fmt.Errorf("invalid channel identifier %q, expected topic:hexid", p)
-		}
-		topic := p[:idx]
-		hexID := p[idx+1:]
-		idBytes, err := hex.DecodeString(hexID)
-		if err != nil {
-			return nil, fmt.Errorf("invalid hex channel id %q: %w", hexID, err)
-		}
-		channels = append(channels, rustpushgo.WrappedApsChannelIdentifier{Topic: topic, Id: idBytes})
-	}
-	return channels, nil
 }
 
 func parseBoolish(value string) (bool, error) {
@@ -258,45 +213,6 @@ func fnStatuskitRequestHandles(ce *commands.Event) {
 	}
 	sk.RequestHandles(handles)
 	ce.Reply("Requested StatusKit updates for %d handle(s).", len(handles))
-}
-
-func fnStatuskitRequestChannels(ce *commands.Event) {
-	if len(ce.Args) < 1 {
-		ce.Reply("Usage: `!statuskit-request-channels <topic:hexid...>`")
-		return
-	}
-	sk, ok := statusKitClientFromEvent(ce)
-	if !ok {
-		return
-	}
-	channels, err := parseStatusKitChannels(ce.Args)
-	if err != nil {
-		ce.Reply("Failed to parse channels: %v", err)
-		return
-	}
-	sk.RequestChannels(channels)
-	ce.Reply("Requested StatusKit updates for %d channel(s).", len(channels))
-}
-
-func fnStatuskitUpdateChannels(ce *commands.Event) {
-	if len(ce.Args) < 1 {
-		ce.Reply("Usage: `!statuskit-update-channels <topic:hexid...>`")
-		return
-	}
-	sk, ok := statusKitClientFromEvent(ce)
-	if !ok {
-		return
-	}
-	channels, err := parseStatusKitChannels(ce.Args)
-	if err != nil {
-		ce.Reply("Failed to parse channels: %v", err)
-		return
-	}
-	if err := sk.UpdateChannels(channels); err != nil {
-		ce.Reply("Failed to update StatusKit channels: %v", err)
-		return
-	}
-	ce.Reply("Updated StatusKit channels (%d).", len(channels))
 }
 
 func fnStatuskitInviteToChannel(ce *commands.Event) {

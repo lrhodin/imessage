@@ -94,8 +94,6 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdStatuskitEnsureChannel,
 		cmdStatuskitClearInterest,
 		cmdStatuskitRequestHandles,
-		cmdStatuskitRequestChannels,
-		cmdStatuskitUpdateChannels,
 		cmdStatuskitInviteToChannel,
 		cmdStatuskitResetKeys,
 		cmdStatuskitRollKeys,

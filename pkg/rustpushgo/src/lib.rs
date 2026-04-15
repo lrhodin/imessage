@@ -2249,12 +2249,6 @@ pub struct WrappedShareProfileData {
 }
 
 #[derive(uniffi::Record, Clone)]
-pub struct WrappedAPSChannelIdentifier {
-    pub topic: String,
-    pub id: Vec<u8>,
-}
-
-#[derive(uniffi::Record, Clone)]
 pub struct WrappedStatusKitInviteHandle {
     pub handle: String,
     pub allowed_modes: Vec<String>,
@@ -3024,7 +3018,7 @@ async fn facetime_event_to_wrapped(
     };
 
     let state = facetime.state.read().await;
-    let (participants, link) = state
+    let (participants, my_handles, link) = state
         .sessions
         .get(&guid)
         .map(|session| {
@@ -3033,6 +3027,8 @@ async fn facetime_event_to_wrapped(
                 .iter()
                 .map(|member| member.handle.clone())
                 .collect::<Vec<_>>();
+            let my_handles: std::collections::HashSet<String> =
+                session.my_handles.iter().cloned().collect();
             let link = session.link.as_ref().map(|link| {
                 let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&link.public_key);
                 let pseud = link
@@ -3041,15 +3037,17 @@ async fn facetime_event_to_wrapped(
                     .unwrap_or(&link.pseudonym);
                 format!("https://facetime.apple.com/join#v=1&p={pseud}&k={encoded}")
             });
-            (participants, link)
+            (participants, my_handles, link)
         })
-        .unwrap_or_else(|| (Vec::new(), None));
+        .unwrap_or_else(|| (Vec::new(), std::collections::HashSet::new(), None));
     drop(state);
 
     if sender.is_none() {
         sender = participants
             .iter()
-            .find(|participant| !participant.starts_with("temp:"))
+            .find(|participant| {
+                !participant.starts_with("temp:") && !my_handles.contains(*participant)
+            })
             .cloned();
     }
 
@@ -4912,24 +4910,6 @@ impl WrappedStatusKitClient {
         Ok(())
     }
 
-    pub async fn update_channels(&self, channels: Vec<WrappedAPSChannelIdentifier>) -> Result<(), WrappedError> {
-        // NOTE: rustpush::aps::APSChannelIdentifier is in a private module in
-        // OpenBubbles upstream, so we cannot construct it from outside the crate.
-        // The receive-side StatusKit presence path (which is the feature the bridge
-        // actually uses for "contact has notifications silenced") does not depend
-        // on dynamic channel management — the initial channel set is established
-        // inside rustpush during StatusKitClient::new(). This stub keeps the Go
-        // FFI signature stable; callers that dynamically manage channels will log
-        // a debug message and see no-op.
-        debug!(
-            "update_channels: no-op ({} channels requested) — dynamic channel management \
-             is not exposed by upstream rustpush; initial channels are configured at \
-             StatusKitClient init time",
-            channels.len()
-        );
-        Ok(())
-    }
-
     pub async fn invite_to_channel(
         &self,
         sender_handle: String,
@@ -4953,16 +4933,6 @@ impl WrappedStatusKitClient {
     pub async fn request_handles(&self, handles: Vec<String>) {
         let token = self.inner.request_handles(&handles).await;
         self.interests.lock().await.push(token);
-    }
-
-    pub async fn request_channels(&self, channels: Vec<WrappedAPSChannelIdentifier>) {
-        // NOTE: see update_channels above — rustpush::aps::APSChannelIdentifier is
-        // private in OpenBubbles upstream and not constructible from outside the crate.
-        // No-op stub preserves the Go FFI surface.
-        debug!(
-            "request_channels: no-op ({} channels requested)",
-            channels.len()
-        );
     }
 
     pub async fn clear_interest_tokens(&self) {
