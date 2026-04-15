@@ -4526,25 +4526,96 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored delivery receipt")
 		return
 	}
-	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	ctx := context.Background()
 
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-	if (err != nil || portal == nil || portal.MXID == "") && msg.Uuid != "" {
-		// Group delivery receipts may lack conversation data. Try message UUID lookup.
-		msgID := makeMessageID(msg.Uuid)
-		if dbMsgs, err2 := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, c.UserLogin.ID, msgID); err2 == nil && len(dbMsgs) > 0 {
-			portalKey = dbMsgs[0].Room
-			portal, err = c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	// Mirror handleReadReceipt's portal-resolution chain. Without these
+	// fallbacks, any drift in makeReceiptPortalKey output (e.g. sender_guid
+	// format churn) silently drops every delivery receipt while read receipts
+	// keep working via their fallback chain — which manifests as "Beeper
+	// shows read but never delivered" with zero log signal.
+	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	resolved := false
+
+	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
+		gidPortalKey := networkid.PortalKey{ID: networkid.PortalID("gid:" + *msg.SenderGuid), Receiver: c.UserLogin.ID}
+		if gidPortal, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, gidPortalKey); gidPortal != nil && gidPortal.MXID != "" {
+			portalKey = gidPortalKey
+			log.Debug().
+				Str("sender_guid", *msg.SenderGuid).
+				Str("resolved_portal", string(portalKey.ID)).
+				Msg("Resolved delivery receipt portal via gid: lookup")
+			resolved = true
+		}
+		if !resolved {
+			c.imGroupGuidsMu.RLock()
+			for portalIDStr, guid := range c.imGroupGuids {
+				if strings.EqualFold(guid, *msg.SenderGuid) {
+					if c.guidCacheMatchIsStale(portalIDStr, msg.Participants) {
+						continue
+					}
+					portalKey = networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
+					log.Debug().
+						Str("sender_guid", *msg.SenderGuid).
+						Str("resolved_portal", string(portalKey.ID)).
+						Msg("Resolved delivery receipt portal via sender_guid cache lookup")
+					resolved = true
+					break
+				}
+			}
+			c.imGroupGuidsMu.RUnlock()
 		}
 	}
+
+	if !resolved && msg.Sender != nil {
+		if groupKey, ok := c.findGroupPortalForMember(*msg.Sender); ok {
+			portalKey = groupKey
+			log.Debug().
+				Str("sender", *msg.Sender).
+				Str("resolved_portal", string(portalKey.ID)).
+				Msg("Resolved delivery receipt portal via group member lookup")
+			resolved = true
+		}
+	}
+
+	if !resolved {
+		if portal, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey); portal != nil && portal.MXID != "" {
+			resolved = true
+		}
+	}
+
+	if msg.Uuid != "" {
+		if msgPortal := c.resolvePortalByTargetMessage(log, msg.Uuid); msgPortal.ID != "" &&
+			(msgPortal.ID != portalKey.ID || msgPortal.Receiver != portalKey.Receiver) {
+			log.Debug().
+				Str("uuid", msg.Uuid).
+				Str("old_portal", string(portalKey.ID)).
+				Str("resolved_portal", string(msgPortal.ID)).
+				Msg("Resolved delivery receipt portal via target message UUID")
+			portalKey = msgPortal
+			resolved = true
+		}
+	}
+
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	if err != nil || portal == nil || portal.MXID == "" {
+		log.Debug().
+			Err(err).
+			Bool("resolved", resolved).
+			Str("uuid", msg.Uuid).
+			Str("portal_key", string(portalKey.ID)).
+			Str("sender_guid", ptrStringOr(msg.SenderGuid, "")).
+			Msg("Dropping delivery receipt: no portal found after fallback chain")
 		return
 	}
 
 	msgID := makeMessageID(msg.Uuid)
 	dbMessages, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, msgID)
 	if err != nil || len(dbMessages) == 0 {
+		log.Debug().
+			Err(err).
+			Str("uuid", msg.Uuid).
+			Str("portal_id", string(portalKey.ID)).
+			Msg("Dropping delivery receipt: target message not in bridge DB")
 		return
 	}
 
@@ -4558,6 +4629,12 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 	senderUserID := makeUserID(normalizedSender)
 	ghost, err := c.Main.Bridge.GetGhostByID(ctx, senderUserID)
 	if err != nil || ghost == nil {
+		log.Debug().
+			Err(err).
+			Str("uuid", msg.Uuid).
+			Str("portal_id", portalID).
+			Str("sender_user_id", string(senderUserID)).
+			Msg("Dropping delivery receipt: ghost not found for sender")
 		return
 	}
 
