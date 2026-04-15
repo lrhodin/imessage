@@ -781,6 +781,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_resolve_handle_cached(uniffiStatus)
+		})
+		if checksum != 6690 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_resolve_handle_cached: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_restore_cloud_chat(uniffiStatus)
 		})
 		if checksum != 36876 {
@@ -3007,11 +3016,6 @@ func (_self *Client) ResolveHandle(handle string, knownHandles []string) ([]stri
 		})
 }
 
-// ResolveHandleCached looks up handle aliases from the in-memory IDS cache
-// only — no network call, no blocking. Returns tel: (or other) aliases that
-// share the same sender_correlation_identifier as handle, based on data
-// already cached from prior message processing. Returns an empty slice if the
-// handle is not in the cache.
 func (_self *Client) ResolveHandleCached(handle string, knownHandles []string) []string {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
@@ -7171,6 +7175,10 @@ type WrappedMessage struct {
 	ShareProfileRecordKey         *string
 	ShareProfileDecryptionKey     *[]byte
 	ShareProfileHasPoster         bool
+	ShareProfileDisplayName       *string
+	ShareProfileFirstName         *string
+	ShareProfileLastName          *string
+	ShareProfileAvatar            *[]byte
 }
 
 func (r *WrappedMessage) Destroy() {
@@ -7255,6 +7263,10 @@ func (r *WrappedMessage) Destroy() {
 	FfiDestroyerOptionalString{}.Destroy(r.ShareProfileRecordKey)
 	FfiDestroyerOptionalBytes{}.Destroy(r.ShareProfileDecryptionKey)
 	FfiDestroyerBool{}.Destroy(r.ShareProfileHasPoster)
+	FfiDestroyerOptionalString{}.Destroy(r.ShareProfileDisplayName)
+	FfiDestroyerOptionalString{}.Destroy(r.ShareProfileFirstName)
+	FfiDestroyerOptionalString{}.Destroy(r.ShareProfileLastName)
+	FfiDestroyerOptionalBytes{}.Destroy(r.ShareProfileAvatar)
 }
 
 type FfiConverterTypeWrappedMessage struct{}
@@ -7348,6 +7360,10 @@ func (c FfiConverterTypeWrappedMessage) Read(reader io.Reader) WrappedMessage {
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalBytesINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalBytesINSTANCE.Read(reader),
 	}
 }
 
@@ -7437,6 +7453,10 @@ func (c FfiConverterTypeWrappedMessage) Write(writer io.Writer, value WrappedMes
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.ShareProfileRecordKey)
 	FfiConverterOptionalBytesINSTANCE.Write(writer, value.ShareProfileDecryptionKey)
 	FfiConverterBoolINSTANCE.Write(writer, value.ShareProfileHasPoster)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.ShareProfileDisplayName)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.ShareProfileFirstName)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.ShareProfileLastName)
+	FfiConverterOptionalBytesINSTANCE.Write(writer, value.ShareProfileAvatar)
 }
 
 type FfiDestroyerTypeWrappedMessage struct{}

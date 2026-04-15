@@ -179,10 +179,14 @@ func (c *IMClient) ensureSharedProfileSchema(ctx context.Context) error {
 }
 
 // handleSharedProfile processes an incoming ShareProfile or UpdateProfile
-// message: fetch the decrypted record from CloudKit, persist it, refresh the
-// in-memory cache, and push the new name/avatar to the Matrix ghost.
+// message. The Rust receive loop has already fetched and decrypted the
+// CloudKit record inline (mirroring how IconChange MMCS bytes are downloaded
+// before the callback fires), so this handler just persists what's on the
+// wrapped message and pushes name/avatar to the Matrix ghost.
 //
-// Replaces the inline handleShareProfile that previously lived in client.go.
+// Falls back to a Go-side FetchProfile call only when the Rust inline
+// download didn't succeed (no display name on the wrapped message) and we
+// still have the record/decryption keys to retry.
 func (c *IMClient) handleSharedProfile(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
 	if msg.Sender == nil || *msg.Sender == "" {
 		return
@@ -198,25 +202,52 @@ func (c *IMClient) handleSharedProfile(log zerolog.Logger, msg rustpushgo.Wrappe
 		return
 	}
 
-	log.Info().Msg("Fetching shared iMessage profile")
-	record, err := c.client.FetchProfile(*msg.ShareProfileRecordKey, *msg.ShareProfileDecryptionKey, msg.ShareProfileHasPoster)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to fetch shared profile")
-		return
+	keyPrefix := *msg.ShareProfileRecordKey
+	if len(keyPrefix) > 8 {
+		keyPrefix = keyPrefix[:8]
 	}
 
 	row := &sharedProfileRow{
 		Identifier:    sender,
-		DisplayName:   record.DisplayName,
-		FirstName:     record.FirstName,
-		LastName:      record.LastName,
 		RecordKey:     *msg.ShareProfileRecordKey,
 		DecryptionKey: append([]byte(nil), *msg.ShareProfileDecryptionKey...),
 		HasPoster:     msg.ShareProfileHasPoster,
 		UpdatedTS:     time.Now().UnixMilli(),
 	}
-	if record.Avatar != nil {
-		row.Avatar = append([]byte(nil), *record.Avatar...)
+	if msg.ShareProfileDisplayName != nil {
+		row.DisplayName = *msg.ShareProfileDisplayName
+	}
+	if msg.ShareProfileFirstName != nil {
+		row.FirstName = *msg.ShareProfileFirstName
+	}
+	if msg.ShareProfileLastName != nil {
+		row.LastName = *msg.ShareProfileLastName
+	}
+	if msg.ShareProfileAvatar != nil {
+		row.Avatar = append([]byte(nil), *msg.ShareProfileAvatar...)
+	}
+
+	// Inline download missed (e.g. ProfilesClient init failed mid-receive) —
+	// retry via the standalone FFI so we don't lose the share entirely.
+	if row.DisplayName == "" && row.FirstName == "" && row.LastName == "" && len(row.Avatar) == 0 {
+		log.Info().
+			Str("record_key_prefix", keyPrefix).
+			Bool("has_poster", msg.ShareProfileHasPoster).
+			Msg("Inline ShareProfile fields empty — falling back to FetchProfile")
+		record, err := c.client.FetchProfile(*msg.ShareProfileRecordKey, *msg.ShareProfileDecryptionKey, msg.ShareProfileHasPoster)
+		if err != nil {
+			log.Warn().Err(err).
+				Str("record_key_prefix", keyPrefix).
+				Bool("has_poster", msg.ShareProfileHasPoster).
+				Msg("Failed to fetch shared profile")
+			return
+		}
+		row.DisplayName = record.DisplayName
+		row.FirstName = record.FirstName
+		row.LastName = record.LastName
+		if record.Avatar != nil {
+			row.Avatar = append([]byte(nil), *record.Avatar...)
+		}
 	}
 
 	c.sharedProfiles.Store(sender, row)
@@ -227,6 +258,7 @@ func (c *IMClient) handleSharedProfile(log zerolog.Logger, msg rustpushgo.Wrappe
 	}
 
 	log.Info().
+		Str("record_key_prefix", keyPrefix).
 		Str("display_name", row.DisplayName).
 		Str("first_name", row.FirstName).
 		Str("last_name", row.LastName).

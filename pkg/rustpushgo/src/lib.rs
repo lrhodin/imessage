@@ -2184,10 +2184,18 @@ pub struct WrappedMessage {
     pub sticker_mime: Option<String>,
 
     // Profile sharing: set when a contact shares their name/photo with us.
+    // record_key + decryption_key + has_poster identify the CloudKit record;
+    // display_name/first_name/last_name/avatar are populated inline by the
+    // Rust receive loop via ProfilesClient::get_record so the Go side just
+    // reads bytes (mirrors the IconChange MMCS download pattern).
     pub is_share_profile: bool,
     pub share_profile_record_key: Option<String>,
     pub share_profile_decryption_key: Option<Vec<u8>>,
     pub share_profile_has_poster: bool,
+    pub share_profile_display_name: Option<String>,
+    pub share_profile_first_name: Option<String>,
+    pub share_profile_last_name: Option<String>,
+    pub share_profile_avatar: Option<Vec<u8>>,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -2905,6 +2913,10 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         share_profile_record_key: None,
         share_profile_decryption_key: None,
         share_profile_has_poster: false,
+        share_profile_display_name: None,
+        share_profile_first_name: None,
+        share_profile_last_name: None,
+        share_profile_avatar: None,
     };
 
     match &msg.message {
@@ -4887,12 +4899,20 @@ pub async fn new_client(
     // can be 20-30s earlier during Go startup).
     let reconnected_at = Arc::new(AtomicU64::new(0));
 
+    // Weak handle to OUR Client, set after Client is constructed below.
+    // The receive loop upgrades this on each iteration to call back into
+    // Client::populate_inline_share_profile (mirrors how IconChange is
+    // downloaded inline). Weak avoids the receive task keeping Client alive.
+    let client_weak_for_loop: Arc<tokio::sync::OnceCell<std::sync::Weak<Client>>> =
+        Arc::new(tokio::sync::OnceCell::new());
+
     let receive_handle = tokio::spawn({
         let conn = connection.inner.clone();
         let conn_for_download = connection.inner.clone();
         let reconnected_at = reconnected_at.clone();
         let sk_for_recv = shared_statuskit_for_recv.clone();
         let status_cb_for_recv = status_callback_for_recv.clone();
+        let client_weak_for_loop = client_weak_for_loop.clone();
         async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
             let pending = Arc::new(AtomicU64::new(0));
@@ -5163,6 +5183,32 @@ pub async fn new_client(
                                 }
                             }
 
+                            // Diagnostic: surface profile-sharing arrivals so we can confirm
+                            // APNs is actually delivering them. Logged here, before the
+                            // has_payload gate, so a future filter regression can't hide it.
+                            match &msg_inst.message {
+                                Message::ShareProfile(p) => info!(
+                                    "received Message::ShareProfile from {:?} (record_key_len={}, has_poster={})",
+                                    msg_inst.sender,
+                                    p.cloud_kit_record_key.len(),
+                                    p.poster.is_some()
+                                ),
+                                Message::UpdateProfile(u) => info!(
+                                    "received Message::UpdateProfile from {:?} (share_contacts={}, has_embedded_profile={})",
+                                    msg_inst.sender,
+                                    u.share_contacts,
+                                    u.profile.is_some()
+                                ),
+                                Message::UpdateProfileSharing(s) => info!(
+                                    "received Message::UpdateProfileSharing from {:?} (version={}, dismissed={}, all={})",
+                                    msg_inst.sender,
+                                    s.version,
+                                    s.shared_dismissed.len(),
+                                    s.shared_all.len()
+                                ),
+                                _ => {}
+                            }
+
                             if msg_inst.has_payload() || matches!(msg_inst.message, Message::Typing(_, _) | Message::Read | Message::Delivered | Message::Error(_) | Message::PeerCacheInvalidate) {
                                 let mut wrapped = message_inst_to_wrapped(&msg_inst);
 
@@ -5184,6 +5230,17 @@ pub async fn new_client(
                                 // Download group photo for IconChange messages via MMCS
                                 if wrapped.is_icon_change && !wrapped.group_photo_cleared {
                                     download_icon_change_photo(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                }
+                                // Download Name & Photo Sharing profile from CloudKit
+                                // (mirrors the IconChange MMCS pattern: fetch in Rust,
+                                // hand Go ready-to-display name + avatar bytes).
+                                if wrapped.is_share_profile {
+                                    if let Some(client_arc) = client_weak_for_loop
+                                        .get()
+                                        .and_then(|w| w.upgrade())
+                                    {
+                                        client_arc.populate_inline_share_profile(&msg_inst, &mut wrapped).await;
+                                    }
                                 }
                                 callback.on_message(wrapped);
                             }
@@ -5233,7 +5290,7 @@ pub async fn new_client(
         }
     });
 
-    Ok(Arc::new(Client {
+    let client = Arc::new(Client {
         client,
         conn: connection.inner.clone(),
         os_config: config_clone,
@@ -5250,7 +5307,11 @@ pub async fn new_client(
         shared_statuskit: shared_statuskit_for_recv,
         status_callback: status_callback_for_recv,
         statuskit_interest_tokens: tokio::sync::Mutex::new(Vec::new()),
-    }))
+    });
+    // Hand the receive loop a Weak<Client> so it can call back into
+    // populate_inline_share_profile without preventing Client drop.
+    let _ = client_weak_for_loop.set(Arc::downgrade(&client));
+    Ok(client)
 }
 
 impl Client {
@@ -5390,7 +5451,63 @@ impl Client {
         let cloudkit = keychain.client.clone();
         let profiles = Arc::new(rustpush::name_photo_sharing::ProfilesClient::new(cloudkit));
         *locked = Some(profiles.clone());
+        info!("ProfilesClient initialized");
         Ok(profiles)
+    }
+
+    /// Inline-fetch a Name & Photo Sharing profile from CloudKit during the
+    /// receive loop and stuff the decrypted name + avatar bytes onto the
+    /// outgoing WrappedMessage. Mirrors `download_icon_change_photo` so the
+    /// Go side never has to make a follow-up FFI call to render the ghost.
+    /// Failures are logged and left silent — the keys remain on the wrapped
+    /// message so a Go-side periodic re-fetch can recover later.
+    async fn populate_inline_share_profile(
+        &self,
+        msg_inst: &MessageInst,
+        wrapped: &mut WrappedMessage,
+    ) {
+        let share_msg = match &msg_inst.message {
+            Message::ShareProfile(p) => p.clone(),
+            Message::UpdateProfile(u) => match &u.profile {
+                Some(p) => p.clone(),
+                None => return,
+            },
+            _ => return,
+        };
+
+        let key_prefix: String = share_msg.cloud_kit_record_key.chars().take(8).collect();
+        let profiles = match self.get_or_init_profiles_client().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    "inline ShareProfile fetch: ProfilesClient init failed (record_key={}…): {:?}",
+                    key_prefix, e
+                );
+                return;
+            }
+        };
+        match profiles.get_record(&share_msg).await {
+            Ok(record) => {
+                info!(
+                    "inline ShareProfile fetch ok (record_key={}…, name='{}', avatar_bytes={})",
+                    key_prefix,
+                    record.name.name,
+                    record.image.as_ref().map(|v| v.len()).unwrap_or(0)
+                );
+                wrapped.share_profile_display_name = Some(record.name.name);
+                wrapped.share_profile_first_name = Some(record.name.first);
+                wrapped.share_profile_last_name = Some(record.name.last);
+                wrapped.share_profile_avatar = record.image;
+            }
+            Err(e) => {
+                warn!(
+                    "inline ShareProfile fetch failed (record_key={}…, has_poster={}): {:?}",
+                    key_prefix,
+                    share_msg.poster.is_some(),
+                    e
+                );
+            }
+        }
     }
 
     async fn get_or_init_findmy_client(&self) -> Result<Arc<WrappedFindMyClient>, WrappedError> {
@@ -5854,6 +5971,12 @@ impl Client {
         decryption_key: Vec<u8>,
         has_poster: bool,
     ) -> Result<WrappedProfileRecord, WrappedError> {
+        let key_prefix: String = record_key.chars().take(8).collect();
+        let dec_len = decryption_key.len();
+        info!(
+            "fetch_profile: record_key={}… decryption_key_len={} has_poster={}",
+            key_prefix, dec_len, has_poster
+        );
         let profiles = self.get_or_init_profiles_client().await?;
         let share_msg = rustpush::ShareProfileMessage {
             cloud_kit_record_key: record_key,
@@ -5871,8 +5994,14 @@ impl Client {
                 None
             },
         };
-        let record = profiles.get_record(&share_msg).await.map_err(|e| WrappedError::GenericError {
-            msg: format!("Failed to fetch profile: {}", e),
+        let record = profiles.get_record(&share_msg).await.map_err(|e| {
+            warn!(
+                "fetch_profile failed (record_key={}…, has_poster={}): {:?}",
+                key_prefix, has_poster, e
+            );
+            WrappedError::GenericError {
+                msg: format!("Failed to fetch profile: {:?}", e),
+            }
         })?;
         Ok(WrappedProfileRecord {
             display_name: record.name.name,

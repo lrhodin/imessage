@@ -1694,6 +1694,36 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 		go c.handleSharedProfile(log, msg)
 		return
 	}
+	// Profile-sharing control messages without an embedded CloudKit record:
+	// log only so we can see whether peers are flipping share_contacts /
+	// updating their dismissed list. No state to apply on the bridge side.
+	if msg.IsUpdateProfile && !msg.IsShareProfile {
+		sender := ""
+		if msg.Sender != nil {
+			sender = *msg.Sender
+		}
+		shareContacts := false
+		if msg.UpdateProfileShareContacts != nil {
+			shareContacts = *msg.UpdateProfileShareContacts
+		}
+		log.Info().
+			Str("sender", sender).
+			Bool("share_contacts", shareContacts).
+			Msg("Received UpdateProfile without embedded CloudKit record")
+		return
+	}
+	if msg.IsUpdateProfileSharing {
+		sender := ""
+		if msg.Sender != nil {
+			sender = *msg.Sender
+		}
+		log.Info().
+			Str("sender", sender).
+			Int("dismissed", len(msg.UpdateProfileSharingDismissed)).
+			Int("all", len(msg.UpdateProfileSharingAll)).
+			Msg("Received UpdateProfileSharing")
+		return
+	}
 
 	// Buffer regular messages, tapbacks, and edits for timestamp-based
 	// reordering. APNs delivers messages grouped by sender rather than
