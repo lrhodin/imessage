@@ -381,6 +381,20 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return true
 	}
 
+	// Pin the persistent bridge link to the session we just created so the
+	// letmein approver's linked_group branch matches deterministically when
+	// the user taps the link. Without this, session_link is None on the first
+	// tap and the approver has to fall through to member/ringing heuristics
+	// — which miss under cold-start / stale-state conditions and fabricate
+	// an empty session (the "0 people" symptom).
+	if bindErr := ft.BindBridgeLinkToSession(client.handle, bridgeFaceTimeLinkUsage, sessionID); bindErr != nil {
+		zerolog.Ctx(ce.Ctx).Warn().
+			Err(bindErr).
+			Str("session_id", sessionID).
+			Str("handle", client.handle).
+			Msg("failed to bind bridge FaceTime link to session; link-tap will fall back to member/ringing match")
+	}
+
 	// Append &n=<handle> so Apple's web join page pre-populates the display
 	// name field — caller hits Join instead of typing a name. Previous
 	// attempt (commit f168c0d) used url.QueryEscape, which percent-encodes +

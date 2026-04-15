@@ -657,6 +657,14 @@ void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_add_members(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_bind_bridge_link_to_session(
+	void* ptr,
+	RustBuffer handle,
+	RustBuffer usage,
+	RustBuffer group_id,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_clear_links(
 	void* ptr,
 	RustCallStatus* out_status
@@ -1825,6 +1833,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedapsstate_to_string(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_add_members(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_bind_bridge_link_to_session(
 	RustCallStatus* out_status
 );
 

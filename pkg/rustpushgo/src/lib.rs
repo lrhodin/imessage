@@ -3015,6 +3015,22 @@ async fn create_session_skip_own_devices(
 
     let prop_result = facetime.prop_up_conv(session, true).await;
 
+    // Log the wire-fanout target list (session.members at this point excludes
+    // the owner's own handle — see strip/restore above) plus the two session
+    // flags the letmein approver keys on. If wife doesn't ring, this tells us
+    // whether prop_up_conv even attempted to reach her target vs. succeeded
+    // at the wire but got dropped on Apple's push stack.
+    let targets: Vec<String> = session.members.iter().map(|m| m.handle.clone()).collect();
+    info!(
+        "FaceTime create_session: group={} own={} prop_ok={} ring_targets={:?} is_propped={} is_ringing_inaccurate={}",
+        group_id,
+        handle,
+        prop_result.is_ok(),
+        targets,
+        session.is_propped,
+        session.is_ringing_inaccurate,
+    );
+
     if own_was_present {
         session.members.insert(own_member);
     }
@@ -3065,6 +3081,20 @@ async fn auto_approve_bridge_letmein(
 
         (link.handle.clone(), linked_group, member_group, ringing_group)
     };
+
+    let match_kind = if linked_group.is_some() {
+        "linked"
+    } else if member_group.is_some() {
+        "member"
+    } else if ringing_group.is_some() {
+        "ringing"
+    } else {
+        "cold-start"
+    };
+    info!(
+        "FaceTime letmein approve: match_kind={} pseud={} requestor={} link_handle={}",
+        match_kind, request.pseud, request.requestor, link_handle,
+    );
 
     let approved_group = if let Some(group) = linked_group.or(member_group).or(ringing_group) {
         group
@@ -4668,6 +4698,34 @@ impl WrappedFaceTimeClient {
 
     pub async fn get_session_link(&self, guid: String) -> Result<String, WrappedError> {
         Ok(self.inner.get_session_link(&guid).await?)
+    }
+
+    // Deterministically binds the FTLink (matched by handle + usage) to a
+    // session group_id by setting link.session_link. Without this, the
+    // persistent "bridge" link has session_link=None until the first
+    // letmein-tap, and auto_approve_bridge_letmein falls through to
+    // member/ringing heuristics. Under cold-start or stale-state conditions
+    // those heuristics miss and the approver creates a fresh empty session,
+    // producing the "0 people" symptom.
+    pub async fn bind_bridge_link_to_session(
+        &self,
+        handle: String,
+        usage: String,
+        group_id: String,
+    ) -> Result<(), WrappedError> {
+        let mut state = self.inner.state.write().await;
+        let pseud = state
+            .links
+            .iter()
+            .find(|(_, link)| link.handle == handle && link.usage.as_deref() == Some(&usage))
+            .map(|(pseud, _)| pseud.clone())
+            .ok_or_else(|| WrappedError::GenericError {
+                msg: format!("No FaceTime link found for handle={} usage={}", handle, usage),
+            })?;
+        if let Some(link) = state.links.get_mut(&pseud) {
+            link.session_link = Some(group_id);
+        }
+        Ok(())
     }
 
     pub async fn create_session(&self, group_id: String, handle: String, participants: Vec<String>) -> Result<(), WrappedError> {
