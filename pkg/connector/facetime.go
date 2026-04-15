@@ -264,10 +264,12 @@ func fnFaceTime(ce *commands.Event) {
 //     https://facetime.apple.com/join URL that works in any browser:
 //     Chrome on Android, Firefox on Linux, Edge on Windows, Safari on
 //     iOS/macOS).
-//  4. Post the web URL to the user. Also post facetime:// and
-//     facetime-audio:// URLs with the target handle baked in as a
-//     one-tap shortcut for users on native Apple clients that register
-//     the scheme.
+//  4. Post the web URL to the user. facetime.apple.com is an Apple
+//     Universal Link, so on iOS / macOS the OS intercepts the domain
+//     and hands the URL off to the FaceTime app directly — no browser
+//     round-trip. On Android / Windows / Linux the same URL opens in
+//     the default browser and runs the FaceTime web client. One link
+//     covers every platform.
 //
 // When the user taps the web URL:
 //   - They authenticate against the personal link's pseudonym by sending a
@@ -372,16 +374,18 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 	}
 
 	bare := stripIdentifierPrefix(target)
-	videoURL := "facetime://" + bare
-	audioURL := "facetime-audio://" + bare
 
+	// One URL for everyone. facetime.apple.com is an Apple Universal Link:
+	// iOS / macOS intercept the domain and hand the URL off to the FaceTime
+	// app directly (no browser round-trip). Android / Windows / Linux just
+	// open the web FaceTime client in the default browser. Same link,
+	// platform-appropriate handling.
 	ce.Reply(
 		"📞 **Calling %s** — their phone is ringing now.\n\n"+
 			"[**🌐 Join FaceTime call**](%s)\n\n"+
-			"Tap the button above to join from **any device** — iOS, macOS, Android (Chrome), Windows, Linux. The link opens in a browser and connects you to the same call %s's phone is ringing for.\n\n"+
-			"**Native Apple shortcut:** [📹 Video](%s) · [📞 Audio](%s) — these open the FaceTime app directly on iOS / macOS.\n\n"+
-			"Raw URL (if the button doesn't open): %s",
-		bare, webLink, bare, videoURL, audioURL, webLink,
+			"Tap to join the same call %s's phone is ringing for. Works on iOS, macOS, Android, Windows, and Linux — Apple's Universal Link handler opens the FaceTime app on Apple devices and the browser everywhere else.\n\n"+
+			"Raw URL: %s",
+		bare, webLink, bare, webLink,
 	)
 	return true
 }
