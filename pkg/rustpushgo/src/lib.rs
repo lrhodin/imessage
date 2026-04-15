@@ -1406,6 +1406,32 @@ pub struct WrappedTokenProvider {
     // `plist::from_bytes(&bytes)?` and let the compiler infer T from the
     // receiving function's signature (e.g. `KeychainClientState::new(_, _, &T)`).
     mme_delegate_bytes: tokio::sync::Mutex<Option<Vec<u8>>>,
+    // Cached (KeychainClient, CloudKitClient) pair. The keychain/cloudkit
+    // pair is built by `create_keychain_clients` and used by
+    // `get_escrow_devices` and `join_keychain_clique_for_device`.
+    //
+    // We cache it because each fresh pair forces a fresh CloudKit container
+    // init (`ckAppInit` POST to `gateway.icloud.com/setup/setup/ck/v1/ckAppInit`
+    // inside upstream `CloudKitOpenContainer::init` at
+    // `third_party/rustpush-upstream/src/icloud/cloudkit.rs:1309-1340`).
+    // Apple has been observed returning empty bodies (401-with-no-body) for
+    // a *second* `ckAppInit` call from the same process minutes after the
+    // first one succeeded — typically the get_escrow_devices → user enters
+    // passcode → join_keychain_clique_for_device sequence in the install
+    // flow. Upstream's init handles 401 by calling `refresh_mme` but then
+    // still tries to JSON-decode the (empty) 401 response body
+    // (cloudkit.rs:1326-1330), surfacing as
+    // "HTTP error: error decoding response body: EOF while parsing a value
+    // at line 1 column 0".
+    //
+    // Caching the pair means the second call reuses the working container
+    // from the first call and skips the second ckAppInit entirely, which
+    // sidesteps the upstream bug and any Apple-side rate limiting on
+    // ckAppInit for the same DSID.
+    keychain_clients_cache: tokio::sync::Mutex<Option<(
+        Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
+        Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
+    )>>,
 }
 
 /// Helper: create CloudKit + Keychain clients from a WrappedTokenProvider.
@@ -1420,6 +1446,19 @@ async fn create_keychain_clients(
     Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
     Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
 ), WrappedError> {
+    // Fast path: return the cached pair if we've already built one in this
+    // process. See the keychain_clients_cache field docstring on
+    // WrappedTokenProvider for why caching is required (Apple returns empty
+    // body on a second ckAppInit, and upstream's CloudKitOpenContainer::init
+    // can't recover from it). Holding the lock across the slow construction
+    // path below also serializes concurrent callers, so two parallel
+    // `get_escrow_devices` calls don't race into two separate ckAppInit POSTs.
+    let mut cache = wp.keychain_clients_cache.lock().await;
+    if let Some(pair) = &*cache {
+        debug!("create_keychain_clients: reusing cached keychain/cloudkit pair");
+        return Ok(pair.clone());
+    }
+
     let (dsid, adsid, anisette) = {
         let account = wp.account.lock().await;
         let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
@@ -1491,7 +1530,9 @@ async fn create_keychain_clients(
         client: cloudkit.clone(),
     });
 
-    Ok((keychain, cloudkit))
+    let pair = (keychain, cloudkit);
+    *cache = Some(pair.clone());
+    Ok(pair)
 }
 
 /// Extract device name and model from an EscrowMetadata's client_metadata dictionary.
@@ -2024,6 +2065,7 @@ pub async fn restore_token_provider(
         account,
         os_config,
         mme_delegate_bytes: tokio::sync::Mutex::new(None),
+        keychain_clients_cache: tokio::sync::Mutex::new(None),
     }))
 }
 
@@ -4176,6 +4218,7 @@ impl LoginSession {
                 account: account_arc,
                 os_config: os_config.clone(),
                 mme_delegate_bytes: tokio::sync::Mutex::new(mme_delegate_bytes),
+                keychain_clients_cache: tokio::sync::Mutex::new(None),
             })),
             account_persist: Some(account_persist),
         })
