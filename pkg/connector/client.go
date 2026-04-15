@@ -136,11 +136,13 @@ type IMClient struct {
 	// Contact source for name resolution (iCloud or external CardDAV)
 	contacts contactSource
 
-	// sharedProfiles caches shared iMessage profile records (Name & Photo
-	// Sharing) received via ShareProfile / UpdateProfile messages, keyed by
-	// sender identifier (e.g. "tel:+1234567890" or "mailto:user@icloud.com").
-	// Used as a supplement to CardDAV contacts in GetUserInfo.
-	sharedProfiles sync.Map // map[string]*rustpushgo.WrappedProfileRecord
+	// sharedProfiles is the in-memory cache of shared iMessage profile records
+	// (Name & Photo Sharing) received via ShareProfile / UpdateProfile
+	// messages, keyed by sender identifier (e.g. "tel:+1234567890"). Values
+	// are *sharedProfileRow. Fronts sharedProfileStore which persists them
+	// across restarts; see pkg/connector/shared_profile.go.
+	sharedProfiles     sync.Map
+	sharedProfileStore *sharedProfileStore
 
 	// statusKitPresence tracks the last-known availability state per contact
 	// handle, keyed by iMessage identifier string (e.g. "tel:+1234567890").
@@ -963,6 +965,16 @@ func (c *IMClient) Connect(ctx context.Context) {
 	c.msgBuffer = &messageBuffer{client: c}
 	go c.periodicStateSave(log)
 	go c.periodicStatusSharingReinvite(log)
+	go c.periodicSharedProfileSync(log)
+
+	// Ensure shared-profile schema and hydrate the in-memory cache from the
+	// DB. Runs on every bridge start so existing installs pick up the table
+	// without needing a fresh login or reconfiguration.
+	if err := c.ensureSharedProfileSchema(context.Background()); err != nil {
+		log.Warn().Err(err).Msg("Failed to ensure shared_profiles schema")
+	} else {
+		c.loadSharedProfilesIntoCache(context.Background(), log)
+	}
 
 	// Ensure CloudKit backfill schema/storage is available.
 	cloudStoreReady := true
@@ -1679,7 +1691,7 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 		return
 	}
 	if msg.IsShareProfile && msg.Sender != nil && *msg.Sender != "" {
-		go c.handleShareProfile(log, msg)
+		go c.handleSharedProfile(log, msg)
 		return
 	}
 
@@ -2328,52 +2340,6 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		},
 		TargetMessage: makeMessageID(targetGUID),
 	})
-}
-
-// handleShareProfile fetches a shared iMessage profile (Name & Photo Sharing)
-// from CloudKit and caches it for GetUserInfo. Triggered by an incoming
-// ShareProfile / UpdateProfile message containing the record & decryption keys.
-func (c *IMClient) handleShareProfile(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	sender := *msg.Sender
-	log = log.With().Str("sender", sender).Logger()
-
-	if msg.ShareProfileRecordKey == nil || msg.ShareProfileDecryptionKey == nil {
-		log.Debug().Msg("ShareProfile message has no record key or decryption key, ignoring")
-		return
-	}
-	if c.client == nil {
-		return
-	}
-
-	log.Info().Msg("Fetching shared iMessage profile")
-	record, err := c.client.FetchProfile(*msg.ShareProfileRecordKey, *msg.ShareProfileDecryptionKey, msg.ShareProfileHasPoster)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to fetch shared profile")
-		return
-	}
-
-	c.sharedProfiles.Store(sender, &record)
-	log.Info().
-		Str("display_name", record.DisplayName).
-		Str("first_name", record.FirstName).
-		Str("last_name", record.LastName).
-		Bool("has_avatar", record.Avatar != nil && len(*record.Avatar) > 0).
-		Msg("Cached shared iMessage profile")
-
-	// Refresh the ghost so the Matrix-side display name / avatar updates.
-	ctx := context.Background()
-	userID := makeUserID(sender)
-	ghost, err := c.Main.Bridge.GetGhostByID(ctx, userID)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to get ghost for profile update")
-		return
-	}
-	info, err := c.GetUserInfo(ctx, ghost)
-	if err != nil || info == nil {
-		return
-	}
-	ghost.UpdateInfo(ctx, info)
-	log.Info().Msg("Updated ghost info from shared profile")
 }
 
 func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -5324,14 +5290,24 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		}
 	}
 
-	if contact != nil && contact.HasName() {
-		name := c.Main.Config.FormatDisplayname(DisplaynameParams{
-			FirstName: contact.FirstName,
-			LastName:  contact.LastName,
-			Nickname:  contact.Nickname,
-			ID:        localID,
-		})
-		ui.Name = &name
+	// User-provided contacts (CardDAV / iCloud) always win. Any match from
+	// c.contacts fully overrides the shared iMessage profile, regardless of
+	// whether the contact has a name or photo: the user adding an entry is
+	// itself the signal that they want their own data used. Shared profiles
+	// only fill the gap when the identifier is unknown to the address book.
+	if contact != nil {
+		if contact.HasName() {
+			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+				FirstName: contact.FirstName,
+				LastName:  contact.LastName,
+				Nickname:  contact.Nickname,
+				ID:        localID,
+			})
+			ui.Name = &name
+		} else {
+			name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
+			ui.Name = &name
+		}
 		for _, phone := range contact.Phones {
 			ui.Identifiers = append(ui.Identifiers, "tel:"+phone)
 		}
@@ -5351,10 +5327,9 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		return ui, nil
 	}
 
-	// Check for a shared iMessage profile (Name & Photo Sharing / Me card)
-	// as a supplement to CardDAV when no contact is found.
-	if val, ok := c.sharedProfiles.Load(identifier); ok {
-		profile := val.(*rustpushgo.WrappedProfileRecord)
+	// No user-provided contact — fall back to a shared iMessage profile
+	// (Name & Photo Sharing / Me card) if one was received and cached.
+	if profile := c.lookupSharedProfile(identifier); profile != nil {
 		if profile.FirstName != "" || profile.LastName != "" || profile.DisplayName != "" {
 			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
 				FirstName: profile.FirstName,
@@ -5378,7 +5353,7 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		}
 	}
 
-	// Fallback: format from identifier
+	// Final fallback: format from identifier
 	name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
 	ui.Name = &name
 	return ui, nil
