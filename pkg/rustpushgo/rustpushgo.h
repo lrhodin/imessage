@@ -1028,16 +1028,6 @@ void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_clear_interest_tokens(
 	RustCallStatus* out_status
 );
 
-void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_configure_aps(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_ensure_channel(
-	void* ptr,
-	RustCallStatus* out_status
-);
-
 void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_export_state_json(
 	void* ptr,
 	RustCallStatus* out_status
@@ -2074,14 +2064,6 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_unsubscrib
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_clear_interest_tokens(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_configure_aps(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_ensure_channel(
 	RustCallStatus* out_status
 );
 

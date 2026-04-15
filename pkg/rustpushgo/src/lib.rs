@@ -4809,16 +4809,6 @@ impl WrappedStatusKitClient {
         serialize_state_json(&*state)
     }
 
-    pub async fn configure_aps(&self) -> Result<(), WrappedError> {
-        self.inner.configure_aps().await?;
-        Ok(())
-    }
-
-    pub async fn ensure_channel(&self) -> Result<(), WrappedError> {
-        self.inner.ensure_channel().await?;
-        Ok(())
-    }
-
     pub async fn roll_keys(&self) {
         self.inner.roll_keys().await;
     }

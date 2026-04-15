@@ -35,26 +35,6 @@ var cmdStatuskitState = &commands.FullHandler{
 	RequiresLogin: true,
 }
 
-var cmdStatuskitConfigureAPS = &commands.FullHandler{
-	Name: "statuskit-configure-aps",
-	Func: fnStatuskitConfigureAPS,
-	Help: commands.HelpMeta{
-		Section:     HelpSectionStatusKit,
-		Description: "Re-run the StatusKit APS channel configuration handshake with Apple.",
-	},
-	RequiresLogin: true,
-}
-
-var cmdStatuskitEnsureChannel = &commands.FullHandler{
-	Name: "statuskit-ensure-channel",
-	Func: fnStatuskitEnsureChannel,
-	Help: commands.HelpMeta{
-		Section:     HelpSectionStatusKit,
-		Description: "Create the local StatusKit channel if it doesn't already exist.",
-	},
-	RequiresLogin: true,
-}
-
 var cmdStatuskitClearInterest = &commands.FullHandler{
 	Name: "statuskit-clear-interest",
 	Func: fnStatuskitClearInterest,
@@ -162,30 +142,6 @@ func fnStatuskitState(ce *commands.Event) {
 		state = state[:12000] + "\n... (truncated)"
 	}
 	ce.Reply("```json\n%s\n```", state)
-}
-
-func fnStatuskitConfigureAPS(ce *commands.Event) {
-	sk, ok := statusKitClientFromEvent(ce)
-	if !ok {
-		return
-	}
-	if err := sk.ConfigureAps(); err != nil {
-		ce.Reply("Failed to configure StatusKit APS: %v", err)
-		return
-	}
-	ce.Reply("Configured StatusKit APS.")
-}
-
-func fnStatuskitEnsureChannel(ce *commands.Event) {
-	sk, ok := statusKitClientFromEvent(ce)
-	if !ok {
-		return
-	}
-	if err := sk.EnsureChannel(); err != nil {
-		ce.Reply("Failed to ensure StatusKit channel: %v", err)
-		return
-	}
-	ce.Reply("StatusKit channel is ready.")
 }
 
 func fnStatuskitClearInterest(ce *commands.Event) {

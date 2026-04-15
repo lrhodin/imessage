@@ -90,8 +90,6 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdSharedDownloadFile,
 		cmdSharedCreateAssetB64,
 		cmdStatuskitState,
-		cmdStatuskitConfigureAPS,
-		cmdStatuskitEnsureChannel,
 		cmdStatuskitClearInterest,
 		cmdStatuskitRequestHandles,
 		cmdStatuskitInviteToChannel,
