@@ -1690,15 +1690,6 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_request_channels(uniffiStatus)
-		})
-		if checksum != 12276 {
-			// If this happens try cleaning and rebuilding your project
-			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_request_channels: UniFFI API checksum mismatch")
-		}
-	}
-	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_request_handles(uniffiStatus)
 		})
 		if checksum != 17015 {
@@ -1731,15 +1722,6 @@ func uniffiCheckChecksums() {
 		if checksum != 10053 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_share_status: UniFFI API checksum mismatch")
-		}
-	}
-	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_update_channels(uniffiStatus)
-		})
-		if checksum != 25555 {
-			// If this happens try cleaning and rebuilding your project
-			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_update_channels: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -5941,30 +5923,6 @@ func (_self *WrappedStatusKitClient) InviteToChannel(senderHandle string, handle
 		})
 }
 
-func (_self *WrappedStatusKitClient) RequestChannels(channels []WrappedApsChannelIdentifier) {
-	_pointer := _self.ffiObject.incrementPointer("*WrappedStatusKitClient")
-	defer _self.ffiObject.decrementPointer()
-	uniffiRustCallAsync(func(status *C.RustCallStatus) *C.void {
-		// rustFutureFunc
-		return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedstatuskitclient_request_channels(
-			_pointer, rustBufferToC(FfiConverterSequenceTypeWrappedAPSChannelIdentifierINSTANCE.Lower(channels)),
-			status,
-		))
-	},
-		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
-			// pollFunc
-			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
-		},
-		func(handle *C.void, status *C.RustCallStatus) {
-			// completeFunc
-			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
-		},
-		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
-			// freeFunc
-			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
-		})
-}
-
 func (_self *WrappedStatusKitClient) RequestHandles(handles []string) {
 	_pointer := _self.ffiObject.incrementPointer("*WrappedStatusKitClient")
 	defer _self.ffiObject.decrementPointer()
@@ -6045,31 +6003,6 @@ func (_self *WrappedStatusKitClient) ShareStatus(active bool, mode *string) erro
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedstatuskitclient_share_status(
 				_pointer, FfiConverterBoolINSTANCE.Lower(active), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(mode)),
-				status,
-			))
-		},
-		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
-			// pollFunc
-			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
-		},
-		func(handle *C.void, status *C.RustCallStatus) {
-			// completeFunc
-			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
-		},
-		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
-			// freeFunc
-			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
-		})
-}
-
-func (_self *WrappedStatusKitClient) UpdateChannels(channels []WrappedApsChannelIdentifier) error {
-	_pointer := _self.ffiObject.incrementPointer("*WrappedStatusKitClient")
-	defer _self.ffiObject.decrementPointer()
-	return uniffiRustCallAsyncWithError(
-		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
-			// rustFutureFunc
-			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedstatuskitclient_update_channels(
-				_pointer, rustBufferToC(FfiConverterSequenceTypeWrappedAPSChannelIdentifierINSTANCE.Lower(channels)),
 				status,
 			))
 		},
@@ -6532,46 +6465,6 @@ func (c FfiConverterTypeIDSUsersWithIdentityRecord) Write(writer io.Writer, valu
 type FfiDestroyerTypeIdsUsersWithIdentityRecord struct{}
 
 func (_ FfiDestroyerTypeIdsUsersWithIdentityRecord) Destroy(value IdsUsersWithIdentityRecord) {
-	value.Destroy()
-}
-
-type WrappedApsChannelIdentifier struct {
-	Topic string
-	Id    []byte
-}
-
-func (r *WrappedApsChannelIdentifier) Destroy() {
-	FfiDestroyerString{}.Destroy(r.Topic)
-	FfiDestroyerBytes{}.Destroy(r.Id)
-}
-
-type FfiConverterTypeWrappedAPSChannelIdentifier struct{}
-
-var FfiConverterTypeWrappedAPSChannelIdentifierINSTANCE = FfiConverterTypeWrappedAPSChannelIdentifier{}
-
-func (c FfiConverterTypeWrappedAPSChannelIdentifier) Lift(rb RustBufferI) WrappedApsChannelIdentifier {
-	return LiftFromRustBuffer[WrappedApsChannelIdentifier](c, rb)
-}
-
-func (c FfiConverterTypeWrappedAPSChannelIdentifier) Read(reader io.Reader) WrappedApsChannelIdentifier {
-	return WrappedApsChannelIdentifier{
-		FfiConverterStringINSTANCE.Read(reader),
-		FfiConverterBytesINSTANCE.Read(reader),
-	}
-}
-
-func (c FfiConverterTypeWrappedAPSChannelIdentifier) Lower(value WrappedApsChannelIdentifier) RustBuffer {
-	return LowerIntoRustBuffer[WrappedApsChannelIdentifier](c, value)
-}
-
-func (c FfiConverterTypeWrappedAPSChannelIdentifier) Write(writer io.Writer, value WrappedApsChannelIdentifier) {
-	FfiConverterStringINSTANCE.Write(writer, value.Topic)
-	FfiConverterBytesINSTANCE.Write(writer, value.Id)
-}
-
-type FfiDestroyerTypeWrappedApsChannelIdentifier struct{}
-
-func (_ FfiDestroyerTypeWrappedApsChannelIdentifier) Destroy(value WrappedApsChannelIdentifier) {
 	value.Destroy()
 }
 
@@ -8686,49 +8579,6 @@ type FfiDestroyerSequenceTypeEscrowDeviceInfo struct{}
 func (FfiDestroyerSequenceTypeEscrowDeviceInfo) Destroy(sequence []EscrowDeviceInfo) {
 	for _, value := range sequence {
 		FfiDestroyerTypeEscrowDeviceInfo{}.Destroy(value)
-	}
-}
-
-type FfiConverterSequenceTypeWrappedAPSChannelIdentifier struct{}
-
-var FfiConverterSequenceTypeWrappedAPSChannelIdentifierINSTANCE = FfiConverterSequenceTypeWrappedAPSChannelIdentifier{}
-
-func (c FfiConverterSequenceTypeWrappedAPSChannelIdentifier) Lift(rb RustBufferI) []WrappedApsChannelIdentifier {
-	return LiftFromRustBuffer[[]WrappedApsChannelIdentifier](c, rb)
-}
-
-func (c FfiConverterSequenceTypeWrappedAPSChannelIdentifier) Read(reader io.Reader) []WrappedApsChannelIdentifier {
-	length := readInt32(reader)
-	if length == 0 {
-		return nil
-	}
-	result := make([]WrappedApsChannelIdentifier, 0, length)
-	for i := int32(0); i < length; i++ {
-		result = append(result, FfiConverterTypeWrappedAPSChannelIdentifierINSTANCE.Read(reader))
-	}
-	return result
-}
-
-func (c FfiConverterSequenceTypeWrappedAPSChannelIdentifier) Lower(value []WrappedApsChannelIdentifier) RustBuffer {
-	return LowerIntoRustBuffer[[]WrappedApsChannelIdentifier](c, value)
-}
-
-func (c FfiConverterSequenceTypeWrappedAPSChannelIdentifier) Write(writer io.Writer, value []WrappedApsChannelIdentifier) {
-	if len(value) > math.MaxInt32 {
-		panic("[]WrappedApsChannelIdentifier is too large to fit into Int32")
-	}
-
-	writeInt32(writer, int32(len(value)))
-	for _, item := range value {
-		FfiConverterTypeWrappedAPSChannelIdentifierINSTANCE.Write(writer, item)
-	}
-}
-
-type FfiDestroyerSequenceTypeWrappedApsChannelIdentifier struct{}
-
-func (FfiDestroyerSequenceTypeWrappedApsChannelIdentifier) Destroy(sequence []WrappedApsChannelIdentifier) {
-	for _, value := range sequence {
-		FfiDestroyerTypeWrappedApsChannelIdentifier{}.Destroy(value)
 	}
 }
 

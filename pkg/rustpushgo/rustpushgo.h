@@ -1055,12 +1055,6 @@ void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_invite_to_channel(
 	RustCallStatus* out_status
 );
 
-void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_request_channels(
-	void* ptr,
-	RustBuffer channels,
-	RustCallStatus* out_status
-);
-
 void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_request_handles(
 	void* ptr,
 	RustBuffer handles,
@@ -1081,12 +1075,6 @@ void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_share_status(
 	void* ptr,
 	int8_t active,
 	RustBuffer mode,
-	RustCallStatus* out_status
-);
-
-void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_update_channels(
-	void* ptr,
-	RustBuffer channels,
 	RustCallStatus* out_status
 );
 
@@ -2109,10 +2097,6 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_invite_to_chan
 	RustCallStatus* out_status
 );
 
-uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_request_channels(
-	RustCallStatus* out_status
-);
-
 uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_request_handles(
 	RustCallStatus* out_status
 );
@@ -2126,10 +2110,6 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_roll_keys(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_share_status(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_update_channels(
 	RustCallStatus* out_status
 );
 
