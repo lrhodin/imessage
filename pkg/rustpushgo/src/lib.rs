@@ -4599,7 +4599,92 @@ impl WrappedFaceTimeClient {
     }
 
     pub async fn create_session(&self, group_id: String, handle: String, participants: Vec<String>) -> Result<(), WrappedError> {
-        self.inner.create_session(group_id, handle, &participants).await?;
+        // Why we don't just call upstream's FTClient::create_session:
+        //
+        // Upstream chains the caller's own handle into session.members
+        // (facetime.rs:598). prop_up_conv then derives `relevant_people` from
+        // that set and fans the wire message out to every device under each
+        // member's handle — including the caller's other Apple devices (Mac,
+        // iPad, etc.). With Continuity on, the Mac auto-answers.
+        //
+        // The Mac auto-answer breaks the bridge link flow: the Mac sends a
+        // RespondedElsewhere back to the bridge, which clears
+        // `is_ringing_inaccurate` on the session (handle path at
+        // facetime.rs:1241-1250). When the user later taps the bridge's
+        // FaceTime link from their actual device, auto_approve_bridge_letmein
+        // walks linked_group → member_group → ringing_group; ringing_group is
+        // the only fallback that would have matched (the link-joiner request
+        // arrives as a temp pseudonym, not the user's real handle), and with
+        // is_ringing_inaccurate=false it doesn't match either. So the
+        // overlay spins up a brand-new session for the join, leaving the
+        // user in a different session from the callee.
+        //
+        // We can't just suppress the secondary fanout from inside upstream
+        // (`feedback_no_patch_rustpush`), but FTSession + ensure_allocations
+        // + prop_up_conv are all already pub, so we mirror upstream's
+        // create_session sequence here and temporarily strip the caller's
+        // handle from `session.members` during prop_up_conv. The handle stays
+        // in `my_handles` (so the bridge knows who it is) and gets restored
+        // to `members` after the ring is sent (so add_members,
+        // decline_invite, etc. see a complete member set later).
+        //
+        // ensure_allocations still runs with the full member set so the
+        // bridge gets its own quickrelay participant entry — without that,
+        // prop_up_conv's `find(|p| &p.token == &base64_encoded)` panics with
+        // NoParticipantTokenIndex.
+        use rustpush::facetime::{FTMember, FTMode, FTSession};
+        use std::collections::{HashMap, HashSet};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let members: HashSet<FTMember> = participants
+            .iter()
+            .chain(std::iter::once(&handle))
+            .map(|p| FTMember { nickname: None, handle: p.clone() })
+            .collect();
+
+        let session = FTSession {
+            group_id: group_id.clone(),
+            my_handles: vec![handle.clone()],
+            participants: HashMap::new(),
+            link: None,
+            members,
+            report_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+            start_time: Some(now_ms),
+            last_rekey: None,
+            is_propped: false,
+            is_ringing_inaccurate: true,
+            mode: Some(FTMode::Outgoing),
+            recent_member_adds: HashMap::new(),
+        };
+
+        let mut state = self.inner.state.write().await;
+        state.sessions.insert(group_id.clone(), session);
+        let session = state.sessions.get_mut(&group_id).expect("just inserted");
+
+        self.inner
+            .ensure_allocations(session, &[])
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("ensure_allocations failed: {:?}", e),
+            })?;
+
+        let own_member = FTMember { nickname: None, handle: handle.clone() };
+        let own_was_present = session.members.remove(&own_member);
+
+        let prop_result = self.inner.prop_up_conv(session, true).await;
+
+        if own_was_present {
+            session.members.insert(own_member);
+        }
+
+        prop_result.map_err(|e| WrappedError::GenericError {
+            msg: format!("prop_up_conv failed: {:?}", e),
+        })?;
+
         Ok(())
     }
 
