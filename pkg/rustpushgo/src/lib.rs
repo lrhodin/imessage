@@ -3087,42 +3087,18 @@ async fn auto_approve_bridge_letmein(
         }
     }
 
-    // Strip the bridge owner's handle from session.members before
-    // respond_letmein. respond_letmein adds the requestor as a member via
-    // upstream's add_members (facetime.rs:1149), which builds to_members
-    // from session.members + new_members and fans the AddMember wire to
-    // every handle in that union — so without the strip, the wire goes to
-    // the bridge owner's other Apple devices, causing the Mac to ring on
-    // every link tap.
-    //
-    // Restore the handle after. add_members replaces session.members with
-    // (stripped_members ∪ new_members) on its way out (facetime.rs:966), so
-    // the post-call set looks like [wife, requestor]; re-inserting the
-    // owner's handle keeps subsequent operations (decline, future
-    // add_members) seeing a complete member set.
-    let own_member = rustpush::facetime::FTMember {
-        nickname: None,
-        handle: link_handle.clone(),
-    };
-    let own_was_present = {
-        let mut state = facetime.state.write().await;
-        if let Some(session) = state.sessions.get_mut(&approved_group) {
-            session.members.remove(&own_member)
-        } else {
-            false
-        }
-    };
-
-    let respond_result = facetime.respond_letmein(request.clone(), Some(&approved_group)).await;
-
-    if own_was_present {
-        let mut state = facetime.state.write().await;
-        if let Some(session) = state.sessions.get_mut(&approved_group) {
-            session.members.insert(own_member);
-        }
-    }
-
-    respond_result?;
+    // Note: respond_letmein internally calls add_members which fans an
+    // AddMember wire to (session.members ∪ new_members). Since session.members
+    // still contains the bridge owner's handle here, the wire reaches the
+    // owner's other Apple devices (Mac), causing the Mac to ring on every
+    // link tap. An earlier attempt stripped own from session.members around
+    // this call but appeared to break wife's initial ring on subsequent
+    // !im facetime invocations — possibly because the strip races with
+    // something else holding session.members. Revert to plain pass-through
+    // until we can either (a) reproduce the regression cleanly, or (b)
+    // expose IDSSendMessage from upstream so we can craft a self-only
+    // RespondedElsewhere without touching members at all.
+    facetime.respond_letmein(request.clone(), Some(&approved_group)).await?;
     info!(
         "FaceTime auto-approved LetMeIn request for bridge link: requestor={} group={} usage=bridge",
         request.requestor,
