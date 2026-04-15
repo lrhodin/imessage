@@ -8322,18 +8322,30 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		participants = []string{sendTo}
 	}
 
-	// Resolve the canonical chat group_id for this DM from CloudKit-synced
-	// data (cloud_chat). This is the group ID Apple's recipient device
-	// already knows about for the chat thread. Without it, prepare_send
-	// in upstream rustpush generates a fresh random sender_guid per call,
-	// and the recipient can't match operations like unsend back to the
-	// original chat thread (edits slip through because the recipient has
-	// visible body content to apply regardless). Same purpose as the
-	// imGroupGuids cache for groups (client.go:247-248).
+	// Populate sender_guid in Apple's canonical DM chat-identifier format
+	// ("iMessage;-;{address}") for non-SMS DMs, matching OpenBubbles'
+	// getConversationData(). Without a stable, well-formed sender_guid,
+	// upstream rustpush's prepare_send synthesises a fresh random UUID
+	// per send, and the recipient's Messages.app fails to match the
+	// unsend back to the original chat thread — so the unsend appears on
+	// the sender's other Apple devices but not on the recipient's. Edits
+	// slip through because the recipient has visible body content to
+	// apply regardless of chat-thread match. Same purpose as the
+	// imGroupGuids cache for groups (client.go:247-248). SMS/RCS don't
+	// support unsend, so we leave their sender_guid unset.
+	//
+	// Falls back to the CloudKit-synced group_id when address resolution
+	// produces nothing (rare; merged-contact edge cases).
 	var senderGuid *string
-	if c.cloudStore != nil {
-		if g := c.cloudStore.getGroupIDForPortalID(context.Background(), portalID); g != "" {
-			senderGuid = &g
+	if !isSms {
+		bare := strings.TrimPrefix(strings.TrimPrefix(sendTo, "tel:"), "mailto:")
+		if bare != "" {
+			guid := "iMessage;-;" + bare
+			senderGuid = &guid
+		} else if c.cloudStore != nil {
+			if g := c.cloudStore.getGroupIDForPortalID(context.Background(), portalID); g != "" {
+				senderGuid = &g
+			}
 		}
 	}
 
