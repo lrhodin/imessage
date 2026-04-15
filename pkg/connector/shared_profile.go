@@ -150,7 +150,11 @@ func (s *sharedProfileStore) loadAll(ctx context.Context) ([]*sharedProfileRow, 
 
 // loadSharedProfilesIntoCache hydrates the in-memory cache from the DB so a
 // bridge restart doesn't lose cached names/photos until a fresh share message
-// arrives. Called once from Connect after ensureSharedProfileSchema.
+// arrives. Called once from Connect after ensureSharedProfileSchema. After
+// the cache is warm, kicks off ghost refreshes in a goroutine so the Matrix
+// side immediately re-applies cached names + avatars without waiting for a
+// new inbound message or the 15-min periodic tick (mirrors how
+// refreshGhostNamesFromContacts re-applies CardDAV state on connect).
 func (c *IMClient) loadSharedProfilesIntoCache(ctx context.Context, log zerolog.Logger) {
 	if c.sharedProfileStore == nil {
 		return
@@ -165,6 +169,14 @@ func (c *IMClient) loadSharedProfilesIntoCache(ctx context.Context, log zerolog.
 	}
 	if len(rows) > 0 {
 		log.Info().Int("count", len(rows)).Msg("Loaded shared iMessage profiles from DB")
+		go func() {
+			refreshed := 0
+			for _, r := range rows {
+				c.refreshGhostFromSharedProfile(log, r.Identifier)
+				refreshed++
+			}
+			log.Info().Int("count", refreshed).Msg("Re-applied cached shared profiles to ghosts on connect")
+		}()
 	}
 }
 
