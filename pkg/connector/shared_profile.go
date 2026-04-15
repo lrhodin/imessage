@@ -37,11 +37,11 @@ import (
 //     need to re-fetch it, so the photo survives bridge restarts without the
 //     iPhone side re-sending a share.
 //   - An in-memory `sync.Map` fronts the DB for read hot paths.
-//   - `periodicSharedProfileSync` re-fetches every stored record from
-//     CloudKit on a 15-minute cadence so profile edits that don't trigger a
-//     fresh ShareProfile message still propagate to Matrix.
-
-const sharedProfileSyncInterval = 15 * time.Minute
+//   - `refreshSharedProfilesWithContacts` rides setContactsReady so the
+//     refresh runs on the same cadence as CardDAV (initial sync + every
+//     periodic re-sync). Profile edits that don't trigger a fresh
+//     ShareProfile message still propagate to Matrix on the next CardDAV
+//     tick.
 
 // sharedProfileStore persists decrypted iMessage shared profiles keyed by
 // (login_id, identifier).
@@ -150,11 +150,9 @@ func (s *sharedProfileStore) loadAll(ctx context.Context) ([]*sharedProfileRow, 
 
 // loadSharedProfilesIntoCache hydrates the in-memory cache from the DB so a
 // bridge restart doesn't lose cached names/photos until a fresh share message
-// arrives. Called once from Connect after ensureSharedProfileSchema. After
-// the cache is warm, kicks off ghost refreshes in a goroutine so the Matrix
-// side immediately re-applies cached names + avatars without waiting for a
-// new inbound message or the 15-min periodic tick (mirrors how
-// refreshGhostNamesFromContacts re-applies CardDAV state on connect).
+// arrives. Called once from Connect after ensureSharedProfileSchema.
+// periodicSharedProfileSync handles pushing cached state (and any CloudKit
+// edits) to Matrix ghosts on its initial pre-ticker sync.
 func (c *IMClient) loadSharedProfilesIntoCache(ctx context.Context, log zerolog.Logger) {
 	if c.sharedProfileStore == nil {
 		return
@@ -169,14 +167,6 @@ func (c *IMClient) loadSharedProfilesIntoCache(ctx context.Context, log zerolog.
 	}
 	if len(rows) > 0 {
 		log.Info().Int("count", len(rows)).Msg("Loaded shared iMessage profiles from DB")
-		go func() {
-			refreshed := 0
-			for _, r := range rows {
-				c.refreshGhostFromSharedProfile(log, r.Identifier)
-				refreshed++
-			}
-			log.Info().Int("count", refreshed).Msg("Re-applied cached shared profiles to ghosts on connect")
-		}()
 	}
 }
 
@@ -329,19 +319,33 @@ func (c *IMClient) lookupSharedProfile(identifier string) *rustpushgo.WrappedPro
 	return nil
 }
 
-// periodicSharedProfileSync re-fetches every persisted shared profile from
-// CloudKit on a 15-minute cadence so profile edits that don't re-trigger a
-// ShareProfile message still reach Matrix. Mirrors periodicCloudContactSync.
-func (c *IMClient) periodicSharedProfileSync(log zerolog.Logger) {
-	ticker := time.NewTicker(sharedProfileSyncInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			c.refreshAllSharedProfiles(log)
-		case <-c.stopChan:
-			return
+// refreshSharedProfilesWithContacts is fired from setContactsReady so the
+// shared-profile refresh runs on the same cadence as CardDAV: once on the
+// initial contact sync and again on every periodic CardDAV re-sync. First
+// pushes every cached row to its Matrix ghost (no network — handles warm
+// restarts) and then re-fetches each row from CloudKit so profile edits
+// we missed while offline propagate.
+func (c *IMClient) refreshSharedProfilesWithContacts(log zerolog.Logger) {
+	c.applyCachedSharedProfilesToGhosts(log)
+	c.refreshAllSharedProfiles(log)
+}
+
+// applyCachedSharedProfilesToGhosts pushes every cached shared profile to
+// its corresponding Matrix ghost without any CloudKit fetch. Runs once on
+// connect so warm restarts re-render names + avatars immediately.
+func (c *IMClient) applyCachedSharedProfilesToGhosts(log zerolog.Logger) {
+	applied := 0
+	c.sharedProfiles.Range(func(key, _ any) bool {
+		identifier, ok := key.(string)
+		if !ok || identifier == "" {
+			return true
 		}
+		c.refreshGhostFromSharedProfile(log, identifier)
+		applied++
+		return true
+	})
+	if applied > 0 {
+		log.Info().Int("count", applied).Msg("Re-applied cached shared profiles to ghosts on connect")
 	}
 }
 

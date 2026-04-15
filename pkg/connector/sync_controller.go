@@ -726,6 +726,12 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	go c.refreshGhostNamesFromContacts(log)
 	go c.refreshGroupPortalNamesFromContacts(log)
 	go c.subscribeToContactPresence(log)
+	// Shared iMessage profiles (Name & Photo Sharing) ride the same trigger
+	// as CardDAV sync: cached state goes to ghosts immediately, then we
+	// re-fetch each row from CloudKit so profile edits propagate. The
+	// CardDAV-wins precedence in GetUserInfo means contacts you have always
+	// override the share regardless of refresh order.
+	go c.refreshSharedProfilesWithContacts(log)
 }
 
 // subscribeToContactPresence subscribes to iMessage presence updates for all

@@ -965,7 +965,8 @@ func (c *IMClient) Connect(ctx context.Context) {
 	c.msgBuffer = &messageBuffer{client: c}
 	go c.periodicStateSave(log)
 	go c.periodicStatusSharingReinvite(log)
-	go c.periodicSharedProfileSync(log)
+	// Shared iMessage profile refresh now rides setContactsReady — same
+	// cadence as CardDAV. No standalone goroutine needed.
 
 	// Ensure shared-profile schema and hydrate the in-memory cache from the
 	// DB. Runs on every bridge start so existing installs pick up the table
