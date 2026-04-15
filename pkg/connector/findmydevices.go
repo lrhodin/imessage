@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -167,7 +168,7 @@ func fnFindMyDevices(ce *commands.Event) {
 			))
 			sb.WriteString(fmt.Sprintf(
 				"  [Open in Maps](https://maps.apple.com/?ll=%.6f,%.6f&q=%s)\n",
-				loc.Latitude, loc.Longitude, strings.ReplaceAll(name, " ", "+"),
+				loc.Latitude, loc.Longitude, url.QueryEscape(name),
 			))
 		} else if d.LocationEnabled != nil && !*d.LocationEnabled {
 			sb.WriteString("  _Location sharing disabled_\n")

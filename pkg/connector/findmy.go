@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -226,7 +227,7 @@ func fnFindMy(ce *commands.Event) {
 			))
 			sb.WriteString(fmt.Sprintf(
 				"  [Open in Maps](https://maps.apple.com/?ll=%.6f,%.6f&q=%s)\n",
-				acc.LastReport.Lat, acc.LastReport.Long, name,
+				acc.LastReport.Lat, acc.LastReport.Long, url.QueryEscape(name),
 			))
 		} else {
 			sb.WriteString("  _No location reported_\n")

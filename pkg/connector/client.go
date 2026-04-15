@@ -1777,11 +1777,27 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	// "Notify Anyway" — sender deliberately broke through our Focus/DND.
 	// Post a silent bot notice in the relevant room so the user can see it.
 	if msg.IsNotifyAnyways {
+		if c.cloudStore != nil {
+			if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+				return
+			}
+			if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, "", int64(msg.TimestampMs), false); err != nil {
+				log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist NotifyAnyway UUID; duplicates possible on restart")
+			}
+		}
 		go c.handleNotifyAnyways(log, msg)
 		return
 	}
 	// Transcript background — someone set or cleared the iMessage chat wallpaper.
 	if msg.IsSetTranscriptBackground {
+		if c.cloudStore != nil {
+			if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+				return
+			}
+			if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, "", int64(msg.TimestampMs), false); err != nil {
+				log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist SetTranscriptBackground UUID; duplicates possible on restart")
+			}
+		}
 		go c.handleTranscriptBackground(log, msg)
 		return
 	}

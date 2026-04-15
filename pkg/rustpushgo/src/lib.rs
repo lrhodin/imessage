@@ -12,7 +12,6 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use icloud_auth::AppleAccount;
 use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
 use log::{debug, error, info, warn};
-use rustpush::util::duration_since_epoch;
 use rustpush::{
     authenticate_apple, login_apple_delegates, register, APSConnectionResource,
     APSState, Attachment, AttachmentType, ConversationData, DeleteTarget, EditMessage,
@@ -2549,8 +2548,7 @@ impl std::io::Write for SharedWriter {
 /// The attributedBody is an NSAttributedString containing ranges with
 /// __kIMFileTransferGUIDAttributeName → attachment GUID.
 fn extract_attachment_guids_from_attributed_body(data: &[u8]) -> Vec<String> {
-    use rustpush::util::duration_since_epoch;
-use rustpush::{coder_decode_flattened, NSAttributedString, StCollapsedValue};
+    use rustpush::{coder_decode_flattened, NSAttributedString, StCollapsedValue};
 
     let decoded = match std::panic::catch_unwind(|| {
         let flat = coder_decode_flattened(data);
@@ -2944,8 +2942,8 @@ async fn facetime_event_to_wrapped(
     event: &rustpush::facetime::FTMessage,
 ) -> Option<WrappedMessage> {
     let (guid, mut sender, marker) = match event {
-        rustpush::facetime::FTMessage::Ring { guid, sender } => {
-            (guid.clone(), Some(sender.clone()), FACETIME_RING_MARKER)
+        rustpush::facetime::FTMessage::Ring { guid } => {
+            (guid.clone(), None, FACETIME_RING_MARKER)
         }
         rustpush::facetime::FTMessage::JoinEvent { guid, handle, ring, .. } if *ring => {
             (guid.clone(), Some(handle.clone()), FACETIME_RING_MARKER)
@@ -2954,11 +2952,11 @@ async fn facetime_event_to_wrapped(
             let fallback = members.iter().next().map(|member| member.handle.clone());
             (guid.clone(), fallback, FACETIME_RING_MARKER)
         }
-        rustpush::facetime::FTMessage::Decline { guid, sender } => {
-            (guid.clone(), Some(sender.clone()), FACETIME_MISSED_MARKER)
+        rustpush::facetime::FTMessage::Decline { guid } => {
+            (guid.clone(), None, FACETIME_MISSED_MARKER)
         }
-        rustpush::facetime::FTMessage::RespondedElsewhere { guid, sender } => {
-            (guid.clone(), Some(sender.clone()), FACETIME_ANSWERED_ELSEWHERE_MARKER)
+        rustpush::facetime::FTMessage::RespondedElsewhere { guid } => {
+            (guid.clone(), None, FACETIME_ANSWERED_ELSEWHERE_MARKER)
         }
         _ => return None,
     };
@@ -2993,7 +2991,10 @@ async fn facetime_event_to_wrapped(
             .cloned();
     }
 
-    let now_ms = duration_since_epoch().as_millis() as u64;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
     let event_kind = marker.trim_matches('[').trim_matches(']').to_lowercase();
     let mut wrapped = WrappedMessage::default();
     wrapped.uuid = format!("FACETIME_{}_{}_{}", event_kind.to_uppercase(), guid, now_ms);
@@ -5561,13 +5562,8 @@ pub async fn new_client(
                 // Consume FaceTime APNs events to keep FT state live and
                 // surface incoming-call attempts to Go as synthetic notice
                 // triggers.
-                let ft_handle_result = {
-                    let ft = ft_for_recv.clone();
-                    let msg_clone = msg.clone();
-                    tokio::task::spawn(async move { ft.handle(msg_clone).await }).await
-                };
-                match ft_handle_result {
-                    Ok(Ok(Some(ft_message))) => {
+                match ft_for_recv.handle(msg.clone()).await {
+                    Ok(Some(ft_message)) => {
                         if let rustpush::facetime::FTMessage::LetMeInRequest(request) = &ft_message {
                             if let Err(e) = auto_approve_bridge_letmein(ft_for_recv.as_ref(), request).await {
                                 warn!("FaceTime auto-approve LetMeIn failed: {:?}", e);
@@ -5577,12 +5573,9 @@ pub async fn new_client(
                             callback.on_message(wrapped);
                         }
                     }
-                    Ok(Ok(None)) => {}
-                    Ok(Err(e)) => {
+                    Ok(None) => {}
+                    Err(e) => {
                         warn!("FaceTime handle error: {:?}", e);
-                    }
-                    Err(_) => {
-                        warn!("FaceTime handle panicked");
                     }
                 }
 
