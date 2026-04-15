@@ -2249,6 +2249,12 @@ pub struct WrappedShareProfileData {
 }
 
 #[derive(uniffi::Record, Clone)]
+pub struct WrappedStatusKitInviteHandle {
+    pub handle: String,
+    pub allowed_modes: Vec<String>,
+}
+
+#[derive(uniffi::Record, Clone)]
 pub struct WrappedPasswordEntryRef {
     pub id: String,
     pub group: Option<String>,
@@ -4086,12 +4092,10 @@ impl LoginSession {
                     .map(|r| r.calculate_rereg_time_s().map(|t| t > 0).unwrap_or(false))
                     .unwrap_or(false);
                 let has_required_services = wrapped.inner[0].registration.contains_key(MADRID_SERVICE.name)
-                    && wrapped.inner[0].registration.contains_key(MULTIPLEX_SERVICE.name)
-                    && wrapped.inner[0].registration.contains_key(FACETIME_SERVICE.name)
-                    && wrapped.inner[0].registration.contains_key(VIDEO_SERVICE.name);
+                    && wrapped.inner[0].registration.contains_key(MULTIPLEX_SERVICE.name);
 
                 if has_valid_registration && has_required_services {
-                    info!("Reusing existing registration (still valid for all required services, skipping register endpoint)");
+                    info!("Reusing existing registration (still valid for iMessage services, skipping register endpoint)");
                     let mut existing = wrapped.inner.clone();
                     existing[0].auth_keypair = fresh_user.auth_keypair.clone();
                     existing
@@ -4103,7 +4107,7 @@ impl LoginSession {
                     register(
                         &*os_config,
                         &*conn.state.read().await,
-                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
                         &mut users,
                         &identity,
                     ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
@@ -4117,7 +4121,7 @@ impl LoginSession {
                     register(
                         &*os_config,
                         &*conn.state.read().await,
-                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
                         &mut users,
                         &identity,
                     ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
@@ -4783,6 +4787,7 @@ impl WrappedPasswordsClient {
 #[derive(uniffi::Object)]
 pub struct WrappedStatusKitClient {
     inner: Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>,
+    interests: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -4790,6 +4795,55 @@ impl WrappedStatusKitClient {
     pub async fn export_state_json(&self) -> Result<String, WrappedError> {
         let state = self.inner.state.read().await;
         serialize_state_json(&*state)
+    }
+
+    pub async fn roll_keys(&self) {
+        self.inner.roll_keys().await;
+    }
+
+    pub async fn reset_keys(&self) {
+        self.inner.reset_keys().await;
+    }
+
+    pub async fn share_status(&self, active: bool, mode: Option<String>) -> Result<(), WrappedError> {
+        let status = if active {
+            rustpush::statuskit::StatusKitStatus::new_active()
+        } else {
+            rustpush::statuskit::StatusKitStatus::new_away(mode.ok_or(WrappedError::GenericError {
+                msg: "Mode is required when sharing away status".into(),
+            })?)
+        };
+        self.inner.share_status(&status).await?;
+        Ok(())
+    }
+
+    pub async fn invite_to_channel(
+        &self,
+        sender_handle: String,
+        handles: Vec<WrappedStatusKitInviteHandle>,
+    ) -> Result<(), WrappedError> {
+        let mapped = handles
+            .into_iter()
+            .map(|h| {
+                (
+                    h.handle,
+                    rustpush::statuskit::StatusKitPersonalConfig {
+                        allowed_modes: h.allowed_modes,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        self.inner.invite_to_channel(&sender_handle, mapped).await?;
+        Ok(())
+    }
+
+    pub async fn request_handles(&self, handles: Vec<String>) {
+        let token = self.inner.request_handles(&handles).await;
+        self.interests.lock().await.push(token);
+    }
+
+    pub async fn clear_interest_tokens(&self) {
+        self.interests.lock().await.clear();
     }
 
     /// Returns contact handles with a confirmed-live StatusKit channel — i.e.
@@ -4970,7 +5024,7 @@ pub async fn new_client(
             conn.clone(),
             users_clone,
             identity_clone,
-            &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+            &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
             "state/id_cache.plist".into(),
             config_clone.clone(),
             Box::new(move |updated_keys| {
@@ -6004,6 +6058,7 @@ impl Client {
                 self.client.identity.clone(),
             )
             .await,
+            interests: tokio::sync::Mutex::new(Vec::new()),
         });
 
         // Write path: re-acquire briefly to store result; handle race.

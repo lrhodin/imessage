@@ -1600,6 +1600,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_clear_interest_tokens(uniffiStatus)
+		})
+		if checksum != 24594 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_clear_interest_tokens: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_export_state_json(uniffiStatus)
 		})
 		if checksum != 3475 {
@@ -1614,6 +1623,51 @@ func uniffiCheckChecksums() {
 		if checksum != 9296 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_get_known_handles: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_invite_to_channel(uniffiStatus)
+		})
+		if checksum != 51991 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_invite_to_channel: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_request_handles(uniffiStatus)
+		})
+		if checksum != 17015 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_request_handles: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_reset_keys(uniffiStatus)
+		})
+		if checksum != 28788 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_reset_keys: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_roll_keys(uniffiStatus)
+		})
+		if checksum != 23793 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_roll_keys: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_share_status(uniffiStatus)
+		})
+		if checksum != 10053 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_share_status: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -5567,6 +5621,30 @@ type WrappedStatusKitClient struct {
 	ffiObject FfiObject
 }
 
+func (_self *WrappedStatusKitClient) ClearInterestTokens() {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedStatusKitClient")
+	defer _self.ffiObject.decrementPointer()
+	uniffiRustCallAsync(func(status *C.RustCallStatus) *C.void {
+		// rustFutureFunc
+		return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedstatuskitclient_clear_interest_tokens(
+			_pointer,
+			status,
+		))
+	},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *WrappedStatusKitClient) ExportStateJson() (string, error) {
 	_pointer := _self.ffiObject.incrementPointer("*WrappedStatusKitClient")
 	defer _self.ffiObject.decrementPointer()
@@ -5613,6 +5691,128 @@ func (_self *WrappedStatusKitClient) GetKnownHandles() []string {
 		FfiConverterSequenceStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *WrappedStatusKitClient) InviteToChannel(senderHandle string, handles []WrappedStatusKitInviteHandle) error {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedStatusKitClient")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedstatuskitclient_invite_to_channel(
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(senderHandle)), rustBufferToC(FfiConverterSequenceTypeWrappedStatusKitInviteHandleINSTANCE.Lower(handles)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *WrappedStatusKitClient) RequestHandles(handles []string) {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedStatusKitClient")
+	defer _self.ffiObject.decrementPointer()
+	uniffiRustCallAsync(func(status *C.RustCallStatus) *C.void {
+		// rustFutureFunc
+		return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedstatuskitclient_request_handles(
+			_pointer, rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(handles)),
+			status,
+		))
+	},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *WrappedStatusKitClient) ResetKeys() {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedStatusKitClient")
+	defer _self.ffiObject.decrementPointer()
+	uniffiRustCallAsync(func(status *C.RustCallStatus) *C.void {
+		// rustFutureFunc
+		return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedstatuskitclient_reset_keys(
+			_pointer,
+			status,
+		))
+	},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *WrappedStatusKitClient) RollKeys() {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedStatusKitClient")
+	defer _self.ffiObject.decrementPointer()
+	uniffiRustCallAsync(func(status *C.RustCallStatus) *C.void {
+		// rustFutureFunc
+		return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedstatuskitclient_roll_keys(
+			_pointer,
+			status,
+		))
+	},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *WrappedStatusKitClient) ShareStatus(active bool, mode *string) error {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedStatusKitClient")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedstatuskitclient_share_status(
+				_pointer, FfiConverterBoolINSTANCE.Lower(active), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(mode)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
 		})
 }
 
@@ -7176,6 +7376,46 @@ func (_ FfiDestroyerTypeWrappedShareProfileData) Destroy(value WrappedShareProfi
 	value.Destroy()
 }
 
+type WrappedStatusKitInviteHandle struct {
+	Handle       string
+	AllowedModes []string
+}
+
+func (r *WrappedStatusKitInviteHandle) Destroy() {
+	FfiDestroyerString{}.Destroy(r.Handle)
+	FfiDestroyerSequenceString{}.Destroy(r.AllowedModes)
+}
+
+type FfiConverterTypeWrappedStatusKitInviteHandle struct{}
+
+var FfiConverterTypeWrappedStatusKitInviteHandleINSTANCE = FfiConverterTypeWrappedStatusKitInviteHandle{}
+
+func (c FfiConverterTypeWrappedStatusKitInviteHandle) Lift(rb RustBufferI) WrappedStatusKitInviteHandle {
+	return LiftFromRustBuffer[WrappedStatusKitInviteHandle](c, rb)
+}
+
+func (c FfiConverterTypeWrappedStatusKitInviteHandle) Read(reader io.Reader) WrappedStatusKitInviteHandle {
+	return WrappedStatusKitInviteHandle{
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterSequenceStringINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeWrappedStatusKitInviteHandle) Lower(value WrappedStatusKitInviteHandle) RustBuffer {
+	return LowerIntoRustBuffer[WrappedStatusKitInviteHandle](c, value)
+}
+
+func (c FfiConverterTypeWrappedStatusKitInviteHandle) Write(writer io.Writer, value WrappedStatusKitInviteHandle) {
+	FfiConverterStringINSTANCE.Write(writer, value.Handle)
+	FfiConverterSequenceStringINSTANCE.Write(writer, value.AllowedModes)
+}
+
+type FfiDestroyerTypeWrappedStatusKitInviteHandle struct{}
+
+func (_ FfiDestroyerTypeWrappedStatusKitInviteHandle) Destroy(value WrappedStatusKitInviteHandle) {
+	value.Destroy()
+}
+
 type WrappedStickerExtension struct {
 	MsgWidth    float64
 	Rotation    float64
@@ -8393,6 +8633,49 @@ type FfiDestroyerSequenceTypeWrappedPasswordEntryRef struct{}
 func (FfiDestroyerSequenceTypeWrappedPasswordEntryRef) Destroy(sequence []WrappedPasswordEntryRef) {
 	for _, value := range sequence {
 		FfiDestroyerTypeWrappedPasswordEntryRef{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceTypeWrappedStatusKitInviteHandle struct{}
+
+var FfiConverterSequenceTypeWrappedStatusKitInviteHandleINSTANCE = FfiConverterSequenceTypeWrappedStatusKitInviteHandle{}
+
+func (c FfiConverterSequenceTypeWrappedStatusKitInviteHandle) Lift(rb RustBufferI) []WrappedStatusKitInviteHandle {
+	return LiftFromRustBuffer[[]WrappedStatusKitInviteHandle](c, rb)
+}
+
+func (c FfiConverterSequenceTypeWrappedStatusKitInviteHandle) Read(reader io.Reader) []WrappedStatusKitInviteHandle {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]WrappedStatusKitInviteHandle, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterTypeWrappedStatusKitInviteHandleINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceTypeWrappedStatusKitInviteHandle) Lower(value []WrappedStatusKitInviteHandle) RustBuffer {
+	return LowerIntoRustBuffer[[]WrappedStatusKitInviteHandle](c, value)
+}
+
+func (c FfiConverterSequenceTypeWrappedStatusKitInviteHandle) Write(writer io.Writer, value []WrappedStatusKitInviteHandle) {
+	if len(value) > math.MaxInt32 {
+		panic("[]WrappedStatusKitInviteHandle is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterTypeWrappedStatusKitInviteHandleINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceTypeWrappedStatusKitInviteHandle struct{}
+
+func (FfiDestroyerSequenceTypeWrappedStatusKitInviteHandle) Destroy(sequence []WrappedStatusKitInviteHandle) {
+	for _, value := range sequence {
+		FfiDestroyerTypeWrappedStatusKitInviteHandle{}.Destroy(value)
 	}
 }
 

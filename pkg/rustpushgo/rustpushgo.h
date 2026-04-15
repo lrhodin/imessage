@@ -992,6 +992,11 @@ void uniffi_rustpushgo_fn_free_wrappedstatuskitclient(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_clear_interest_tokens(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_export_state_json(
 	void* ptr,
 	RustCallStatus* out_status
@@ -999,6 +1004,36 @@ void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_export_state_json(
 
 void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_get_known_handles(
 	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_invite_to_channel(
+	void* ptr,
+	RustBuffer sender_handle,
+	RustBuffer handles,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_request_handles(
+	void* ptr,
+	RustBuffer handles,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_reset_keys(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_roll_keys(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedstatuskitclient_share_status(
+	void* ptr,
+	int8_t active,
+	RustBuffer mode,
 	RustCallStatus* out_status
 );
 
@@ -1981,11 +2016,35 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_unsubscrib
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_clear_interest_tokens(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_export_state_json(
 	RustCallStatus* out_status
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_get_known_handles(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_invite_to_channel(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_request_handles(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_reset_keys(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_roll_keys(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedstatuskitclient_share_status(
 	RustCallStatus* out_status
 );
 
