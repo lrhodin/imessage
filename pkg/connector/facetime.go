@@ -19,7 +19,6 @@ package connector
 import (
 	"bytes"
 	"context"
-	cryptoRand "crypto/rand"
 	"fmt"
 	"html"
 	"net/url"
@@ -52,7 +51,7 @@ var cmdFaceTime = &commands.FullHandler{
 	Func:    fnFaceTime,
 	Help: commands.HelpMeta{
 		Section:     HelpSectionFaceTime,
-		Description: "In a DM portal: call the contact — a join link is posted and their phone rings when you tap it. In the management room: print a shareable FaceTime link for your account.",
+		Description: "In a DM portal: post facetime:// and facetime-audio:// deep links that dial the contact from your own Apple ID when tapped on iOS / macOS. In the management room: print a shareable FaceTime web link for your account.",
 		Args:        "[handle]",
 	},
 	RequiresLogin: true,
@@ -252,20 +251,36 @@ func fnFaceTime(ce *commands.Event) {
 	ce.Reply("Failed to get FaceTime link: %v\n\nAvailable handles: `%s`", lastErr, strings.Join(handles, "`, `"))
 }
 
-// fnFaceTimeCallInPortal handles the portal-room variant of !facetime: create
-// a FaceTime session targeting the DM contact (which causes Apple to ring the
-// contact's phone immediately), fetch the web join link, append a display-name
-// slug so the browser join flow skips the "enter your name" prompt, and post
-// the link back to the caller as an m.notice. The caller taps the link, the
-// FaceTime web client opens with their name pre-filled, they tap Join, and
-// they're in the same session the contact is being rung for. The ringing and
-// joining happen in parallel — caller has a tight but reasonable window.
+// fnFaceTimeCallInPortal handles the portal-room variant of !facetime: post
+// facetime:// and facetime-audio:// deep links targeting the DM contact's bare
+// handle. Tapping on iOS / macOS hands off to the user's own FaceTime app,
+// which handles dial-out, ringing, and media entirely client-side using the
+// logged-in Apple ID — the bridge is not in the audio/video path at all.
 //
-// Returns true if the command was handled (reply already sent); false to fall
-// through to the link-only branch (group portal, no target handle, etc.).
+// Returns true if the command was handled; false to fall through to the
+// link-only branch (group portal, no usable target handle, etc.).
+//
+// Why not create_session + web join link?
+//
+// The bridge's Apple-ID login is headless: there is no FaceTime client on our
+// side that can stream AV. Calling ft.CreateSession registers bridge.handle
+// as a session member ("caller") and propps up the call via prop_up_conv,
+// causing Apple's servers to expect AV from that participant. When the callee
+// picks up they never see media from the caller slot, so even though the
+// caller's web tap and the callee's pickup both register as joins, the call
+// never actually connects — media stays locked on the never-arriving
+// bridge.handle participant. Upstream rustpush only unprop_convs the session
+// when a `temp:` (link pseud) joins (facetime.rs:1316), which is racy with
+// callee pickup and not exposed as an FFI the Go side can call directly.
+//
+// The facetime:// scheme sidesteps all of this: the user's own device is the
+// caller, Apple's servers never see a headless participant, and ringing only
+// happens once the user has actually tapped Call. Browser / Android clients
+// that don't register the facetime:// scheme should use !facetime-send, which
+// iMessages a plain FaceTime web link to the contact.
 func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 	portalID := string(ce.Portal.ID)
-	// Group portals fall through — we only ring a single target for now.
+	// Group portals fall through — direct-dial URLs only make sense for DMs.
 	if strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",") {
 		return false
 	}
@@ -278,10 +293,6 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 	client, isClient := login.Client.(*IMClient)
 	if !isClient || client == nil || client.client == nil {
 		ce.Reply("Bridge client not available.")
-		return true
-	}
-	if client.handle == "" {
-		ce.Reply("No iMessage handle configured. Please complete bridge setup first.")
 		return true
 	}
 
@@ -297,68 +308,26 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return false
 	}
 
-	ft, err := client.client.GetFacetimeClient()
-	if err != nil {
-		ce.Reply("Failed to initialize FaceTime client: %v", err)
-		return true
+	// Apple's facetime:// / facetime-audio:// schemes want the bare email or
+	// E.164 phone number, without the mailto: / tel: prefix.
+	bare := stripIdentifierPrefix(target)
+	if bare == "" {
+		return false
 	}
 
-	// Fresh group_id per call so sessions don't collide. Apple's wire format
-	// expects an uppercase v4 UUID.
-	sessionID, err := newFaceTimeSessionID()
-	if err != nil {
-		ce.Reply("Failed to generate session ID: %v", err)
-		return true
-	}
+	videoURL := "facetime://" + bare
+	audioURL := "facetime-audio://" + bare
 
-	// CreateSession fires an Invitation to the target (this IS the ring) via
-	// upstream's prop_up_conv(ring=true). Send-ack occasionally times out;
-	// retry once with the same session ID since the announcement is idempotent
-	// on group_id.
-	createErr := ft.CreateSession(sessionID, client.handle, []string{target})
-	if createErr != nil && isLikelyDeliveredSendTimeout(createErr) {
-		time.Sleep(500 * time.Millisecond)
-		createErr = ft.CreateSession(sessionID, client.handle, []string{target})
-	}
-	if createErr != nil {
-		ce.Reply("Failed to start FaceTime call: %v\n\nSend-ack timeouts usually clear on a second try — run `!im facetime` again.", createErr)
-		return true
-	}
-
-	link, linkErr := ft.GetSessionLink(sessionID)
-	if linkErr != nil && isLikelyDeliveredSendTimeout(linkErr) {
-		time.Sleep(500 * time.Millisecond)
-		link, linkErr = ft.GetSessionLink(sessionID)
-	}
-	if linkErr != nil {
-		ce.Reply("Call started and %s's phone is ringing, but the join link failed: %v", stripIdentifierPrefix(target), linkErr)
-		return true
-	}
-
-	recipient := stripIdentifierPrefix(target)
 	ce.Reply(
-		"[**📹 Join FaceTime call**](%s)\n\n"+
-			"%s's phone is ringing — tap the button to join the call.\n\n"+
-			"Raw link (if the button doesn't open): %s",
-		link, recipient, link,
+		"[**📹 FaceTime Video %s**](%s)\n\n"+
+			"[**📞 FaceTime Audio %s**](%s)\n\n"+
+			"Tapping a button opens FaceTime on iOS / macOS and dials %s directly from your own Apple ID — the bridge is not in the media path.\n\n"+
+			"**On browser / Android clients** where `facetime://` links aren't handled, use `!im facetime-send` instead — it iMessages a FaceTime web join link to %s.",
+		bare, videoURL,
+		bare, audioURL,
+		bare, bare,
 	)
 	return true
-}
-
-// newFaceTimeSessionID returns a random uppercase UUID v4 — Apple's FaceTime
-// session GUID format.
-func newFaceTimeSessionID() (string, error) {
-	var b [16]byte
-	if _, err := cryptoRand.Read(b[:]); err != nil {
-		return "", err
-	}
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return strings.ToUpper(fmt.Sprintf(
-		"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-		b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-		b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-	)), nil
 }
 
 // fnFaceTimeSend is the handler for !facetime-send. It generates a FaceTime
