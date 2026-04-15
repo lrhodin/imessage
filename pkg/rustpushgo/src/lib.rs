@@ -1690,6 +1690,9 @@ impl WrappedTokenProvider {
     /// Reads from our locally-cached MobileMe delegate plist bytes via generic
     /// `plist::Value` traversal (we can't name `MobileMeDelegateResponse` from
     /// outside the rustpush crate, so we use untyped plist parsing here).
+    /// Runs the bytes through `normalize_mme_delegate_dict` first so we look
+    /// up the URL on a single canonical shape regardless of which of the
+    /// three persisted shapes is on disk (see normalize comment for details).
     pub async fn get_contacts_url(&self) -> Result<Option<String>, WrappedError> {
         let bytes_guard = self.mme_delegate_bytes.lock().await;
         let Some(bytes) = bytes_guard.as_ref() else {
@@ -1698,11 +1701,11 @@ impl WrappedTokenProvider {
         let value: plist::Value = plist::from_bytes(bytes).map_err(|e| {
             WrappedError::GenericError { msg: format!("Invalid MobileMe delegate plist: {}", e) }
         })?;
-        // The serialized delegate is `{"tokens": {...}, "com.apple.mobileme": {...}}`.
-        // CardDAV URL lives at `com.apple.mobileme/com.apple.Dataclass.Contacts/url`.
-        let url = value
+        let normalized = normalize_mme_delegate_dict(value);
+        // After normalize: `{tokens, config: {com.apple.Dataclass.Contacts: {url}, ...}}`.
+        let url = normalized
             .as_dictionary()
-            .and_then(|d| d.get("com.apple.mobileme"))
+            .and_then(|d| d.get("config"))
             .and_then(|v| v.as_dictionary())
             .and_then(|d| d.get("com.apple.Dataclass.Contacts"))
             .and_then(|v| v.as_dictionary())
