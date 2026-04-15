@@ -47,6 +47,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
 	"maunium.net/go/mautrix/pushrules"
 
@@ -2879,18 +2880,22 @@ func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.W
 		}
 	}
 
-	notice := "📞 Incoming FaceTime call from " + name + "."
+	// Build the notice as markdown so the join link renders as a tappable
+	// anchor in the formatted_body. Plain-URL notices aren't autolinked by
+	// every Matrix client; wrapping the URL in [text](url) guarantees an
+	// <a> tag reaches the client.
+	noticeMarkdown := "📞 **Incoming FaceTime call from " + name + ".**"
 	if link != "" {
-		notice += "\n\n" + link
+		noticeMarkdown += "\n\n[**Answer FaceTime call**](" + link + ")"
+		noticeMarkdown += "\n\nRaw link (if the button above doesn't open): " + link
 	}
 
 	sendNotice := func(roomID id.RoomID) error {
+		content := format.RenderMarkdown(noticeMarkdown, true, false)
+		content.MsgType = event.MsgNotice
+		content.Mentions = &event.Mentions{}
 		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
-			Parsed: &event.MessageEventContent{
-				MsgType:  event.MsgNotice,
-				Body:     notice,
-				Mentions: &event.Mentions{},
-			},
+			Parsed: &content,
 		}, nil)
 		return sendErr
 	}
