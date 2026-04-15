@@ -4656,17 +4656,9 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		return fmt.Errorf("message retraction is not supported for SMS conversations")
 	}
 
-	// Strip _attN suffix and recover the iMessage part index. Multi-part
-	// messages (text + URL preview, text + attachment) are stored under
-	// IDs like "UUID_att1"; rustpush's unsend wants the bare UUID with a
-	// separate part index. Sending the suffixed string as the tuuid means
-	// the recipient finds no matching GUID and silently drops the unsend.
-	// Same pattern as HandleMatrixReaction and HandleMatrixReadReceipt.
-	targetGUID, targetPart := extractTapbackTarget(string(msg.TargetMessage.ID))
-
 	// Track outbound unsend so we can suppress the APNs echo.
-	c.trackOutboundUnsend(targetGUID)
-	_, err := c.client.SendUnsend(conv, targetGUID, targetPart, c.handle)
+	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
+	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
 	// while preserving the UUID for echo detection.
