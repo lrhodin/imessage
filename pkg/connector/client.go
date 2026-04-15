@@ -8322,8 +8322,24 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		participants = []string{sendTo}
 	}
 
+	// Resolve the canonical chat group_id for this DM from CloudKit-synced
+	// data (cloud_chat). This is the group ID Apple's recipient device
+	// already knows about for the chat thread. Without it, prepare_send
+	// in upstream rustpush generates a fresh random sender_guid per call,
+	// and the recipient can't match operations like unsend back to the
+	// original chat thread (edits slip through because the recipient has
+	// visible body content to apply regardless). Same purpose as the
+	// imGroupGuids cache for groups (client.go:247-248).
+	var senderGuid *string
+	if c.cloudStore != nil {
+		if g := c.cloudStore.getGroupIDForPortalID(context.Background(), portalID); g != "" {
+			senderGuid = &g
+		}
+	}
+
 	return rustpushgo.WrappedConversation{
 		Participants: participants,
+		SenderGuid:   senderGuid,
 		IsSms:        isSms,
 	}
 }
