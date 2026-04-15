@@ -1242,7 +1242,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_register_pending_ring(uniffiStatus)
 		})
-		if checksum != 3908 {
+		if checksum != 44246 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_register_pending_ring: UniFFI API checksum mismatch")
 		}
@@ -4460,14 +4460,14 @@ func (_self *WrappedFaceTimeClient) ListDelegatedLetmeinRequests() []WrappedLetM
 		})
 }
 
-func (_self *WrappedFaceTimeClient) RegisterPendingRing(sessionId string, targets []string, ttlSecs uint64) error {
+func (_self *WrappedFaceTimeClient) RegisterPendingRing(sessionId string, callerHandle string, targets []string, ttlSecs uint64) error {
 	_pointer := _self.ffiObject.incrementPointer("*WrappedFaceTimeClient")
 	defer _self.ffiObject.decrementPointer()
 	return uniffiRustCallAsyncWithError(
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedfacetimeclient_register_pending_ring(
-				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(sessionId)), rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(targets)), FfiConverterUint64INSTANCE.Lower(ttlSecs),
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(sessionId)), rustBufferToC(FfiConverterStringINSTANCE.Lower(callerHandle)), rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(targets)), FfiConverterUint64INSTANCE.Lower(ttlSecs),
 				status,
 			))
 		},

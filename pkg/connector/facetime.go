@@ -332,17 +332,18 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return true
 	}
 
-	if err := ft.RegisterPendingRing(sessionID, []string{target}, 60); err != nil {
+	if err := ft.RegisterPendingRing(sessionID, client.handle, []string{target}, 60); err != nil {
 		ce.Reply("Session and link are ready, but ring registration failed: %v", err)
 		return true
 	}
 
 	recipient := stripIdentifierPrefix(target)
 	ce.Reply(
-		"FaceTime call ready: %s\n\n"+
-			"⚠️ **Tapping this link will ring %s's phone.** The ring fires the moment you join — so open the link when you're ready to be on camera. "+
-			"If you don't tap within 60 seconds the session is dropped and nothing rings.",
-		link, recipient,
+		"[**Join FaceTime call**](%s)\n\n"+
+			"⚠️ **Tapping this link will ring %s's phone.** The ring only fires once you've actually joined the session — so open the link when you're ready to be on camera. "+
+			"If you don't tap within 60 seconds the session is dropped and nothing rings.\n\n"+
+			"Raw link (if the button above doesn't open): %s",
+		link, recipient, link,
 	)
 	return true
 }

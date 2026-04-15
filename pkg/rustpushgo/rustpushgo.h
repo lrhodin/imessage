@@ -702,6 +702,7 @@ void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_list_delegated_letmein_r
 void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_register_pending_ring(
 	void* ptr,
 	RustBuffer session_id,
+	RustBuffer caller_handle,
 	RustBuffer targets,
 	uint64_t ttl_secs,
 	RustCallStatus* out_status
