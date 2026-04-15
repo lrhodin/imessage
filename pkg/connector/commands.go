@@ -38,12 +38,75 @@ import (
 //
 //	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands()...)
 func BridgeCommands() []*commands.FullHandler {
-	return []*commands.FullHandler{
+	cmds := []*commands.FullHandler{
 		cmdRestoreChat,
 		cmdRestoreDebug,
 		cmdMsgDebug,
 		cmdContacts,
+		// Apple service integrations
+		cmdFaceTime,
+		cmdFaceTimeSend,
+		cmdFaceTimeClear,
+		cmdFaceTimeState,
+		cmdFaceTimeSessionLink,
+		cmdFaceTimeUseLink,
+		cmdFaceTimeDeleteLink,
+		cmdFaceTimeLetMeIn,
+		cmdFaceTimeLetMeInApprove,
+		cmdFaceTimeLetMeInDeny,
+		cmdFaceTimeCreateSession,
+		cmdFaceTimeRing,
+		cmdFaceTimeAddMembers,
+		cmdFaceTimeRemoveMembers,
+		cmdFindMy,
+		cmdFindMySyncItems,
+		cmdFindMyAcceptShare,
+		cmdFindMyDeleteItem,
+		cmdFindMyRenameBeacon,
+		cmdFindMyStateJSON,
+		cmdFindMyStateBytes,
+		cmdFindMyDevices,
+		cmdFindMyFriends,
+		cmdFindMyFriendsImport,
+		cmdSharedAlbums,
+		cmdSharedPhotos,
+		cmdSharedSubscribe,
+		cmdSharedSubscribeToken,
+		cmdSharedUnsubscribe,
+		cmdSharedState,
+		cmdSharedAssetsJSON,
+		cmdSharedDeleteAssets,
+		cmdSharedDownloadFile,
+		cmdSharedCreateAssetB64,
+		cmdStatuskitState,
+		cmdStatuskitConfigureAPS,
+		cmdStatuskitEnsureChannel,
+		cmdStatuskitClearInterest,
+		cmdStatuskitRequestHandles,
+		cmdStatuskitRequestChannels,
+		cmdStatuskitUpdateChannels,
+		cmdStatuskitInviteToChannel,
+		cmdStatuskitResetKeys,
+		cmdStatuskitRollKeys,
+		cmdStatuskitShare,
 	}
+	for _, cmd := range cmds {
+		ensureBangAlias(cmd)
+	}
+	return cmds
+}
+
+func ensureBangAlias(cmd *commands.FullHandler) {
+	if cmd == nil || cmd.Name == "" {
+		return
+	}
+	bangName := "!" + cmd.Name
+	for _, alias := range cmd.Aliases {
+		if alias == bangName {
+			return
+		}
+	}
+	cmd.Aliases = append(cmd.Aliases, bangName)
 }
 
 // cmdRestoreChat lists deleted rooms, then waits for the user to reply with
