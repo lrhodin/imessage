@@ -5037,6 +5037,45 @@ pub async fn new_client(
         .await,
     );
 
+    // Best-effort FaceTime + Video IDS service registration.
+    //
+    // These are registered *outside* the IdentityResource's ResourceManager
+    // generate loop. If we included them in the services list passed to
+    // IMClient::new above, a non-zero status from Apple for either service
+    // (status 6005 on accounts where FaceTime isn't eligible — phone-only
+    // logins in some regions, etc.) would cause upstream's
+    // `register()` to fail, `IdentityResource::generate` to wrap the error
+    // in `PushError::DoNotRetry` (identity_manager.rs:372-375), and the
+    // whole IdentityResource to transition permanently to
+    // `ResourceState::Closed`. That closes the *shared* identity handle
+    // used by iMessage send too, so every subsequent
+    // `identity.cache_keys` / `send_message` fails with
+    // "Do not retry Resource has been closed!" until a fresh Client is
+    // constructed — which a restart cannot provide because the same
+    // services list is retried every boot.
+    //
+    // Registering here in a best-effort block lets FaceTime registration
+    // fail silently without killing iMessage. If it succeeds, FaceTime
+    // pushes work; if it doesn't, FaceTime is unavailable but the rest of
+    // the bridge keeps functioning.
+    {
+        let mut users_lock = client.identity.resource.users.write().await;
+        let aps_state_guard = conn.state.read().await;
+        match register(
+            config_clone.as_ref(),
+            &*aps_state_guard,
+            &[&FACETIME_SERVICE, &VIDEO_SERVICE],
+            &mut *users_lock,
+            &client.identity.resource.identity,
+        ).await {
+            Ok(()) => info!("Best-effort FaceTime/Video IDS registration succeeded"),
+            Err(e) => warn!(
+                "Best-effort FaceTime/Video IDS registration failed (iMessage unaffected): {:?}",
+                e,
+            ),
+        }
+    }
+
     // Start receive loop.
     //
     // Architecture: two tasks connected by an unbounded mpsc channel.
