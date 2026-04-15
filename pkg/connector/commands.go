@@ -90,23 +90,7 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdStatuskitRollKeys,
 		cmdStatuskitShare,
 	}
-	for _, cmd := range cmds {
-		ensureBangAlias(cmd)
-	}
 	return cmds
-}
-
-func ensureBangAlias(cmd *commands.FullHandler) {
-	if cmd == nil || cmd.Name == "" {
-		return
-	}
-	bangName := "!" + cmd.Name
-	for _, alias := range cmd.Aliases {
-		if alias == bangName {
-			return
-		}
-	}
-	cmd.Aliases = append(cmd.Aliases, bangName)
 }
 
 // cmdRestoreChat lists deleted rooms, then waits for the user to reply with
