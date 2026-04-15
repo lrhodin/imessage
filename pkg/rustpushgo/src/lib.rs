@@ -2828,6 +2828,19 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
     Some(MessageParts(parts))
 }
 
+/// Lift a ShareProfileMessage onto a WrappedMessage's share-profile keys.
+/// Used by both the standalone Message::ShareProfile / UpdateProfile arms
+/// and the embedded_profile field on NormalMessage / ReactMessage —
+/// iOS partners send profile keys piggybacked on regular text messages
+/// when Name & Photo Sharing is enabled, so the standalone control message
+/// alone is not sufficient to discover all shared profiles.
+fn populate_share_profile_keys(w: &mut WrappedMessage, profile: &rustpush::ShareProfileMessage) {
+    w.is_share_profile = true;
+    w.share_profile_record_key = Some(profile.cloud_kit_record_key.clone());
+    w.share_profile_decryption_key = Some(profile.cloud_kit_decryption_record_key.clone());
+    w.share_profile_has_poster = profile.poster.is_some();
+}
+
 fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
     let conv = msg.conversation.as_ref();
 
@@ -2926,6 +2939,12 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.reply_guid = normal.reply_guid.clone();
             w.reply_part = normal.reply_part.clone();
             w.is_sms = matches!(normal.service, MessageType::SMS { .. });
+            // iOS piggybacks Name & Photo Sharing keys on regular text
+            // messages from contacts who have sharing enabled; lift them so
+            // the receive loop's inline download still fires.
+            if let Some(profile) = &normal.embedded_profile {
+                populate_share_profile_keys(&mut w, profile);
+            }
 
             for indexed_part in &normal.parts.0 {
                 if let MessagePart::Attachment(att) = &indexed_part.part {
@@ -3048,6 +3067,11 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                     w.tapback_type = Some(7);
                 }
             }
+            // Reactions can also carry a piggybacked profile (same pattern
+            // as text messages). Surface it for inline download.
+            if let Some(profile) = &react.embedded_profile {
+                populate_share_profile_keys(&mut w, profile);
+            }
         }
         Message::Edit(edit) => {
             w.is_edit = true;
@@ -3131,19 +3155,13 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.is_notify_anyways = true;
         }
         Message::ShareProfile(profile) => {
-            w.is_share_profile = true;
-            w.share_profile_record_key = Some(profile.cloud_kit_record_key.clone());
-            w.share_profile_decryption_key = Some(profile.cloud_kit_decryption_record_key.clone());
-            w.share_profile_has_poster = profile.poster.is_some();
+            populate_share_profile_keys(&mut w, profile);
         }
         Message::UpdateProfile(update) => {
             w.is_update_profile = true;
             w.update_profile_share_contacts = Some(update.share_contacts);
             if let Some(profile) = &update.profile {
-                w.is_share_profile = true;
-                w.share_profile_record_key = Some(profile.cloud_kit_record_key.clone());
-                w.share_profile_decryption_key = Some(profile.cloud_kit_decryption_record_key.clone());
-                w.share_profile_has_poster = profile.poster.is_some();
+                populate_share_profile_keys(&mut w, profile);
             }
         }
         Message::UpdateProfileSharing(update) => {
@@ -5463,16 +5481,33 @@ impl Client {
     /// message so a Go-side periodic re-fetch can recover later.
     async fn populate_inline_share_profile(
         &self,
-        msg_inst: &MessageInst,
+        _msg_inst: &MessageInst,
         wrapped: &mut WrappedMessage,
     ) {
-        let share_msg = match &msg_inst.message {
-            Message::ShareProfile(p) => p.clone(),
-            Message::UpdateProfile(u) => match &u.profile {
-                Some(p) => p.clone(),
-                None => return,
-            },
+        // Drive off the wrapped fields rather than re-matching on
+        // msg_inst.message — populate_share_profile_keys already pulled the
+        // keys out of the standalone (Message::ShareProfile / UpdateProfile)
+        // and embedded (NormalMessage.embedded_profile / React.embedded_profile)
+        // cases, so by the time we get here the keys are uniformly available.
+        let (record_key, decryption_key, has_poster) = match (
+            wrapped.share_profile_record_key.as_ref(),
+            wrapped.share_profile_decryption_key.as_ref(),
+        ) {
+            (Some(rk), Some(dk)) => (rk.clone(), dk.clone(), wrapped.share_profile_has_poster),
             _ => return,
+        };
+        let share_msg = rustpush::ShareProfileMessage {
+            cloud_kit_record_key: record_key,
+            cloud_kit_decryption_record_key: decryption_key,
+            poster: if has_poster {
+                Some(rustpush::SharedPoster {
+                    low_res_wallpaper_tag: vec![],
+                    wallpaper_tag: vec![],
+                    message_tag: vec![],
+                })
+            } else {
+                None
+            },
         };
 
         let key_prefix: String = share_msg.cloud_kit_record_key.chars().take(8).collect();

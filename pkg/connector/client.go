@@ -1693,7 +1693,15 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	}
 	if msg.IsShareProfile && msg.Sender != nil && *msg.Sender != "" {
 		go c.handleSharedProfile(log, msg)
-		return
+		// Only swallow the message when it's a standalone profile-sharing
+		// control event (Message::ShareProfile / Message::UpdateProfile).
+		// iOS also piggybacks profile keys on regular text messages and
+		// reactions via the embedded_profile field — those still need to
+		// flow through the buffer so the user actually sees the message.
+		isStandalone := msg.Text == nil && !msg.IsTapback && !msg.IsEdit && !msg.IsUnsend
+		if isStandalone {
+			return
+		}
 	}
 	// Profile-sharing control messages without an embedded CloudKit record:
 	// log only so we can see whether peers are flipping share_contacts /
