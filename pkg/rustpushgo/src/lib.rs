@@ -5058,6 +5058,181 @@ pub async fn new_client(
                 // called; otherwise falls through.
                 let sk_opt = sk_for_recv.read().await.clone();
                 if let Some(sk) = sk_opt {
+                    // Wrapper-only workaround for upstream silent-drop.
+                    // statuskit.rs:719 destructures payload as Value::Data and
+                    // returns Ok(None) for keysharing-topic notifications whose
+                    // payload arrived as Value::Dictionary — which is the typical
+                    // case because aps.rs:880 greedily plist-decodes payload bytes
+                    // into a Dictionary before reaching handle(). Without this
+                    // intercept, peer keysharing replies are dropped at the
+                    // destructure and state.keys never grows.
+                    //
+                    // We bypass handle() for that exact shape (keysharing topic +
+                    // non-Data payload), call identity.receive_message directly
+                    // (which accepts any Value variant via plist::from_value at
+                    // identity_manager.rs:771), and construct a
+                    // StatusKitSharedDevice via serde with a built Dictionary —
+                    // mirroring the construction at upstream statuskit.rs:776–781
+                    // but routed through Deserialize so the private fields stay
+                    // private. The device is inserted into the public
+                    // sk.state.keys map and persisted via the same code path
+                    // upstream's update_state callback uses.
+                    let mut workaround_consumed = false;
+                    if let rustpush::APSMessage::Notification {
+                        topic: msg_topic,
+                        payload,
+                        ..
+                    } = &msg
+                    {
+                        let keysharing_topic_hash: [u8; 20] = openssl::sha::sha1(
+                            "com.apple.private.alloy.status.keysharing".as_bytes(),
+                        );
+                        if *msg_topic == keysharing_topic_hash
+                            && !matches!(payload, plist::Value::Data(_))
+                        {
+                            let result: Result<bool, String> = async {
+                                use prost::Message as _;
+                                let recv = sk
+                                    .identity
+                                    .receive_message(
+                                        msg.clone(),
+                                        &["com.apple.private.alloy.status.keysharing"],
+                                    )
+                                    .await
+                                    .map_err(|e| format!("identity.receive_message: {e}"))?;
+                                let Some(recv) = recv else {
+                                    return Ok::<bool, String>(false);
+                                };
+                                let Some(message_unenc) = recv.message_unenc else {
+                                    return Ok(false);
+                                };
+                                let Some(sender) = recv.sender else {
+                                    return Ok(false);
+                                };
+
+                                #[derive(serde::Deserialize)]
+                                struct LocalRawShared {
+                                    #[serde(rename = "r")]
+                                    keys: String,
+                                    #[serde(rename = "p")]
+                                    personal_config: String,
+                                    #[serde(rename = "c")]
+                                    channel: String,
+                                }
+                                let parsed: LocalRawShared = message_unenc
+                                    .plist()
+                                    .map_err(|e| format!("plist parse raw shared: {e}"))?;
+
+                                let keys_bytes = BASE64_STANDARD
+                                    .decode(&parsed.keys)
+                                    .map_err(|e| format!("keys base64: {e}"))?;
+                                let pc_bytes = BASE64_STANDARD
+                                    .decode(&parsed.personal_config)
+                                    .map_err(|e| format!("personal_config base64: {e}"))?;
+
+                                let share_message =
+                                    rustpush::statuskit::statuskitp::SharedMessage::decode(
+                                        std::io::Cursor::new(keys_bytes),
+                                    )
+                                    .map_err(|e| format!("SharedMessage decode: {e}"))?;
+
+                                let sig_key_arr: [u8; 32] = share_message
+                                    .sig_key
+                                    .clone()
+                                    .try_into()
+                                    .map_err(|v: Vec<u8>| {
+                                        format!("sig_key length {} != 32", v.len())
+                                    })?;
+                                let compact = rustpush::CompactECKey::<openssl::pkey::Public>::decompress(sig_key_arr);
+                                let der_bytes = compact
+                                    .public_key_to_der()
+                                    .map_err(|e| format!("public_key_to_der: {e}"))?;
+
+                                let shared_keys =
+                                    share_message.keys.unwrap_or_default().keys;
+                                if shared_keys.is_empty() {
+                                    return Err("share_message.keys.keys is empty".into());
+                                }
+                                let key_data_array: Vec<plist::Value> = shared_keys
+                                    .iter()
+                                    .map(|k| plist::Value::Data(k.encode_to_vec()))
+                                    .collect();
+                                let key_count = key_data_array.len();
+
+                                let pc_value: plist::Value = plist::from_bytes(&pc_bytes)
+                                    .map_err(|e| format!("personal_config plist: {e}"))?;
+
+                                let mut dict = plist::Dictionary::new();
+                                dict.insert(
+                                    "from".into(),
+                                    plist::Value::String(sender.clone()),
+                                );
+                                dict.insert(
+                                    "signature".into(),
+                                    plist::Value::Data(der_bytes),
+                                );
+                                dict.insert(
+                                    "keys".into(),
+                                    plist::Value::Array(key_data_array),
+                                );
+                                dict.insert("personal_config".into(), pc_value);
+
+                                let device: rustpush::statuskit::StatusKitSharedDevice =
+                                    plist::from_value(&plist::Value::Dictionary(dict))
+                                        .map_err(|e| {
+                                            format!("StatusKitSharedDevice deserialize: {e}")
+                                        })?;
+
+                                let mut state_w = sk.state.write().await;
+                                let prev = state_w
+                                    .keys
+                                    .insert(parsed.channel.clone(), device);
+                                let total = state_w.keys.len();
+                                drop(state_w);
+
+                                let action = if prev.is_some() { "replaced" } else { "added" };
+                                let state_path =
+                                    subsystem_state_path("statuskit-state.plist");
+                                persist_plist_state(
+                                    &state_path,
+                                    &*sk.state.read().await,
+                                );
+
+                                info!(
+                                    "StatusKit workaround {action} channel for {} (keys_in_msg={}, state.keys total={}) — Dictionary-payload bypass",
+                                    sender, key_count, total
+                                );
+                                if let Some(cb) =
+                                    status_cb_for_recv.read().await.as_ref()
+                                {
+                                    cb.on_keys_received();
+                                }
+                                Ok(true)
+                            }
+                            .await;
+
+                            match result {
+                                Ok(true) => {
+                                    workaround_consumed = true;
+                                }
+                                Ok(false) => {
+                                    debug!("StatusKit workaround: receive_message returned None or partial fields, falling through");
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "StatusKit workaround failed: {} — falling back to upstream handle()",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if workaround_consumed {
+                        pending.fetch_sub(1, Ordering::Relaxed);
+                        continue;
+                    }
+
                     // Extract the APNs topic before spawning the thread so we can
                     // check it later for key-sharing detection (msg is moved into
                     // the spawned thread and unavailable afterwards).
