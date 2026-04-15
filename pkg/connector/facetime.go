@@ -380,6 +380,15 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return true
 	}
 
+	// Append &n=<handle> so Apple's web join page pre-populates the display
+	// name field — caller hits Join instead of typing a name. Previous
+	// attempt (commit f168c0d) used url.QueryEscape, which percent-encodes +
+	// to %2B; Apple's web FT fragment parser appears to display the encoded
+	// form literally instead of decoding, so callers saw "%2B18454996730"
+	// (looks like Unicode gibberish) instead of "+18454996730". Send the
+	// bare handle without percent-encoding — + is a legal fragment char.
+	webLink = appendFaceTimeLinkName(webLink, stripIdentifierPrefix(client.handle))
+
 	bare := stripIdentifierPrefix(target)
 
 	// One URL for everyone. facetime.apple.com is an Apple Universal Link:
@@ -395,6 +404,35 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		bare, webLink, bare, webLink,
 	)
 	return true
+}
+
+// appendFaceTimeLinkName appends &n=<name> to a FaceTime web join link so
+// Apple's join page pre-fills the display-name field. The URL fragment
+// (everything after #) is parsed by Apple's JS, not the server. Use a
+// minimal escape that only percent-encodes characters that would actually
+// break fragment parsing (#, &) — most observable evidence suggests Apple's
+// fragment parser shows percent-encoded sequences literally rather than
+// decoding them, so over-encoding (e.g. + → %2B from url.QueryEscape) is
+// what produces the gibberish display.
+func appendFaceTimeLinkName(link, name string) string {
+	if name == "" {
+		return link
+	}
+	var b strings.Builder
+	b.Grow(len(name))
+	for _, r := range name {
+		switch r {
+		case '#', '&', '%':
+			fmt.Fprintf(&b, "%%%02X", r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	encoded := b.String()
+	if strings.Contains(link, "#") {
+		return link + "&n=" + encoded
+	}
+	return link + "#n=" + encoded
 }
 
 // newFaceTimeSessionID returns a random uppercase UUID v4 — Apple's FaceTime
