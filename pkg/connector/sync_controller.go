@@ -830,11 +830,20 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 		log.Warn().Err(err).Msg("StatusKit invite: channel not ready (will retry on next restart)")
 		return
 	}
-	if err := c.client.InviteToStatusSharing(c.handle, handles); err != nil {
-		log.Warn().Err(err).Int("count", len(handles)).Msg("StatusKit invite failed")
-	} else {
-		log.Info().Int("count", len(handles)).Msg("Sent StatusKit key invite to known ghosts")
+	senders := c.allHandles
+	if len(senders) == 0 && c.handle != "" {
+		senders = []string{c.handle}
 	}
+	var okCount, failCount int
+	for _, sender := range senders {
+		if err := c.client.InviteToStatusSharing(sender, handles); err != nil {
+			failCount++
+			log.Warn().Err(err).Str("sender", sender).Int("count", len(handles)).Msg("StatusKit invite failed for sender")
+		} else {
+			okCount++
+		}
+	}
+	log.Info().Int("count", len(handles)).Int("senders_ok", okCount).Int("senders_failed", failCount).Strs("senders", senders).Msg("Sent StatusKit key invites from all registered handles")
 }
 
 // statusKitLastInviteKeyPrefix is the KV store key prefix for per-ghost
@@ -934,8 +943,20 @@ func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
 		log.Warn().Err(err).Msg("StatusKit re-invite: channel not ready")
 		return
 	}
-	if err := c.client.InviteToStatusSharing(c.handle, pending); err != nil {
-		log.Warn().Err(err).Int("count", len(pending)).Msg("StatusKit re-invite: failed")
+	senders := c.allHandles
+	if len(senders) == 0 && c.handle != "" {
+		senders = []string{c.handle}
+	}
+	var okCount, failCount int
+	for _, sender := range senders {
+		if err := c.client.InviteToStatusSharing(sender, pending); err != nil {
+			failCount++
+			log.Warn().Err(err).Str("sender", sender).Int("count", len(pending)).Msg("StatusKit re-invite: failed for sender")
+		} else {
+			okCount++
+		}
+	}
+	if okCount == 0 {
 		return
 	}
 
