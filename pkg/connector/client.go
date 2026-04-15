@@ -2879,6 +2879,13 @@ func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.W
 			}
 		}
 	}
+	if link != "" && c.handle != "" {
+		// Pre-fill the join page's display-name field with the bridge owner's
+		// handle — same transformation as the outbound !im facetime flow at
+		// facetime.go:391. Without this the user lands on the web FT join
+		// page with the name field blank and has to type it themselves.
+		link = appendFaceTimeLinkName(link, stripIdentifierPrefix(c.handle))
+	}
 
 	// Build the notice as markdown so the join link renders as a tappable
 	// anchor in the formatted_body. Plain-URL notices aren't autolinked by

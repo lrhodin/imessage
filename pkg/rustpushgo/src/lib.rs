@@ -2963,81 +2963,6 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
     }
 }
 
-// create_session_skip_own_devices mirrors upstream's FTClient::create_session
-// but holds the caller's own handle out of `session.members` during the
-// prop_up_conv ring fanout, then restores it. Without this, the wire ring
-// fans out to every device under the caller's handle (Mac, iPad, etc.) and
-// Continuity auto-answers — see WrappedFaceTimeClient::create_session for
-// the long writeup.
-async fn create_session_skip_own_devices(
-    facetime: &rustpush::facetime::FTClient,
-    group_id: String,
-    handle: String,
-    participants: &[String],
-) -> Result<(), rustpush::PushError> {
-    use rustpush::facetime::{FTMember, FTMode, FTSession};
-    use std::collections::{HashMap, HashSet};
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let members: HashSet<FTMember> = participants
-        .iter()
-        .chain(std::iter::once(&handle))
-        .map(|p| FTMember { nickname: None, handle: p.clone() })
-        .collect();
-
-    let session = FTSession {
-        group_id: group_id.clone(),
-        my_handles: vec![handle.clone()],
-        participants: HashMap::new(),
-        link: None,
-        members,
-        report_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
-        start_time: Some(now_ms),
-        last_rekey: None,
-        is_propped: false,
-        is_ringing_inaccurate: true,
-        mode: Some(FTMode::Outgoing),
-        recent_member_adds: HashMap::new(),
-    };
-
-    let mut state = facetime.state.write().await;
-    state.sessions.insert(group_id.clone(), session);
-    let session = state.sessions.get_mut(&group_id).expect("just inserted");
-
-    facetime.ensure_allocations(session, &[]).await?;
-
-    let own_member = FTMember { nickname: None, handle: handle.clone() };
-    let own_was_present = session.members.remove(&own_member);
-
-    let prop_result = facetime.prop_up_conv(session, true).await;
-
-    // Log the wire-fanout target list (session.members at this point excludes
-    // the owner's own handle — see strip/restore above) plus the two session
-    // flags the letmein approver keys on. If wife doesn't ring, this tells us
-    // whether prop_up_conv even attempted to reach her target vs. succeeded
-    // at the wire but got dropped on Apple's push stack.
-    let targets: Vec<String> = session.members.iter().map(|m| m.handle.clone()).collect();
-    info!(
-        "FaceTime create_session: group={} own={} prop_ok={} ring_targets={:?} is_propped={} is_ringing_inaccurate={}",
-        group_id,
-        handle,
-        prop_result.is_ok(),
-        targets,
-        session.is_propped,
-        session.is_ringing_inaccurate,
-    );
-
-    if own_was_present {
-        session.members.insert(own_member);
-    }
-
-    prop_result
-}
-
 async fn auto_approve_bridge_letmein(
     facetime: &rustpush::facetime::FTClient,
     request: &rustpush::facetime::LetMeInRequest,
@@ -3100,10 +3025,12 @@ async fn auto_approve_bridge_letmein(
         group
     } else {
         let group = uuid::Uuid::new_v4().to_string().to_uppercase();
-        // Use the strip-own-devices wrapper so the cold-start ring on the
-        // newly-created session doesn't fan out to the bridge owner's other
-        // Apple devices (Mac, iPad).
-        create_session_skip_own_devices(facetime, group.clone(), link_handle.clone(), &[request.requestor.clone()])
+        // Cold-start fallback: the tap request doesn't map to any known
+        // session via linked/member/ringing. Call upstream directly — the
+        // strip-own-devices wrapper caused the callee not to ring (see
+        // WrappedFaceTimeClient::create_session for the full writeup).
+        facetime
+            .create_session(group.clone(), link_handle.clone(), &[request.requestor.clone()])
             .await?;
         group
     };
@@ -4729,16 +4656,32 @@ impl WrappedFaceTimeClient {
     }
 
     pub async fn create_session(&self, group_id: String, handle: String, participants: Vec<String>) -> Result<(), WrappedError> {
-        // See create_session_skip_own_devices for the why. tl;dr: upstream's
-        // FTClient::create_session chains the caller's handle into
-        // session.members and prop_up_conv fans the wire ring to every device
-        // under each member's handle — Mac picks up via Continuity. The
-        // helper mirrors the upstream sequence but holds the caller's handle
-        // out of members during the ring fanout.
-        create_session_skip_own_devices(&self.inner, group_id, handle, &participants)
+        // Call upstream directly. We previously wrapped this with a
+        // strip-own-from-session.members pattern to stop the wire ring from
+        // fanning out to the owner's other Apple devices (Mac, iPad). The
+        // motivation was tap-routing fragility: when the Mac auto-answered
+        // via Continuity, it sent RespondedElsewhere back to the bridge,
+        // which cleared is_ringing_inaccurate, which broke the
+        // auto_approve_bridge_letmein ringing-group fallback for link taps.
+        //
+        // bind_bridge_link_to_session (added alongside this change) pins the
+        // bridge FaceTime link's session_link to the outgoing session the
+        // moment it's created, so the letmein approver's linked_group branch
+        // matches deterministically regardless of is_ringing_inaccurate. The
+        // strip's original justification is moot.
+        //
+        // Empirically the strip also correlated with the callee not ringing
+        // (own was absent from update_context.members and fanout_groupmembers
+        // in the Invitation wire, which we suspect Apple's FT routing
+        // rejected). Straight upstream sends a well-formed Invitation. Side
+        // effect: owner's devices ring too; caller dismisses on the device
+        // they don't want. Future: suppress own-device ring via a follow-up
+        // RespondedElsewhere once we've confirmed the callee ring is stable.
+        self.inner
+            .create_session(group_id, handle, &participants)
             .await
             .map_err(|e| WrappedError::GenericError {
-                msg: format!("create_session_skip_own_devices failed: {:?}", e),
+                msg: format!("FTClient::create_session failed: {:?}", e),
             })?;
         Ok(())
     }
