@@ -52,7 +52,7 @@ var cmdFaceTime = &commands.FullHandler{
 	Func:    fnFaceTime,
 	Help: commands.HelpMeta{
 		Section:     HelpSectionFaceTime,
-		Description: "In a DM portal: call the contact — a join link is posted and their phone rings when you tap it. In the management room: print a shareable FaceTime link for your account.",
+		Description: "In a DM portal: ring the contact and post a FaceTime web link anyone can tap (iOS, macOS, Android, Windows, Linux) to join the call. In the management room: print a shareable FaceTime web link for your account.",
 		Args:        "[handle]",
 	},
 	RequiresLogin: true,
@@ -252,20 +252,56 @@ func fnFaceTime(ce *commands.Event) {
 	ce.Reply("Failed to get FaceTime link: %v\n\nAvailable handles: `%s`", lastErr, strings.Join(handles, "`, `"))
 }
 
-// fnFaceTimeCallInPortal handles the portal-room variant of !facetime: create
-// a FaceTime session targeting the DM contact (which causes Apple to ring the
-// contact's phone immediately), fetch the web join link, append a display-name
-// slug so the browser join flow skips the "enter your name" prompt, and post
-// the link back to the caller as an m.notice. The caller taps the link, the
-// FaceTime web client opens with their name pre-filled, they tap Join, and
-// they're in the same session the contact is being rung for. The ringing and
-// joining happen in parallel — caller has a tight but reasonable window.
+// fnFaceTimeCallInPortal handles the portal-room variant of !facetime. It
+// mirrors the OpenBubbles outgoing-call flow (openbubbles-app
+// rustpush_service.dart#placeOutgoingCall):
 //
-// Returns true if the command was handled (reply already sent); false to fall
-// through to the link-only branch (group portal, no target handle, etc.).
+//  1. Generate a fresh session UUID.
+//  2. ft.CreateSession(uuid, bridge.handle, [target]) — rings the target
+//     via upstream's prop_up_conv(ring=true) Invitation push.
+//  3. ft.GetLinkForUsage(bridge.handle, "bridge") — fetch the bridge's
+//     persistent personal FaceTime web link (a stable
+//     https://facetime.apple.com/join URL that works in any browser:
+//     Chrome on Android, Firefox on Linux, Edge on Windows, Safari on
+//     iOS/macOS).
+//  4. Post the web URL to the user. facetime.apple.com is an Apple
+//     Universal Link, so on iOS / macOS the OS intercepts the domain
+//     and hands the URL off to the FaceTime app directly — no browser
+//     round-trip. On Android / Windows / Linux the same URL opens in
+//     the default browser and runs the FaceTime web client. One link
+//     covers every platform.
+//
+// When the user taps the web URL:
+//   - They authenticate against the personal link's pseudonym by sending a
+//     let-me-in request to the bridge.
+//   - The bridge's APNs recv loop dispatches the request through
+//     auto_approve_bridge_letmein (pkg/rustpushgo/src/lib.rs:2924), which
+//     walks the bridge's sessions looking for one owned by the link's
+//     handle that has is_ringing_inaccurate=true — the session we just
+//     created in step 2 — and routes the let-me-in there.
+//   - Upstream respond_letmein (facetime.rs:1057) detects the OneOnOne-mode
+//     bug that was breaking web-joiner connections and calls
+//     prop_up_conv(ring=false) as the bridge to bump the active-participant
+//     count, so Apple's callservicesd correctly exits OneOnOne mode before
+//     the web client joins. Without that step, upstream's own comment
+//     describes the failure as "If said device is the only one in the call
+//     (ringing), it sees zero (0) remote participants, thus the condition
+//     fails; OneOnOne mode is not exited, and the call fails." — the exact
+//     symptom the bridge was exhibiting with the old get_session_link flow.
+//
+// Why not ft.GetSessionLink? Session links bypass the let-me-in path and
+// therefore the OneOnOne-mode workaround. The web joiner enters the
+// session directly via the session's pseudonym, the bridge has no
+// opportunity to bump the participant count, and the call stalls on a
+// locked OneOnOne state — this was the "rings, I join, they pick up, it
+// never connects" bug.
+//
+// Returns true if the command was handled; false to fall through to the
+// generic link-only branch (group portals, no usable target handle, etc.).
 func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 	portalID := string(ce.Portal.ID)
-	// Group portals fall through — we only ring a single target for now.
+	// Group portals fall through — the outgoing-call flow only targets a
+	// single contact for now.
 	if strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",") {
 		return false
 	}
@@ -311,10 +347,12 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return true
 	}
 
-	// CreateSession fires an Invitation to the target (this IS the ring) via
-	// upstream's prop_up_conv(ring=true). Send-ack occasionally times out;
-	// retry once with the same session ID since the announcement is idempotent
-	// on group_id.
+	// CreateSession fires an Invitation to the target via upstream's
+	// prop_up_conv(ring=true) — this IS the ring. The session also gets
+	// is_ringing_inaccurate=true, which auto_approve_bridge_letmein uses as
+	// its "which session does this link-joiner belong in?" hint.
+	// Send-ack occasionally times out; retry once with the same sessionID
+	// since the announcement is idempotent on group_id.
 	createErr := ft.CreateSession(sessionID, client.handle, []string{target})
 	if createErr != nil && isLikelyDeliveredSendTimeout(createErr) {
 		time.Sleep(500 * time.Millisecond)
@@ -325,35 +363,42 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return true
 	}
 
-	link, linkErr := ft.GetSessionLink(sessionID)
-	if linkErr != nil && isLikelyDeliveredSendTimeout(linkErr) {
-		time.Sleep(500 * time.Millisecond)
-		link, linkErr = ft.GetSessionLink(sessionID)
-	}
+	// Fetch (or mint) the bridge's persistent personal link tagged with
+	// bridgeFaceTimeLinkUsage ("bridge"). That exact tag is what
+	// auto_approve_bridge_letmein keys off when routing a link-tap request
+	// into the session we just created.
+	webLink, linkErr := getFaceTimeLinkWithRecovery(ft, client.handle)
 	if linkErr != nil {
-		ce.Reply("Call started and %s's phone is ringing, but the join link failed: %v", stripIdentifierPrefix(target), linkErr)
+		ce.Reply("Call started and %s's phone is ringing, but fetching the bridge FaceTime link failed: %v\n\nTry `!im facetime-clear` and then `!im facetime` again to reset the link state.", stripIdentifierPrefix(target), linkErr)
 		return true
 	}
 
-	recipient := stripIdentifierPrefix(target)
+	bare := stripIdentifierPrefix(target)
+
+	// One URL for everyone. facetime.apple.com is an Apple Universal Link:
+	// iOS / macOS intercept the domain and hand the URL off to the FaceTime
+	// app directly (no browser round-trip). Android / Windows / Linux just
+	// open the web FaceTime client in the default browser. Same link,
+	// platform-appropriate handling.
 	ce.Reply(
-		"[**📹 Join FaceTime call**](%s)\n\n"+
-			"%s's phone is ringing — tap the button to join the call.\n\n"+
-			"Raw link (if the button doesn't open): %s",
-		link, recipient, link,
+		"📞 **Calling %s** — their phone is ringing now.\n\n"+
+			"[**🌐 Join FaceTime call**](%s)\n\n"+
+			"Tap to join the same call %s's phone is ringing for. Works on iOS, macOS, Android, Windows, and Linux — Apple's Universal Link handler opens the FaceTime app on Apple devices and the browser everywhere else.\n\n"+
+			"Raw URL: %s",
+		bare, webLink, bare, webLink,
 	)
 	return true
 }
 
 // newFaceTimeSessionID returns a random uppercase UUID v4 — Apple's FaceTime
-// session GUID format.
+// session GUID wire format.
 func newFaceTimeSessionID() (string, error) {
 	var b [16]byte
 	if _, err := cryptoRand.Read(b[:]); err != nil {
 		return "", err
 	}
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
+	b[6] = (b[6] & 0x0f) | 0x40 // RFC 4122 version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 1
 	return strings.ToUpper(fmt.Sprintf(
 		"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
 		b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
