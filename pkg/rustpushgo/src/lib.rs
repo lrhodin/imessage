@@ -29,6 +29,7 @@ use rustpush::{
     ResourceState,
 };
 use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
+use rustpush::facetime::{FACETIME_SERVICE, VIDEO_SERVICE};
 use rustpush::findmy::MULTIPLEX_SERVICE;
 
 use std::sync::RwLock;
@@ -2030,7 +2031,7 @@ pub async fn restore_token_provider(
 // Message wrapper types (flat structs for uniffi)
 // ============================================================================
 
-#[derive(uniffi::Record, Clone)]
+#[derive(uniffi::Record, Clone, Default)]
 pub struct WrappedMessage {
     pub uuid: String,
     pub sender: Option<String>,
@@ -2858,6 +2859,197 @@ fn populate_share_profile_keys(
         profile.cloud_kit_record_key.len(),
         profile.poster.is_some()
     );
+}
+
+const FACETIME_RING_MARKER: &str = "[[FACETIME_RING]]";
+const FACETIME_MISSED_MARKER: &str = "[[FACETIME_MISSED]]";
+const FACETIME_ANSWERED_ELSEWHERE_MARKER: &str = "[[FACETIME_ANSWERED_ELSEWHERE]]";
+
+// Tracks FaceTime sessions that should ring a set of targets as soon as any
+// participant joins. Populated by `!im facetime` in a portal room: the command
+// creates a session for the user + contact, returns a join link, and queues
+// a pending ring here. When the user taps the link and their JoinEvent
+// arrives on the APNs stream, the receive loop fires ft.ring() against the
+// queued targets so the contact's phone doesn't ring until the caller is
+// actually in the session.
+struct PendingFTRing {
+    targets: Vec<String>,
+    expires_at: std::time::Instant,
+}
+
+static PENDING_FT_RINGS: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, PendingFTRing>>> =
+    std::sync::OnceLock::new();
+
+fn pending_ft_rings() -> &'static tokio::sync::Mutex<HashMap<String, PendingFTRing>> {
+    PENDING_FT_RINGS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str) {
+    let targets = {
+        let mut map = pending_ft_rings().lock().await;
+        match map.remove(guid) {
+            Some(p) if p.expires_at > std::time::Instant::now() => p.targets,
+            _ => return,
+        }
+    };
+    let session = {
+        let state = ft.state.read().await;
+        match state.sessions.get(guid).cloned() {
+            Some(s) => s,
+            None => {
+                warn!("pending ring: session {} not found", guid);
+                return;
+            }
+        }
+    };
+    match ft.ring(&session, &targets, false).await {
+        Ok(_) => info!("pending ring: rang {} target(s) in session {}", targets.len(), guid),
+        Err(e) => warn!("pending ring: ft.ring failed for session {}: {:?}", guid, e),
+    }
+}
+
+async fn auto_approve_bridge_letmein(
+    facetime: &rustpush::facetime::FTClient,
+    request: &rustpush::facetime::LetMeInRequest,
+) -> Result<(), rustpush::PushError> {
+    // Only auto-approve for links owned by this bridge and tagged for bridge usage.
+    let (link_handle, linked_group, member_group, ringing_group) = {
+        let state = facetime.state.read().await;
+        let Some(link) = state.links.get(&request.pseud) else {
+            return Ok(());
+        };
+        if link.usage.as_deref() != Some("bridge") {
+            return Ok(());
+        }
+
+        let linked_group = link
+            .session_link
+            .clone()
+            .filter(|group| state.sessions.contains_key(group));
+
+        let member_group = state.sessions.iter().find_map(|(group, session)| {
+            if !session.my_handles.iter().any(|h| h == &link.handle) {
+                return None;
+            }
+            if session.members.iter().any(|member| member.handle == request.requestor) {
+                Some(group.clone())
+            } else {
+                None
+            }
+        });
+
+        let ringing_group = state.sessions.iter().find_map(|(group, session)| {
+            if !session.my_handles.iter().any(|h| h == &link.handle) {
+                return None;
+            }
+            if session.is_ringing_inaccurate {
+                Some(group.clone())
+            } else {
+                None
+            }
+        });
+
+        (link.handle.clone(), linked_group, member_group, ringing_group)
+    };
+
+    let approved_group = if let Some(group) = linked_group.or(member_group).or(ringing_group) {
+        group
+    } else {
+        let group = uuid::Uuid::new_v4().to_string().to_uppercase();
+        facetime
+            .create_session(group.clone(), link_handle.clone(), &[request.requestor.clone()])
+            .await?;
+        group
+    };
+
+    {
+        let mut state = facetime.state.write().await;
+        if let Some(link) = state.links.get_mut(&request.pseud) {
+            if link.session_link.as_deref() != Some(approved_group.as_str()) {
+                link.session_link = Some(approved_group.clone());
+            }
+        }
+    }
+
+    facetime.respond_letmein(request.clone(), Some(&approved_group)).await?;
+    info!(
+        "FaceTime auto-approved LetMeIn request for bridge link: requestor={} group={} usage=bridge",
+        request.requestor,
+        approved_group
+    );
+    Ok(())
+}
+
+async fn facetime_event_to_wrapped(
+    facetime: &rustpush::facetime::FTClient,
+    event: &rustpush::facetime::FTMessage,
+) -> Option<WrappedMessage> {
+    let (guid, mut sender, marker) = match event {
+        rustpush::facetime::FTMessage::Ring { guid } => {
+            (guid.clone(), None, FACETIME_RING_MARKER)
+        }
+        rustpush::facetime::FTMessage::JoinEvent { guid, handle, ring, .. } if *ring => {
+            (guid.clone(), Some(handle.clone()), FACETIME_RING_MARKER)
+        }
+        rustpush::facetime::FTMessage::AddMembers { guid, members, ring } if *ring => {
+            let fallback = members.iter().next().map(|member| member.handle.clone());
+            (guid.clone(), fallback, FACETIME_RING_MARKER)
+        }
+        rustpush::facetime::FTMessage::Decline { guid } => {
+            (guid.clone(), None, FACETIME_MISSED_MARKER)
+        }
+        rustpush::facetime::FTMessage::RespondedElsewhere { guid } => {
+            (guid.clone(), None, FACETIME_ANSWERED_ELSEWHERE_MARKER)
+        }
+        _ => return None,
+    };
+
+    let state = facetime.state.read().await;
+    let (participants, link) = state
+        .sessions
+        .get(&guid)
+        .map(|session| {
+            let participants = session
+                .members
+                .iter()
+                .map(|member| member.handle.clone())
+                .collect::<Vec<_>>();
+            let link = session.link.as_ref().map(|link| {
+                let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&link.public_key);
+                let pseud = link
+                    .pseudonym
+                    .strip_prefix("temp:")
+                    .unwrap_or(&link.pseudonym);
+                format!("https://facetime.apple.com/join#v=1&p={pseud}&k={encoded}")
+            });
+            (participants, link)
+        })
+        .unwrap_or_else(|| (Vec::new(), None));
+    drop(state);
+
+    if sender.is_none() {
+        sender = participants
+            .iter()
+            .find(|participant| !participant.starts_with("temp:"))
+            .cloned();
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let event_kind = marker.trim_matches('[').trim_matches(']').to_lowercase();
+    let mut wrapped = WrappedMessage::default();
+    wrapped.uuid = format!("FACETIME_{}_{}_{}", event_kind.to_uppercase(), guid, now_ms);
+    wrapped.sender = sender;
+    wrapped.text = Some(match link {
+        Some(link) if marker == FACETIME_RING_MARKER => format!("{marker} guid={guid} {link}"),
+        _ => format!("{marker} guid={guid}"),
+    });
+    wrapped.participants = participants;
+    wrapped.timestamp_ms = now_ms;
+    wrapped.is_notify_anyways = true;
+    Some(wrapped)
 }
 
 fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
@@ -3879,22 +4071,28 @@ impl LoginSession {
         let users = match existing_users {
             Some(ref wrapped) if !wrapped.inner.is_empty() => {
                 let has_valid_registration = wrapped.inner[0]
-                    .registration.get("com.apple.madrid")
+                    .registration.get(MADRID_SERVICE.name)
                     .map(|r| r.calculate_rereg_time_s().map(|t| t > 0).unwrap_or(false))
                     .unwrap_or(false);
+                let has_required_services = wrapped.inner[0].registration.contains_key(MADRID_SERVICE.name)
+                    && wrapped.inner[0].registration.contains_key(MULTIPLEX_SERVICE.name)
+                    && wrapped.inner[0].registration.contains_key(FACETIME_SERVICE.name)
+                    && wrapped.inner[0].registration.contains_key(VIDEO_SERVICE.name);
 
-                if has_valid_registration {
-                    info!("Reusing existing registration (still valid, skipping register endpoint)");
+                if has_valid_registration && has_required_services {
+                    info!("Reusing existing registration (still valid for all required services, skipping register endpoint)");
                     let mut existing = wrapped.inner.clone();
                     existing[0].auth_keypair = fresh_user.auth_keypair.clone();
                     existing
                 } else {
-                    info!("Existing registration expired, must re-register");
+                    info!(
+                        "Existing registration missing required services or expired, must re-register"
+                    );
                     let mut users = vec![fresh_user];
                     register(
                         &*os_config,
                         &*conn.state.read().await,
-                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
+                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
                         &mut users,
                         &identity,
                     ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
@@ -3908,7 +4106,7 @@ impl LoginSession {
                     register(
                         &*os_config,
                         &*conn.state.read().await,
-                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
+                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
                         &mut users,
                         &identity,
                     ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
@@ -4420,6 +4618,19 @@ impl WrappedFaceTimeClient {
         Ok(())
     }
 
+    // Queue a ring that fires as soon as any participant joins this session.
+    // The portal !facetime command uses this so the contact's phone doesn't
+    // ring until the caller has actually tapped the join link. Entries
+    // self-expire after ttl_secs to avoid orphan rings.
+    pub async fn register_pending_ring(&self, session_id: String, targets: Vec<String>, ttl_secs: u64) -> Result<(), WrappedError> {
+        let mut map = pending_ft_rings().lock().await;
+        map.insert(session_id, PendingFTRing {
+            targets,
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs),
+        });
+        Ok(())
+    }
+
     pub async fn list_delegated_letmein_requests(&self) -> Vec<WrappedLetMeInRequest> {
         let delegated = self.inner.delegated_requests.lock().await;
         delegated
@@ -4895,7 +5106,7 @@ pub async fn new_client(
             conn.clone(),
             users_clone,
             identity_clone,
-            &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
+            &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
             "state/id_cache.plist".into(),
             config_clone.clone(),
             Box::new(move |updated_keys| {
@@ -4926,6 +5137,24 @@ pub async fn new_client(
     //    needs without risking broadcast lag.
     let client_for_recv = client.clone();
     let callback = Arc::new(message_callback);
+
+    // Pre-warm FaceTime so incoming FT APNs notifications are consumed even
+    // before any explicit !facetime command initializes the subsystem.
+    let facetime_state_path = subsystem_state_path("facetime-state.plist");
+    let facetime_state = read_plist_state::<rustpush::facetime::FTState>(&facetime_state_path).unwrap_or_default();
+    let facetime_state_path_for_closure = facetime_state_path.clone();
+    let prewarmed_facetime = Arc::new(WrappedFaceTimeClient {
+        inner: Arc::new(
+            rustpush::facetime::FTClient::new(
+                facetime_state,
+                Box::new(move |state| persist_plist_state(&facetime_state_path_for_closure, state)),
+                conn.clone(),
+                client.identity.clone(),
+                config_clone.clone(),
+            )
+            .await,
+        ),
+    });
 
     // Shared StatusKit state: init_statuskit() populates these Arc<RwLock>s,
     // and the receive loop below reads them on every message. The raw
@@ -4960,6 +5189,7 @@ pub async fn new_client(
         let reconnected_at = reconnected_at.clone();
         let sk_for_recv = shared_statuskit_for_recv.clone();
         let status_cb_for_recv = status_callback_for_recv.clone();
+        let ft_for_recv = prewarmed_facetime.inner.clone();
         let client_weak_for_loop = client_weak_for_loop.clone();
         async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
@@ -5385,6 +5615,29 @@ pub async fn new_client(
                     }
                 }
 
+                // Consume FaceTime APNs events to keep FT state live and
+                // surface incoming-call attempts to Go as synthetic notice
+                // triggers.
+                match ft_for_recv.handle(msg.clone()).await {
+                    Ok(Some(ft_message)) => {
+                        if let rustpush::facetime::FTMessage::LetMeInRequest(request) = &ft_message {
+                            if let Err(e) = auto_approve_bridge_letmein(ft_for_recv.as_ref(), request).await {
+                                warn!("FaceTime auto-approve LetMeIn failed: {:?}", e);
+                            }
+                        }
+                        if let rustpush::facetime::FTMessage::JoinEvent { guid, .. } = &ft_message {
+                            maybe_fire_pending_ring(ft_for_recv.as_ref(), guid).await;
+                        }
+                        if let Some(wrapped) = facetime_event_to_wrapped(ft_for_recv.as_ref(), &ft_message).await {
+                            callback.on_message(wrapped);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!("FaceTime handle error: {:?}", e);
+                    }
+                }
+
                 let mut retries = 0u32;
                 let mut backoff = INITIAL_BACKOFF;
 
@@ -5522,7 +5775,7 @@ pub async fn new_client(
         cloud_messages_client: tokio::sync::Mutex::new(None),
         cloud_keychain_client: tokio::sync::Mutex::new(None),
         findmy_client: tokio::sync::Mutex::new(None),
-        facetime_client: tokio::sync::Mutex::new(None),
+        facetime_client: tokio::sync::Mutex::new(Some(prewarmed_facetime)),
         passwords_client: tokio::sync::Mutex::new(None),
         statuskit_client: tokio::sync::Mutex::new(None),
         sharedstreams_client: tokio::sync::Mutex::new(None),

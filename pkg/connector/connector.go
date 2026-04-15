@@ -37,12 +37,13 @@ var _ bridgev2.NetworkConnector = (*IMConnector)(nil)
 
 func (c *IMConnector) GetName() bridgev2.BridgeName {
 	return bridgev2.BridgeName{
-		DisplayName:      "iMessage",
-		NetworkURL:       "https://support.apple.com/messages",
-		NetworkIcon:      "mxc://maunium.net/tManJEpANASZvDVzvRvhILdl",
-		NetworkID:        "imessage",
-		BeeperBridgeType: "imessagego",
-		DefaultPort:      29332,
+		DisplayName:          "iMessage",
+		NetworkURL:           "https://support.apple.com/messages",
+		NetworkIcon:          "mxc://maunium.net/tManJEpANASZvDVzvRvhILdl",
+		NetworkID:            "imessage",
+		BeeperBridgeType:     "imessagego",
+		DefaultPort:          29332,
+		DefaultCommandPrefix: "!im",
 	}
 }
 
@@ -314,6 +315,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		recentOutboundUnsends:   make(map[string]time.Time),
 		recentSmsReactionEchoes: make(map[string]time.Time),
 		smsPortals:              make(map[string]bool),
+		sharedStreamAssetCache:  make(map[string]map[string]struct{}),
 		imGroupNames:            make(map[string]string),
 		imGroupGuids:            make(map[string]string),
 		imGroupParticipants:     make(map[string][]string),

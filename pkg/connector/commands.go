@@ -33,17 +33,75 @@ import (
 	"github.com/lrhodin/imessage/imessage"
 )
 
+// Help sections for Apple-service commands added by this bridge. Orders slot
+// in after bridgev2's built-in sections (General=0, Auth=10, Chats=20,
+// Admin=50), so `!im help` renders each service as its own heading at the
+// bottom instead of lumping everything under "General".
+var (
+	HelpSectionFaceTime      = commands.HelpSection{Name: "FaceTime", Order: 60}
+	HelpSectionFindMy        = commands.HelpSection{Name: "Find My", Order: 70}
+	HelpSectionSharedStreams = commands.HelpSection{Name: "Shared Streams", Order: 80}
+	HelpSectionStatusKit     = commands.HelpSection{Name: "StatusKit", Order: 90}
+)
+
 // BridgeCommands returns the custom slash commands for the iMessage bridge.
 // Register these in main.go's PostInit hook:
 //
 //	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands()...)
 func BridgeCommands() []*commands.FullHandler {
-	return []*commands.FullHandler{
+	cmds := []*commands.FullHandler{
 		cmdRestoreChat,
 		cmdRestoreDebug,
 		cmdMsgDebug,
 		cmdContacts,
+		// Apple service integrations
+		cmdFaceTime,
+		cmdFaceTimeSend,
+		cmdFaceTimeClear,
+		cmdFaceTimeState,
+		cmdFaceTimeSessionLink,
+		cmdFaceTimeUseLink,
+		cmdFaceTimeDeleteLink,
+		cmdFaceTimeLetMeIn,
+		cmdFaceTimeLetMeInApprove,
+		cmdFaceTimeLetMeInDeny,
+		cmdFaceTimeCreateSession,
+		cmdFaceTimeRing,
+		cmdFaceTimeAddMembers,
+		cmdFaceTimeRemoveMembers,
+		cmdFindMy,
+		cmdFindMySyncItems,
+		cmdFindMyAcceptShare,
+		cmdFindMyDeleteItem,
+		cmdFindMyRenameBeacon,
+		cmdFindMyStateJSON,
+		cmdFindMyStateBytes,
+		cmdFindMyDevices,
+		cmdFindMyFriends,
+		cmdFindMyFriendsImport,
+		cmdSharedAlbums,
+		cmdSharedPhotos,
+		cmdSharedSubscribe,
+		cmdSharedSubscribeToken,
+		cmdSharedUnsubscribe,
+		cmdSharedState,
+		cmdSharedAssetsJSON,
+		cmdSharedDeleteAssets,
+		cmdSharedDownloadFile,
+		cmdSharedCreateAssetB64,
+		cmdStatuskitState,
+		cmdStatuskitConfigureAPS,
+		cmdStatuskitEnsureChannel,
+		cmdStatuskitClearInterest,
+		cmdStatuskitRequestHandles,
+		cmdStatuskitRequestChannels,
+		cmdStatuskitUpdateChannels,
+		cmdStatuskitInviteToChannel,
+		cmdStatuskitResetKeys,
+		cmdStatuskitRollKeys,
+		cmdStatuskitShare,
 	}
+	return cmds
 }
 
 // cmdRestoreChat lists deleted rooms, then waits for the user to reply with

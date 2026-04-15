@@ -1240,6 +1240,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_register_pending_ring(uniffiStatus)
+		})
+		if checksum != 3908 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_register_pending_ring: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_remove_members(uniffiStatus)
 		})
 		if checksum != 65464 {
@@ -4448,6 +4457,31 @@ func (_self *WrappedFaceTimeClient) ListDelegatedLetmeinRequests() []WrappedLetM
 		FfiConverterSequenceTypeWrappedLetMeInRequestINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *WrappedFaceTimeClient) RegisterPendingRing(sessionId string, targets []string, ttlSecs uint64) error {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedFaceTimeClient")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedfacetimeclient_register_pending_ring(
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(sessionId)), rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(targets)), FfiConverterUint64INSTANCE.Lower(ttlSecs),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
 		})
 }
 

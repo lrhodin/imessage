@@ -156,6 +156,13 @@ type IMClient struct {
 	// per unresolved handle per session. Values are networkid.PortalID.
 	statusKitPortalCache sync.Map // map[string]networkid.PortalID
 
+	// sharedStreamAssetCache tracks the last observed asset GUID set per shared
+	// album for this session. The Shared Streams watcher uses it to suppress
+	// false-positive "new content" notices from Apple's getchanges endpoint,
+	// which also fires on metadata-only album updates.
+	sharedStreamAssetCache   map[string]map[string]struct{}
+	sharedStreamAssetCacheMu sync.Mutex
+
 	// statusKitBotRulePushed is set to true after we successfully install a
 	// sender push rule via the double puppet that silences push notifications
 	// from the bridge bot. Done once per session; the rule is durable on the
@@ -965,6 +972,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	c.msgBuffer = &messageBuffer{client: c}
 	go c.periodicStateSave(log)
 	go c.periodicStatusSharingReinvite(log)
+	go c.startSharedStreamsWatcher(log)
 
 	// Ensure shared-profile schema and hydrate the in-memory cache from the
 	// DB. Runs on every bridge start so existing installs pick up the table
@@ -1138,8 +1146,9 @@ func statusKitModeLabel(mode *string) string {
 }
 
 // OnStatusUpdate is called by StatusKit when a contact's presence changes.
-// Posts an m.notice in the DM portal so the user sees a subtle inline notice
-// (the way Apple shows "has notifications silenced" at the bottom of the chat).
+// Posts an m.notice in the contact DM and the last active shared group so the
+// user sees status inline where they're actively chatting, similar to Apple's
+// in-conversation "has notifications silenced" affordance.
 // Also sets Matrix ghost presence for clients that render it.
 //
 // IMPORTANT: this function is called from a Rust FFI callback (inside the APNs
@@ -1344,7 +1353,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			Str("normalized_user", normalizedUser).
 			Str("portal_id", string(portal.ID)).
 			Str("ghost_handle", ghostHandle).
-			Msg("StatusKit: sending presence notice to portal")
+			Msg("StatusKit: sending presence notice to active conversations")
 
 		name := ghost.Name
 		if name == "" {
@@ -1362,66 +1371,84 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			notice = name + " has notifications turned on."
 		}
 
-		// Anchor the notice timestamp 1ms before the last real iMessage in
-		// this portal.  When Hungry evaluates room-list ordering it uses
-		// origin_server_ts; by placing our notice just before the last real
-		// message the room's effective "latest event" stays at the real
-		// message's timestamp, so the DM won't jump to the top of the chat
-		// list as though a new iMessage arrived.
-		//
-		// If no prior messages exist, or the last message is older than 24 h
-		// (the room is already near the bottom of the list so a bump is
-		// harmless), or the DB query fails, fall back to now-1ms.
-		noticeTS := time.Now().Add(-1 * time.Millisecond)
-		if lastMsg, dbErr := c.Main.Bridge.DB.Message.GetLastNonFakePartAtOrBeforeTime(
-			ctx, portal.PortalKey, time.Now(),
-		); dbErr != nil {
-			log.Warn().Err(dbErr).Msg("StatusKit: failed to query last message timestamp, using now-1ms")
-		} else if lastMsg != nil && !lastMsg.Timestamp.IsZero() &&
-			time.Since(lastMsg.Timestamp) < 24*time.Hour {
-			noticeTS = lastMsg.Timestamp.Add(-1 * time.Millisecond)
+		targetPortals := map[networkid.PortalID]*bridgev2.Portal{
+			portal.ID: portal,
+		}
+		candidateHandles := map[string]bool{
+			normalizedUser: true,
+			ghostHandle:    true,
+		}
+		if contact := c.lookupContact(user); contact != nil {
+			for _, altID := range contactPortalIDs(contact) {
+				candidateHandles[altID] = true
+			}
+		}
+		for handleID := range candidateHandles {
+			if handleID == "" {
+				continue
+			}
+			c.lastGroupForMemberMu.RLock()
+			groupKey, ok := c.lastGroupForMember[handleID]
+			c.lastGroupForMemberMu.RUnlock()
+			if !ok || groupKey.ID == "" {
+				continue
+			}
+			groupPortal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, groupKey)
+			if err == nil && groupPortal != nil && groupPortal.MXID != "" {
+				targetPortals[groupPortal.ID] = groupPortal
+			}
 		}
 
-		var sendErr error
-		if c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
-			// Beeper/Hungry path: batch-send with SendNotification:false tells
-			// Hungry's proprietary push gateway to skip APNs dispatch entirely —
-			// this is the only mechanism that works on Hungry, which ignores
-			// standard Matrix push rules for DM rooms.  MarkReadBy atomically
-			// marks the event as read by the real user so no unread badge
-			// appears, replacing the separate m.read.private attempt.
-			batchEvt := &event.Event{
-				Type:      event.EventMessage,
-				Sender:    c.Main.Bridge.Bot.GetMXID(),
-				RoomID:    portal.MXID,
-				Timestamp: noticeTS.UnixMilli(),
-				Content: event.Content{
-					Parsed: &event.MessageEventContent{
-						MsgType:  event.MsgNotice,
-						Body:     notice,
-						Mentions: &event.Mentions{},
-					},
-					Raw: map[string]any{
-						"com.beeper.action_message": map[string]any{
-							"type": "presence_update",
+		sendStatusNotice := func(targetPortal *bridgev2.Portal) error {
+			if targetPortal == nil || targetPortal.MXID == "" {
+				return fmt.Errorf("invalid target portal")
+			}
+
+			// Anchor each notice timestamp 1ms before the last real iMessage in
+			// the target room so room ordering doesn't jump on passive status updates.
+			noticeTS := time.Now().Add(-1 * time.Millisecond)
+			if lastMsg, dbErr := c.Main.Bridge.DB.Message.GetLastNonFakePartAtOrBeforeTime(
+				ctx, targetPortal.PortalKey, time.Now(),
+			); dbErr != nil {
+				log.Warn().Err(dbErr).Str("portal_id", string(targetPortal.ID)).
+					Msg("StatusKit: failed to query last message timestamp, using now-1ms")
+			} else if lastMsg != nil && !lastMsg.Timestamp.IsZero() &&
+				time.Since(lastMsg.Timestamp) < 24*time.Hour {
+				noticeTS = lastMsg.Timestamp.Add(-1 * time.Millisecond)
+			}
+
+			if c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
+				batchEvt := &event.Event{
+					Type:      event.EventMessage,
+					Sender:    c.Main.Bridge.Bot.GetMXID(),
+					RoomID:    targetPortal.MXID,
+					Timestamp: noticeTS.UnixMilli(),
+					Content: event.Content{
+						Parsed: &event.MessageEventContent{
+							MsgType:  event.MsgNotice,
+							Body:     notice,
+							Mentions: &event.Mentions{},
+						},
+						Raw: map[string]any{
+							"com.beeper.action_message": map[string]any{
+								"type": "presence_update",
+							},
 						},
 					},
-				},
+				}
+				batchReq := &mautrix.ReqBeeperBatchSend{
+					Forward:          true,
+					SendNotification: false,
+					Events:           []*event.Event{batchEvt},
+				}
+				if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
+					batchReq.MarkReadBy = dp.GetMXID()
+				}
+				_, sendErr := c.Main.Bridge.Matrix.BatchSend(ctx, targetPortal.MXID, batchReq, nil)
+				return sendErr
 			}
-			batchReq := &mautrix.ReqBeeperBatchSend{
-				Forward:          true,  // insert at end of live timeline (not as hidden backfill)
-				SendNotification: false, // suppress APNs push on Hungry
-				Events:           []*event.Event{batchEvt},
-			}
-			if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
-				batchReq.MarkReadBy = dp.GetMXID()
-			}
-			_, sendErr = c.Main.Bridge.Matrix.BatchSend(ctx, portal.MXID, batchReq, nil)
-		} else {
-			// Fallback for homeservers without Beeper batch-send support.
-			// Push suppression relies on the sender push rules installed by
-			// ensureBotPushRuleSilenced (called at Connect time).
-			_, sendErr = c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+
+			_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, targetPortal.MXID, event.EventMessage, &event.Content{
 				Parsed: &event.MessageEventContent{
 					MsgType:  event.MsgNotice,
 					Body:     notice,
@@ -1433,11 +1460,20 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 					},
 				},
 			}, &bridgev2.MatrixSendExtra{Timestamp: noticeTS})
+			return sendErr
 		}
-		if sendErr != nil {
-			log.Warn().Err(sendErr).Str("portal_mxid", string(portal.MXID)).Msg("StatusKit: failed to send presence notice")
-		} else {
-			log.Info().Str("portal_mxid", string(portal.MXID)).Msg("StatusKit: sent silent presence notice")
+
+		sent := 0
+		for _, targetPortal := range targetPortals {
+			if err := sendStatusNotice(targetPortal); err != nil {
+				log.Warn().Err(err).Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: failed to send presence notice")
+				continue
+			}
+			sent++
+			log.Info().Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: sent silent presence notice")
+		}
+		if sent == 0 {
+			log.Warn().Msg("StatusKit: failed to send presence notice to any conversation")
 		}
 	}()
 }
@@ -1735,6 +1771,34 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 			Int("dismissed", len(msg.UpdateProfileSharingDismissed)).
 			Int("all", len(msg.UpdateProfileSharingAll)).
 			Msg("Received UpdateProfileSharing")
+		return
+	}
+
+	// "Notify Anyway" — sender deliberately broke through our Focus/DND.
+	// Post a silent bot notice in the relevant room so the user can see it.
+	if msg.IsNotifyAnyways {
+		if c.cloudStore != nil {
+			if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+				return
+			}
+			if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, "", int64(msg.TimestampMs), false); err != nil {
+				log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist NotifyAnyway UUID; duplicates possible on restart")
+			}
+		}
+		go c.handleNotifyAnyways(log, msg)
+		return
+	}
+	// Transcript background — someone set or cleared the iMessage chat wallpaper.
+	if msg.IsSetTranscriptBackground {
+		if c.cloudStore != nil {
+			if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+				return
+			}
+			if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, "", int64(msg.TimestampMs), false); err != nil {
+				log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist SetTranscriptBackground UUID; duplicates possible on restart")
+			}
+		}
+		go c.handleTranscriptBackground(log, msg)
 		return
 	}
 
@@ -2138,6 +2202,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist message UUID; duplicates may occur on restart")
 		}
 	}
+	c.maybeNotifyIncomingFaceTimeInvite(log, &msg, portalKey, sender.IsFromMe, createPortal)
 	if createPortal || sender.IsFromMe {
 		log.Info().
 			Bool("create_portal", createPortal).
@@ -2718,6 +2783,272 @@ func (c *IMClient) handleIconChange(log zerolog.Logger, msg rustpushgo.WrappedMe
 			},
 		},
 	})
+}
+
+const faceTimeRingMarker = "[[FACETIME_RING]]"
+const faceTimeMissedMarker = "[[FACETIME_MISSED]]"
+const faceTimeAnsweredElsewhereMarker = "[[FACETIME_ANSWERED_ELSEWHERE]]"
+
+// handleNotifyAnyways posts a silent bot notice when a contact deliberately
+// breaks through our Focus / Do Not Disturb by tapping "Notify Anyway" on their
+// device. The notice is delivered to the portal that corresponds to this chat so
+// the user can see who sent it. Stored messages are silently dropped.
+func (c *IMClient) handleNotifyAnyways(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	if msg.IsStoredMessage {
+		log.Debug().Msg("Skipping stored NotifyAnyways message")
+		return
+	}
+
+	rawText := strings.TrimSpace(ptrStringOr(msg.Text, ""))
+	if strings.HasPrefix(rawText, faceTimeRingMarker) {
+		c.handleFaceTimeRingNotice(log, msg, rawText)
+		return
+	}
+	if strings.HasPrefix(rawText, faceTimeMissedMarker) {
+		c.handleFaceTimeMissedNotice(log, msg)
+		return
+	}
+	if strings.HasPrefix(rawText, faceTimeAnsweredElsewhereMarker) {
+		c.handleFaceTimeAnsweredElsewhereNotice(log, msg)
+		return
+	}
+
+	ctx := context.Background()
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil || portal == nil || portal.MXID == "" {
+		log.Debug().Err(err).Msg("NotifyAnyways: no portal found, skipping notice")
+		return
+	}
+
+	// Resolve a friendly name from the ghost (same as StatusKit notices).
+	senderHandle := ptrStringOr(msg.Sender, "")
+	name := senderHandle
+	if senderHandle != "" {
+		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
+		if ghostErr == nil && ghost != nil && ghost.Name != "" {
+			name = ghost.Name
+		}
+	}
+
+	notice := "🔔 " + name + " sent a Notify Anyway (tapped through Focus / Do Not Disturb)."
+	log.Info().
+		Str("sender", senderHandle).
+		Str("portal_mxid", string(portal.MXID)).
+		Msg("NotifyAnyways: posting notice")
+
+	_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+		Parsed: &event.MessageEventContent{
+			MsgType:  event.MsgNotice,
+			Body:     notice,
+			Mentions: &event.Mentions{},
+		},
+	}, nil)
+	if sendErr != nil {
+		log.Warn().Err(sendErr).Msg("NotifyAnyways: failed to send notice")
+	}
+}
+
+func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage, rawText string) {
+	ctx := context.Background()
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+
+	senderHandle := ptrStringOr(msg.Sender, "")
+	name := stripIdentifierPrefix(senderHandle)
+	if senderHandle != "" {
+		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
+		if ghostErr == nil && ghost != nil && ghost.Name != "" {
+			name = ghost.Name
+		}
+	}
+	if name == "" {
+		name = "someone"
+	}
+
+	link := firstFaceTimeLinkInText(rawText)
+	if link == "" {
+		// Caller didn't embed a link (native FaceTime ring). Generate the
+		// bridge's own FaceTime link so the user always has something to tap.
+		if ft, ftErr := c.client.GetFacetimeClient(); ftErr == nil {
+			if generated, genErr := getFaceTimeLinkWithRecovery(ft, c.handle); genErr == nil {
+				link = generated
+			} else {
+				log.Warn().Err(genErr).Msg("FaceTimeRing: failed to generate fallback FaceTime link")
+			}
+		}
+	}
+
+	notice := "📞 Incoming FaceTime call from " + name + "."
+	if link != "" {
+		notice += "\n\n" + link
+	}
+
+	sendNotice := func(roomID id.RoomID) error {
+		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
+			Parsed: &event.MessageEventContent{
+				MsgType:  event.MsgNotice,
+				Body:     notice,
+				Mentions: &event.Mentions{},
+			},
+		}, nil)
+		return sendErr
+	}
+
+	if err == nil && portal != nil && portal.MXID != "" {
+		if sendErr := sendNotice(portal.MXID); sendErr == nil {
+			log.Info().
+				Str("sender", senderHandle).
+				Str("portal_mxid", string(portal.MXID)).
+				Msg("FaceTimeRing: posted incoming call notice to portal")
+			return
+		} else {
+			log.Warn().Err(sendErr).Msg("FaceTimeRing: failed to send portal notice")
+		}
+	}
+
+	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
+	if mgmtErr != nil {
+		log.Warn().Err(mgmtErr).Msg("FaceTimeRing: failed to get management room for fallback notice")
+		return
+	}
+	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
+		log.Warn().Err(sendErr).Msg("FaceTimeRing: failed to send management room notice")
+		return
+	}
+	log.Info().
+		Str("sender", senderHandle).
+		Str("management_room", string(mgmtRoom)).
+		Msg("FaceTimeRing: posted incoming call notice to management room")
+}
+
+func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	ctx := context.Background()
+	senderHandle := ptrStringOr(msg.Sender, "")
+	name := stripIdentifierPrefix(senderHandle)
+	if senderHandle != "" {
+		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
+		if ghostErr == nil && ghost != nil && ghost.Name != "" {
+			name = ghost.Name
+		}
+	}
+	if name == "" {
+		name = "someone"
+	}
+	notice := "📞 Missed FaceTime call from " + name + "."
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	sendNotice := func(roomID id.RoomID) error {
+		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
+			Parsed: &event.MessageEventContent{
+				MsgType:  event.MsgNotice,
+				Body:     notice,
+				Mentions: &event.Mentions{},
+			},
+		}, nil)
+		return sendErr
+	}
+	if err == nil && portal != nil && portal.MXID != "" {
+		if sendErr := sendNotice(portal.MXID); sendErr == nil {
+			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Msg("FaceTimeMissed: posted missed call notice to portal")
+			return
+		}
+	}
+	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
+	if mgmtErr != nil {
+		log.Warn().Err(mgmtErr).Msg("FaceTimeMissed: failed to get management room for fallback notice")
+		return
+	}
+	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
+		log.Warn().Err(sendErr).Msg("FaceTimeMissed: failed to send management room notice")
+		return
+	}
+	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Msg("FaceTimeMissed: posted missed call notice to management room")
+}
+
+func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	ctx := context.Background()
+	notice := "📞 Incoming FaceTime call was answered on another device."
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	sendNotice := func(roomID id.RoomID) error {
+		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
+			Parsed: &event.MessageEventContent{
+				MsgType:  event.MsgNotice,
+				Body:     notice,
+				Mentions: &event.Mentions{},
+			},
+		}, nil)
+		return sendErr
+	}
+	senderHandle := ptrStringOr(msg.Sender, "")
+	if err == nil && portal != nil && portal.MXID != "" {
+		if sendErr := sendNotice(portal.MXID); sendErr == nil {
+			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Msg("FaceTimeAnsweredElsewhere: posted notice to portal")
+			return
+		}
+	}
+	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
+	if mgmtErr != nil {
+		log.Warn().Err(mgmtErr).Msg("FaceTimeAnsweredElsewhere: failed to get management room for fallback notice")
+		return
+	}
+	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
+		log.Warn().Err(sendErr).Msg("FaceTimeAnsweredElsewhere: failed to send management room notice")
+		return
+	}
+	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Msg("FaceTimeAnsweredElsewhere: posted notice to management room")
+}
+
+// handleTranscriptBackground posts a silent bot notice when a participant sets
+// or removes the custom iMessage chat wallpaper (transcript background).
+// Stored messages are silently dropped.
+func (c *IMClient) handleTranscriptBackground(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	if msg.IsStoredMessage {
+		log.Debug().Msg("Skipping stored SetTranscriptBackground message")
+		return
+	}
+	ctx := context.Background()
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil || portal == nil || portal.MXID == "" {
+		log.Debug().Err(err).Msg("SetTranscriptBackground: no portal found, skipping notice")
+		return
+	}
+
+	senderHandle := ptrStringOr(msg.Sender, "")
+	name := senderHandle
+	if senderHandle != "" {
+		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
+		if ghostErr == nil && ghost != nil && ghost.Name != "" {
+			name = ghost.Name
+		}
+	}
+
+	var notice string
+	isRemove := msg.TranscriptBackgroundRemove != nil && *msg.TranscriptBackgroundRemove
+	if isRemove {
+		notice = "🖼️ " + name + " removed the chat background."
+	} else {
+		notice = "🖼️ " + name + " set a new chat background."
+	}
+
+	log.Info().
+		Str("sender", senderHandle).
+		Bool("remove", isRemove).
+		Str("portal_mxid", string(portal.MXID)).
+		Msg("SetTranscriptBackground: posting notice")
+
+	_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+		Parsed: &event.MessageEventContent{
+			MsgType:  event.MsgNotice,
+			Body:     notice,
+			Mentions: &event.Mentions{},
+		},
+	}, nil)
+	if sendErr != nil {
+		log.Warn().Err(sendErr).Msg("SetTranscriptBackground: failed to send notice")
+	}
 }
 
 // makeDeletePortalKey constructs a PortalKey from the delete/recover-specific
@@ -6556,15 +6887,26 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
+	parts := make([]*bridgev2.ConvertedMessagePart, 0, 2)
+	if isVCardAttachment(mimeType, fileName, att.UTIType) {
+		if vcardPreview := makeVCardPreviewContent(data); vcardPreview != nil {
+			parts = append(parts, &bridgev2.ConvertedMessagePart{
+				Type:    event.EventMessage,
+				Content: vcardPreview,
+			})
+		}
+	}
+	parts = append(parts, &bridgev2.ConvertedMessagePart{
+		Type:    event.EventMessage,
+		Content: content,
+	})
+
 	messages := []*bridgev2.BackfillMessage{{
 		Sender:    sender,
 		ID:        makeMessageID(attID),
 		Timestamp: ts,
 		ConvertedMessage: &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{{
-				Type:    event.EventMessage,
-				Content: content,
-			}},
+			Parts: parts,
 		},
 	}}
 
@@ -8612,6 +8954,66 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 	return cm, nil
 }
 
+func isVCardAttachment(mimeType, fileName, utiType string) bool {
+	if strings.EqualFold(utiType, "public.vcard") {
+		return true
+	}
+	if strings.EqualFold(mimeType, "text/vcard") ||
+		strings.EqualFold(mimeType, "text/x-vcard") ||
+		strings.EqualFold(mimeType, "text/directory") {
+		return true
+	}
+	return strings.HasSuffix(strings.ToLower(fileName), ".vcf")
+}
+
+func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
+	contact := parseVCard(string(data))
+	if contact == nil {
+		return nil
+	}
+	name := strings.TrimSpace(contact.Name())
+	if name == "" && len(contact.Phones) == 0 && len(contact.Emails) == 0 {
+		return nil
+	}
+
+	bodyLines := []string{"Shared contact"}
+	htmlLines := []string{"<strong>Shared contact</strong>"}
+	if name != "" {
+		bodyLines = append(bodyLines, name)
+		htmlLines = append(htmlLines, html.EscapeString(name))
+	}
+	for i, phone := range contact.Phones {
+		if i >= 3 {
+			break
+		}
+		phone = strings.TrimSpace(phone)
+		if phone == "" {
+			continue
+		}
+		bodyLines = append(bodyLines, "Phone: "+phone)
+		htmlLines = append(htmlLines, "Phone: "+html.EscapeString(phone))
+	}
+	for i, email := range contact.Emails {
+		if i >= 3 {
+			break
+		}
+		email = strings.TrimSpace(email)
+		if email == "" {
+			continue
+		}
+		bodyLines = append(bodyLines, "Email: "+email)
+		htmlLines = append(htmlLines, "Email: "+html.EscapeString(email))
+	}
+
+	return &event.MessageEventContent{
+		MsgType:       event.MsgNotice,
+		Body:          strings.Join(bodyLines, "\n"),
+		Format:        event.FormatHTML,
+		FormattedBody: strings.Join(htmlLines, "<br/>"),
+		Mentions:      &event.Mentions{},
+	}
+}
+
 func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {
 	att := attMsg.Attachment
 	mimeType := att.MimeType
@@ -8626,6 +9028,11 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		if att.UtiType == "com.apple.coreaudio-format" || mimeType == "audio/x-caf" {
 			inlineData, mimeType, fileName, durationMs = convertAudioForMatrix(inlineData, mimeType, fileName)
 		}
+	}
+
+	var vcardPreview *event.MessageEventContent
+	if inlineData != nil && isVCardAttachment(mimeType, fileName, att.UtiType) {
+		vcardPreview = makeVCardPreviewContent(inlineData)
 	}
 
 	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
@@ -8770,12 +9177,22 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		}
 	}
 
-	cm := &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
-			ID:      networkid.PartID(fmt.Sprintf("att%d", attMsg.Index)),
+	parts := make([]*bridgev2.ConvertedMessagePart, 0, 2)
+	if vcardPreview != nil {
+		parts = append(parts, &bridgev2.ConvertedMessagePart{
+			ID:      networkid.PartID(fmt.Sprintf("att%d-preview", attMsg.Index)),
 			Type:    event.EventMessage,
-			Content: content,
-		}},
+			Content: vcardPreview,
+		})
+	}
+	parts = append(parts, &bridgev2.ConvertedMessagePart{
+		ID:      networkid.PartID(fmt.Sprintf("att%d", attMsg.Index)),
+		Type:    event.EventMessage,
+		Content: content,
+	})
+
+	cm := &bridgev2.ConvertedMessage{
+		Parts: parts,
 	}
 
 	if attMsg.WrappedMessage.ReplyGuid != nil && *attMsg.WrappedMessage.ReplyGuid != "" {
@@ -9073,6 +9490,8 @@ func mimeToUTI(mime string) string {
 		return "public.aac-audio"
 	case mime == "audio/x-caf":
 		return "com.apple.coreaudio-format"
+	case mime == "text/vcard", mime == "text/x-vcard", mime == "text/directory":
+		return "public.vcard"
 	case strings.HasPrefix(mime, "image/"):
 		return "public.image"
 	case strings.HasPrefix(mime, "video/"):
@@ -9112,6 +9531,8 @@ func utiToMIME(uti string) string {
 		return "audio/aac"
 	case "com.apple.coreaudio-format":
 		return "audio/x-caf"
+	case "public.vcard":
+		return "text/vcard"
 	default:
 		return ""
 	}

@@ -843,6 +843,7 @@ func completeLoginWithMeta(
 		recentOutboundUnsends:   make(map[string]time.Time),
 		recentSmsReactionEchoes: make(map[string]time.Time),
 		smsPortals:              make(map[string]bool),
+		sharedStreamAssetCache:  make(map[string]map[string]struct{}),
 		imGroupNames:            make(map[string]string),
 		imGroupGuids:            make(map[string]string),
 		imGroupParticipants:     make(map[string][]string),
