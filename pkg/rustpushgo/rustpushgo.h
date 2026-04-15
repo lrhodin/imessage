@@ -699,6 +699,14 @@ void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_list_delegated_letmein_r
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_register_pending_ring(
+	void* ptr,
+	RustBuffer session_id,
+	RustBuffer targets,
+	uint64_t ttl_secs,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_wrappedfacetimeclient_remove_members(
 	void* ptr,
 	RustBuffer session_id,
@@ -1897,6 +1905,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_get_session_lin
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_list_delegated_letmein_requests(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_register_pending_ring(
 	RustCallStatus* out_status
 );
 

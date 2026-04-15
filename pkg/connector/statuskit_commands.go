@@ -30,8 +30,8 @@ var cmdStatuskitState = &commands.FullHandler{
 	Name: "statuskit-state",
 	Func: fnStatuskitState,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Show raw StatusKit state JSON (debug).",
+		Section:     HelpSectionStatusKit,
+		Description: "Dump raw StatusKit client state (channels, keys, interest tokens) as JSON — debugging only.",
 	},
 	RequiresLogin: true,
 }
@@ -40,8 +40,8 @@ var cmdStatuskitConfigureAPS = &commands.FullHandler{
 	Name: "statuskit-configure-aps",
 	Func: fnStatuskitConfigureAPS,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Configure APS channels for StatusKit.",
+		Section:     HelpSectionStatusKit,
+		Description: "Re-run the StatusKit APS channel configuration handshake with Apple.",
 	},
 	RequiresLogin: true,
 }
@@ -50,8 +50,8 @@ var cmdStatuskitEnsureChannel = &commands.FullHandler{
 	Name: "statuskit-ensure-channel",
 	Func: fnStatuskitEnsureChannel,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Ensure local StatusKit channel exists.",
+		Section:     HelpSectionStatusKit,
+		Description: "Create the local StatusKit channel if it doesn't already exist.",
 	},
 	RequiresLogin: true,
 }
@@ -60,8 +60,8 @@ var cmdStatuskitClearInterest = &commands.FullHandler{
 	Name: "statuskit-clear-interest",
 	Func: fnStatuskitClearInterest,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Clear StatusKit interest tokens.",
+		Section:     HelpSectionStatusKit,
+		Description: "Drop all StatusKit interest tokens so Apple re-pushes them on the next subscribe.",
 	},
 	RequiresLogin: true,
 }
@@ -70,8 +70,8 @@ var cmdStatuskitRequestHandles = &commands.FullHandler{
 	Name: "statuskit-request-handles",
 	Func: fnStatuskitRequestHandles,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Request StatusKit updates for handles.",
+		Section:     HelpSectionStatusKit,
+		Description: "Ask Apple to push StatusKit updates for each listed handle.",
 		Args:        "<handle...>",
 	},
 	RequiresLogin: true,
@@ -81,8 +81,8 @@ var cmdStatuskitRequestChannels = &commands.FullHandler{
 	Name: "statuskit-request-channels",
 	Func: fnStatuskitRequestChannels,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Request StatusKit updates for channel identifiers.",
+		Section:     HelpSectionStatusKit,
+		Description: "Ask Apple to push StatusKit updates for each listed channel (format: topic:hexid).",
 		Args:        "<topic:hexid...>",
 	},
 	RequiresLogin: true,
@@ -92,8 +92,8 @@ var cmdStatuskitUpdateChannels = &commands.FullHandler{
 	Name: "statuskit-update-channels",
 	Func: fnStatuskitUpdateChannels,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Replace tracked StatusKit channels.",
+		Section:     HelpSectionStatusKit,
+		Description: "Replace the bridge's tracked StatusKit channel list with the given set (format: topic:hexid).",
 		Args:        "<topic:hexid...>",
 	},
 	RequiresLogin: true,
@@ -103,8 +103,8 @@ var cmdStatuskitInviteToChannel = &commands.FullHandler{
 	Name: "statuskit-invite-channel",
 	Func: fnStatuskitInviteToChannel,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Invite handles to StatusKit channel (handle or handle=m1|m2).",
+		Section:     HelpSectionStatusKit,
+		Description: "Invite handles to your StatusKit channel so they can decrypt your shared presence; optional =mode1|mode2 per handle.",
 		Args:        "<sender-handle> <handle[=mode1|mode2]...>",
 	},
 	RequiresLogin: true,
@@ -114,8 +114,8 @@ var cmdStatuskitResetKeys = &commands.FullHandler{
 	Name: "statuskit-reset-keys",
 	Func: fnStatuskitResetKeys,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Reset local StatusKit keys.",
+		Section:     HelpSectionStatusKit,
+		Description: "Wipe local StatusKit keys; the next publish will mint a fresh keyset.",
 	},
 	RequiresLogin: true,
 }
@@ -124,8 +124,8 @@ var cmdStatuskitRollKeys = &commands.FullHandler{
 	Name: "statuskit-roll-keys",
 	Func: fnStatuskitRollKeys,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Rotate local StatusKit keys.",
+		Section:     HelpSectionStatusKit,
+		Description: "Rotate local StatusKit keys and reshare them with invited handles.",
 	},
 	RequiresLogin: true,
 }
@@ -134,8 +134,8 @@ var cmdStatuskitShare = &commands.FullHandler{
 	Name: "statuskit-share",
 	Func: fnStatuskitShare,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Publish StatusKit share status.",
+		Section:     HelpSectionStatusKit,
+		Description: "Publish or retract your StatusKit shared-status (on/off, optional mode string).",
 		Args:        "<on|off> [mode]",
 	},
 	RequiresLogin: true,

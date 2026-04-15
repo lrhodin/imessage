@@ -37,8 +37,8 @@ var cmdFindMyDevices = &commands.FullHandler{
 	Name: "findmy-devices",
 	Func: fnFindMyDevices,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Show the location and status of your iCloud-linked Apple devices.",
+		Section:     HelpSectionFindMy,
+		Description: "List iCloud-linked Apple devices with current location, battery, charging state, and a Maps link.",
 	},
 	RequiresLogin: true,
 }

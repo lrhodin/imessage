@@ -19,6 +19,7 @@ package connector
 import (
 	"bytes"
 	"context"
+	cryptoRand "crypto/rand"
 	"fmt"
 	"html"
 	"net/url"
@@ -50,8 +51,8 @@ var cmdFaceTime = &commands.FullHandler{
 	Aliases: []string{"ft"},
 	Func:    fnFaceTime,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Get a shareable FaceTime link for your iMessage account.",
+		Section:     HelpSectionFaceTime,
+		Description: "In a DM portal: call the contact — a join link is posted and their phone rings when you tap it. In the management room: print a shareable FaceTime link for your account.",
 		Args:        "[handle]",
 	},
 	RequiresLogin: true,
@@ -65,8 +66,8 @@ var cmdFaceTimeSend = &commands.FullHandler{
 	Name: "facetime-send",
 	Func: fnFaceTimeSend,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Send a FaceTime link to the iMessage contact in this portal.",
+		Section:     HelpSectionFaceTime,
+		Description: "Generate a FaceTime link and iMessage it to the contact in this portal so they can tap to join.",
 	},
 	RequiresLogin: true,
 }
@@ -77,8 +78,8 @@ var cmdFaceTimeClear = &commands.FullHandler{
 	Name: "facetime-clear",
 	Func: fnFaceTimeClear,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Revoke all bridge FaceTime links and generate a new one on next !facetime.",
+		Section:     HelpSectionFaceTime,
+		Description: "Revoke every bridge-created FaceTime link so the next `facetime` call mints a fresh one.",
 	},
 	RequiresLogin: true,
 }
@@ -87,8 +88,8 @@ var cmdFaceTimeState = &commands.FullHandler{
 	Name: "facetime-state",
 	Func: fnFaceTimeState,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Show raw FaceTime client state JSON (debug).",
+		Section:     HelpSectionFaceTime,
+		Description: "Dump raw FaceTime client state (sessions, links, pending requests) as JSON — debugging only.",
 	},
 	RequiresLogin: true,
 }
@@ -97,8 +98,8 @@ var cmdFaceTimeSessionLink = &commands.FullHandler{
 	Name: "facetime-session-link",
 	Func: fnFaceTimeSessionLink,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Get the join link for an existing FaceTime session GUID.",
+		Section:     HelpSectionFaceTime,
+		Description: "Rebuild the join URL for an existing FaceTime session from its GUID.",
 		Args:        "<session-guid>",
 	},
 	RequiresLogin: true,
@@ -108,8 +109,8 @@ var cmdFaceTimeUseLink = &commands.FullHandler{
 	Name: "facetime-use-link",
 	Func: fnFaceTimeUseLink,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Move a FaceTime link from one usage tag to another.",
+		Section:     HelpSectionFaceTime,
+		Description: "Reassign a FaceTime link from one usage tag to another (e.g. 'personal' → 'work').",
 		Args:        "<old-usage> <new-usage>",
 	},
 	RequiresLogin: true,
@@ -119,8 +120,8 @@ var cmdFaceTimeDeleteLink = &commands.FullHandler{
 	Name: "facetime-delete-link",
 	Func: fnFaceTimeDeleteLink,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Delete a FaceTime link by pseud.",
+		Section:     HelpSectionFaceTime,
+		Description: "Delete a specific FaceTime link by its pseud identifier.",
 		Args:        "<pseud>",
 	},
 	RequiresLogin: true,
@@ -130,8 +131,8 @@ var cmdFaceTimeLetMeIn = &commands.FullHandler{
 	Name: "facetime-letmein",
 	Func: fnFaceTimeLetMeIn,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "List pending delegated Let Me In requests.",
+		Section:     HelpSectionFaceTime,
+		Description: "List FaceTime Let-Me-In requests that are pending delegated approval from this bridge.",
 	},
 	RequiresLogin: true,
 }
@@ -140,8 +141,8 @@ var cmdFaceTimeLetMeInApprove = &commands.FullHandler{
 	Name: "facetime-letmein-approve",
 	Func: fnFaceTimeLetMeInApprove,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Approve a delegated Let Me In request.",
+		Section:     HelpSectionFaceTime,
+		Description: "Approve a pending Let-Me-In request by delegation UUID (optionally restrict access to a named group).",
 		Args:        "<delegation-uuid> [approved-group]",
 	},
 	RequiresLogin: true,
@@ -151,8 +152,8 @@ var cmdFaceTimeLetMeInDeny = &commands.FullHandler{
 	Name: "facetime-letmein-deny",
 	Func: fnFaceTimeLetMeInDeny,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Deny a delegated Let Me In request.",
+		Section:     HelpSectionFaceTime,
+		Description: "Deny a pending Let-Me-In request by delegation UUID.",
 		Args:        "<delegation-uuid>",
 	},
 	RequiresLogin: true,
@@ -162,8 +163,8 @@ var cmdFaceTimeCreateSession = &commands.FullHandler{
 	Name: "facetime-create-session",
 	Func: fnFaceTimeCreateSession,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Create a FaceTime session for a group and participants.",
+		Section:     HelpSectionFaceTime,
+		Description: "Create a new FaceTime session for a given group ID and list of participant handles.",
 		Args:        "<group-id> <participants...>",
 	},
 	RequiresLogin: true,
@@ -173,8 +174,8 @@ var cmdFaceTimeRing = &commands.FullHandler{
 	Name: "facetime-ring",
 	Func: fnFaceTimeRing,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Ring targets in an existing FaceTime session.",
+		Section:     HelpSectionFaceTime,
+		Description: "Ring the listed targets in an existing FaceTime session; pass --letmein to include a LetMeIn push.",
 		Args:        "<session-id> <targets...> [--letmein]",
 	},
 	RequiresLogin: true,
@@ -184,8 +185,8 @@ var cmdFaceTimeAddMembers = &commands.FullHandler{
 	Name: "facetime-add-members",
 	Func: fnFaceTimeAddMembers,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Add members to a FaceTime session.",
+		Section:     HelpSectionFaceTime,
+		Description: "Add participants to an existing FaceTime session; pass --letmein to send a LetMeIn push.",
 		Args:        "<session-id> <handles...> [--letmein]",
 	},
 	RequiresLogin: true,
@@ -195,8 +196,8 @@ var cmdFaceTimeRemoveMembers = &commands.FullHandler{
 	Name: "facetime-remove-members",
 	Func: fnFaceTimeRemoveMembers,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Remove members from a FaceTime session.",
+		Section:     HelpSectionFaceTime,
+		Description: "Remove participants from an existing FaceTime session.",
 		Args:        "<session-id> <handles...>",
 	},
 	RequiresLogin: true,
@@ -210,6 +211,17 @@ const bridgeFaceTimeLinkUsage = "bridge"
 var faceTimeURLRegex = regexp.MustCompile(`(?i)(?:facetime://[^\s<>")']+|(?:https?://)?(?:www\.)?facetime\.apple\.com/[^\s<>")']+)`)
 
 func fnFaceTime(ce *commands.Event) {
+	// In a DM portal with no explicit handle arg, `!facetime` acts as
+	// "call the contact": it creates a fresh session, posts the join link
+	// as a silent bot notice, and queues a ring so the contact's phone
+	// only rings once the caller actually taps the link. Group portals and
+	// explicit-handle usage fall through to the link-only behavior below.
+	if ce.Portal != nil && len(ce.Args) == 0 {
+		if handled := fnFaceTimeCallInPortal(ce); handled {
+			return
+		}
+	}
+
 	client, handles, explicit, ok := faceTimeClientAndCandidates(ce)
 	if !ok {
 		return
@@ -225,7 +237,7 @@ func fnFaceTime(ce *commands.Event) {
 	for _, handle := range handles {
 		link, linkErr := getFaceTimeLinkWithRecovery(ft, handle)
 		if linkErr == nil {
-			ce.Reply("FaceTime link for **%s**: %s\n\nShare this link to start a FaceTime call. Use `!facetime-clear` to revoke it.", handle, link)
+			ce.Reply("FaceTime link for **%s**: %s\n\nShare this link to start a FaceTime call. Use `!im facetime-clear` to revoke it.", handle, link)
 			return
 		}
 		lastErr = linkErr
@@ -238,6 +250,103 @@ func fnFaceTime(ce *commands.Event) {
 		lastErr = fmt.Errorf("no usable FaceTime handles found")
 	}
 	ce.Reply("Failed to get FaceTime link: %v\n\nAvailable handles: `%s`", lastErr, strings.Join(handles, "`, `"))
+}
+
+// fnFaceTimeCallInPortal handles the portal-room variant of !facetime: create
+// a new session for the caller + the DM contact, return the join link, and
+// queue a ring that fires the instant the caller's JoinEvent arrives. Returns
+// true if it handled the command (reply already sent); false to signal that
+// the caller should fall through to the link-only branch (group portal, etc.).
+func fnFaceTimeCallInPortal(ce *commands.Event) bool {
+	portalID := string(ce.Portal.ID)
+	// Group portals fall through to link behavior — ringing a group with
+	// the pending-ring flow would need per-participant tracking that we
+	// don't wire up yet.
+	if strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",") {
+		return false
+	}
+
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("No active login found.")
+		return true
+	}
+	client, isClient := login.Client.(*IMClient)
+	if !isClient || client == nil || client.client == nil {
+		ce.Reply("Bridge client not available.")
+		return true
+	}
+	if client.handle == "" {
+		ce.Reply("No iMessage handle configured. Please complete bridge setup first.")
+		return true
+	}
+
+	conv := client.portalToConversation(ce.Portal)
+	var target string
+	for _, p := range conv.Participants {
+		if !client.isMyHandle(p) {
+			target = p
+			break
+		}
+	}
+	if target == "" {
+		ce.Reply("Could not determine the iMessage contact in this portal.")
+		return true
+	}
+
+	ft, err := client.client.GetFacetimeClient()
+	if err != nil {
+		ce.Reply("Failed to initialize FaceTime client: %v", err)
+		return true
+	}
+
+	sessionID, err := newFaceTimeSessionID()
+	if err != nil {
+		ce.Reply("Failed to generate session ID: %v", err)
+		return true
+	}
+
+	if err := ft.CreateSession(sessionID, client.handle, []string{target}); err != nil {
+		ce.Reply("Failed to create FaceTime session: %v", err)
+		return true
+	}
+
+	link, err := ft.GetSessionLink(sessionID)
+	if err != nil {
+		ce.Reply("Session created but link fetch failed: %v", err)
+		return true
+	}
+
+	if err := ft.RegisterPendingRing(sessionID, []string{target}, 60); err != nil {
+		ce.Reply("Session and link are ready, but ring registration failed: %v", err)
+		return true
+	}
+
+	recipient := stripIdentifierPrefix(target)
+	ce.Reply(
+		"FaceTime call ready: %s\n\n"+
+			"⚠️ **Tapping this link will ring %s's phone.** The ring fires the moment you join — so open the link when you're ready to be on camera. "+
+			"If you don't tap within 60 seconds the session is dropped and nothing rings.",
+		link, recipient,
+	)
+	return true
+}
+
+// newFaceTimeSessionID returns a random uppercase UUID v4 — Apple's FaceTime
+// session GUID format. Used by the portal !facetime flow to mint a fresh
+// group_id per call.
+func newFaceTimeSessionID() (string, error) {
+	var b [16]byte
+	if _, err := cryptoRand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // RFC 4122 version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 1
+	return strings.ToUpper(fmt.Sprintf(
+		"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+		b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+	)), nil
 }
 
 // fnFaceTimeSend is the handler for !facetime-send. It generates a FaceTime

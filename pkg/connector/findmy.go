@@ -43,8 +43,8 @@ var cmdFindMy = &commands.FullHandler{
 	Name: "findmy",
 	Func: fnFindMy,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Show the current locations of your Find My accessories (AirTags, etc.).",
+		Section:     HelpSectionFindMy,
+		Description: "List your Find My accessories (AirTags, etc.) with current location, accuracy, and a Maps link.",
 	},
 	RequiresLogin: true,
 }
@@ -53,8 +53,8 @@ var cmdFindMySyncItems = &commands.FullHandler{
 	Name: "findmy-sync-items",
 	Func: fnFindMySyncItems,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Sync Find My items metadata, optionally including shared items.",
+		Section:     HelpSectionFindMy,
+		Description: "Re-fetch Find My items metadata from iCloud; --fetch-shares also pulls shared-item invites.",
 		Args:        "[--fetch-shares]",
 	},
 	RequiresLogin: true,
@@ -64,8 +64,8 @@ var cmdFindMyAcceptShare = &commands.FullHandler{
 	Name: "findmy-accept-share",
 	Func: fnFindMyAcceptShare,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Accept a Find My item share by circle ID.",
+		Section:     HelpSectionFindMy,
+		Description: "Accept a pending Find My item share by its circle ID.",
 		Args:        "<circle-id>",
 	},
 	RequiresLogin: true,
@@ -75,8 +75,8 @@ var cmdFindMyDeleteItem = &commands.FullHandler{
 	Name: "findmy-delete-item",
 	Func: fnFindMyDeleteItem,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Delete a shared Find My item by item ID.",
+		Section:     HelpSectionFindMy,
+		Description: "Delete a shared Find My item; pass --remove-beacon to also forget the associated beacon.",
 		Args:        "<item-id> [--remove-beacon]",
 	},
 	RequiresLogin: true,
@@ -86,8 +86,8 @@ var cmdFindMyRenameBeacon = &commands.FullHandler{
 	Name: "findmy-rename-beacon",
 	Func: fnFindMyRenameBeacon,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Rename a Find My beacon by associated beacon + role ID.",
+		Section:     HelpSectionFindMy,
+		Description: "Rename a Find My beacon or item by its associated-beacon + role ID; optional emoji.",
 		Args:        "<associated-beacon> <role-id> <name> [emoji]",
 	},
 	RequiresLogin: true,
@@ -97,8 +97,8 @@ var cmdFindMyStateJSON = &commands.FullHandler{
 	Name: "findmy-state-json",
 	Func: fnFindMyStateJSON,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Show raw Find My state JSON (debug).",
+		Section:     HelpSectionFindMy,
+		Description: "Dump raw Find My state as JSON — debugging only.",
 	},
 	RequiresLogin: true,
 }
@@ -107,8 +107,8 @@ var cmdFindMyStateBytes = &commands.FullHandler{
 	Name: "findmy-state-bytes",
 	Func: fnFindMyStateBytes,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Show Find My state bytes length + hash (debug).",
+		Section:     HelpSectionFindMy,
+		Description: "Show the Find My state blob size and a hash — debugging only.",
 	},
 	RequiresLogin: true,
 }

@@ -37,8 +37,8 @@ var cmdFindMyFriends = &commands.FullHandler{
 	Name: "findmy-friends",
 	Func: fnFindMyFriends,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Show your Find My Friends followers and following.",
+		Section:     HelpSectionFindMy,
+		Description: "List your Find My Friends followers and followings; --daemon uses fmfd for background requests.",
 		Args:        "[--daemon]",
 	},
 	RequiresLogin: true,
@@ -54,8 +54,8 @@ var cmdFindMyFriendsImport = &commands.FullHandler{
 	Name: "findmy-friends-import",
 	Func: fnFindMyFriendsImport,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Import a Find My Friends location-share URL (from iMessage deep-link).",
+		Section:     HelpSectionFindMy,
+		Description: "Accept a Find My Friends location share by pasting the URL from an iMessage deep-link.",
 		Args:        "<url> [--daemon]",
 	},
 	RequiresLogin: true,

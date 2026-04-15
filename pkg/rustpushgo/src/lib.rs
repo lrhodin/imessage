@@ -2865,6 +2865,49 @@ const FACETIME_RING_MARKER: &str = "[[FACETIME_RING]]";
 const FACETIME_MISSED_MARKER: &str = "[[FACETIME_MISSED]]";
 const FACETIME_ANSWERED_ELSEWHERE_MARKER: &str = "[[FACETIME_ANSWERED_ELSEWHERE]]";
 
+// Tracks FaceTime sessions that should ring a set of targets as soon as any
+// participant joins. Populated by `!im facetime` in a portal room: the command
+// creates a session for the user + contact, returns a join link, and queues
+// a pending ring here. When the user taps the link and their JoinEvent
+// arrives on the APNs stream, the receive loop fires ft.ring() against the
+// queued targets so the contact's phone doesn't ring until the caller is
+// actually in the session.
+struct PendingFTRing {
+    targets: Vec<String>,
+    expires_at: std::time::Instant,
+}
+
+static PENDING_FT_RINGS: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, PendingFTRing>>> =
+    std::sync::OnceLock::new();
+
+fn pending_ft_rings() -> &'static tokio::sync::Mutex<HashMap<String, PendingFTRing>> {
+    PENDING_FT_RINGS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str) {
+    let targets = {
+        let mut map = pending_ft_rings().lock().await;
+        match map.remove(guid) {
+            Some(p) if p.expires_at > std::time::Instant::now() => p.targets,
+            _ => return,
+        }
+    };
+    let session = {
+        let state = ft.state.read().await;
+        match state.sessions.get(guid).cloned() {
+            Some(s) => s,
+            None => {
+                warn!("pending ring: session {} not found", guid);
+                return;
+            }
+        }
+    };
+    match ft.ring(&session, &targets, false).await {
+        Ok(_) => info!("pending ring: rang {} target(s) in session {}", targets.len(), guid),
+        Err(e) => warn!("pending ring: ft.ring failed for session {}: {:?}", guid, e),
+    }
+}
+
 async fn auto_approve_bridge_letmein(
     facetime: &rustpush::facetime::FTClient,
     request: &rustpush::facetime::LetMeInRequest,
@@ -4575,6 +4618,19 @@ impl WrappedFaceTimeClient {
         Ok(())
     }
 
+    // Queue a ring that fires as soon as any participant joins this session.
+    // The portal !facetime command uses this so the contact's phone doesn't
+    // ring until the caller has actually tapped the join link. Entries
+    // self-expire after ttl_secs to avoid orphan rings.
+    pub async fn register_pending_ring(&self, session_id: String, targets: Vec<String>, ttl_secs: u64) -> Result<(), WrappedError> {
+        let mut map = pending_ft_rings().lock().await;
+        map.insert(session_id, PendingFTRing {
+            targets,
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs),
+        });
+        Ok(())
+    }
+
     pub async fn list_delegated_letmein_requests(&self) -> Vec<WrappedLetMeInRequest> {
         let delegated = self.inner.delegated_requests.lock().await;
         delegated
@@ -5568,6 +5624,9 @@ pub async fn new_client(
                             if let Err(e) = auto_approve_bridge_letmein(ft_for_recv.as_ref(), request).await {
                                 warn!("FaceTime auto-approve LetMeIn failed: {:?}", e);
                             }
+                        }
+                        if let rustpush::facetime::FTMessage::JoinEvent { guid, .. } = &ft_message {
+                            maybe_fire_pending_ring(ft_for_recv.as_ref(), guid).await;
                         }
                         if let Some(wrapped) = facetime_event_to_wrapped(ft_for_recv.as_ref(), &ft_message).await {
                             callback.on_message(wrapped);

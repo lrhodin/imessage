@@ -40,8 +40,8 @@ var cmdSharedAlbums = &commands.FullHandler{
 	Name: "shared-albums",
 	Func: fnSharedAlbums,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "List your subscribed iCloud Shared Streams albums.",
+		Section:     HelpSectionSharedStreams,
+		Description: "List the iCloud Shared Streams albums you're currently subscribed to.",
 	},
 	RequiresLogin: true,
 }
@@ -51,8 +51,8 @@ var cmdSharedPhotos = &commands.FullHandler{
 	Name: "shared-photos",
 	Func: fnSharedPhotos,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "List photo/video GUIDs in a shared album.",
+		Section:     HelpSectionSharedStreams,
+		Description: "List every photo and video GUID in a shared album.",
 		Args:        "<album-id>",
 	},
 	RequiresLogin: true,
@@ -62,8 +62,8 @@ var cmdSharedSubscribe = &commands.FullHandler{
 	Name: "shared-subscribe",
 	Func: fnSharedSubscribe,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Subscribe to a shared album by album ID.",
+		Section:     HelpSectionSharedStreams,
+		Description: "Subscribe to a shared album by its album ID so the bridge watches it for new assets.",
 		Args:        "<album-id>",
 	},
 	RequiresLogin: true,
@@ -73,8 +73,8 @@ var cmdSharedSubscribeToken = &commands.FullHandler{
 	Name: "shared-subscribe-token",
 	Func: fnSharedSubscribeToken,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Subscribe to a shared album using an invitation token.",
+		Section:     HelpSectionSharedStreams,
+		Description: "Subscribe to a shared album using the one-time invitation token from an iCloud share URL.",
 		Args:        "<token>",
 	},
 	RequiresLogin: true,
@@ -84,8 +84,8 @@ var cmdSharedUnsubscribe = &commands.FullHandler{
 	Name: "shared-unsubscribe",
 	Func: fnSharedUnsubscribe,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Unsubscribe from a shared album.",
+		Section:     HelpSectionSharedStreams,
+		Description: "Unsubscribe from a shared album by album ID so the bridge stops watching it.",
 		Args:        "<album-id>",
 	},
 	RequiresLogin: true,
@@ -95,8 +95,8 @@ var cmdSharedState = &commands.FullHandler{
 	Name: "shared-state",
 	Func: fnSharedState,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Show raw Shared Streams state JSON (debug).",
+		Section:     HelpSectionSharedStreams,
+		Description: "Dump raw Shared Streams state (subscriptions, asset metadata) as JSON — debugging only.",
 	},
 	RequiresLogin: true,
 }
@@ -105,8 +105,8 @@ var cmdSharedAssetsJSON = &commands.FullHandler{
 	Name: "shared-assets-json",
 	Func: fnSharedAssetsJSON,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Export asset details JSON for specific album assets.",
+		Section:     HelpSectionSharedStreams,
+		Description: "Export full asset metadata as JSON for specific assets in an album — debugging only.",
 		Args:        "<album-id> <asset-guid...>",
 	},
 	RequiresLogin: true,
@@ -116,8 +116,8 @@ var cmdSharedDeleteAssets = &commands.FullHandler{
 	Name: "shared-delete-assets",
 	Func: fnSharedDeleteAssets,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Delete specific assets from an album.",
+		Section:     HelpSectionSharedStreams,
+		Description: "Delete specific assets from a shared album by asset GUID.",
 		Args:        "<album-id> <asset-guid...>",
 	},
 	RequiresLogin: true,
@@ -127,8 +127,8 @@ var cmdSharedDownloadFile = &commands.FullHandler{
 	Name: "shared-download-file",
 	Func: fnSharedDownloadFile,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Download a Shared Streams file by checksum/token/url and report size/hash.",
+		Section:     HelpSectionSharedStreams,
+		Description: "Fetch a Shared Streams file by checksum/token/url and report its size and hash — debugging only.",
 		Args:        "<checksum-hex> <token> <url>",
 	},
 	RequiresLogin: true,
@@ -138,8 +138,8 @@ var cmdSharedCreateAssetB64 = &commands.FullHandler{
 	Name: "shared-create-asset-b64",
 	Func: fnSharedCreateAssetB64,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionGeneral,
-		Description: "Create an asset from base64 bytes (admin/debug).",
+		Section:     HelpSectionSharedStreams,
+		Description: "Upload an asset from base64-encoded bytes into a shared album — admin/debug only.",
 		Args:        "<album-id> <filename> <width> <height> <uti-type> <base64-data> [video-type]",
 	},
 	RequiresLogin: true,

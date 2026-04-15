@@ -33,6 +33,17 @@ import (
 	"github.com/lrhodin/imessage/imessage"
 )
 
+// Help sections for Apple-service commands added by this bridge. Orders slot
+// in after bridgev2's built-in sections (General=0, Auth=10, Chats=20,
+// Admin=50), so `!im help` renders each service as its own heading at the
+// bottom instead of lumping everything under "General".
+var (
+	HelpSectionFaceTime      = commands.HelpSection{Name: "FaceTime", Order: 60}
+	HelpSectionFindMy        = commands.HelpSection{Name: "Find My", Order: 70}
+	HelpSectionSharedStreams = commands.HelpSection{Name: "Shared Streams", Order: 80}
+	HelpSectionStatusKit     = commands.HelpSection{Name: "StatusKit", Order: 90}
+)
+
 // BridgeCommands returns the custom slash commands for the iMessage bridge.
 // Register these in main.go's PostInit hook:
 //
