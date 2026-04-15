@@ -4073,19 +4073,30 @@ async fn fetch_imessage_mmcs_authorize_body(
     // check the parsed payload fields directly and trust APNs routing
     // to only deliver com.apple.madrid messages on this subscription.
     let predicate = move |msg: rustpush::APSMessage| -> Option<Value> {
-        // After the packed-APS-encoding refactor, payload is plist::Value
-        // (Value::Data variant when it carries bytes) instead of Vec<u8>.
-        if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = msg {
-            if let Ok(parsed) = plist::from_bytes::<Value>(&payload) {
-                let dict = parsed.as_dictionary()?;
-                let c = dict.get("c")?.as_unsigned_integer()?;
-                let i = dict.get("i")?.as_unsigned_integer()? as u32;
-                if c == 151 && i == msg_id {
-                    return Some(parsed);
-                }
-            }
+        // Upstream APSPackedValue::Into<Value> maps each packed-attribute
+        // kind to its corresponding plist::Value variant (aps.rs:31-42),
+        // so MMCS auth responses with a Dict-encoded payload arrive as
+        // Value::Dictionary, while Data-encoded payloads arrive as
+        // Value::Data carrying raw plist bytes. Accept both — matches
+        // upstream's get_message helper, which doesn't constrain the
+        // variant.
+        let rustpush::APSMessage::Notification { payload, .. } = msg else { return None };
+        let parsed = match payload {
+            plist::Value::Data(bytes) => plist::from_bytes::<Value>(&bytes).ok()?,
+            v => v,
+        };
+        let dict = parsed.as_dictionary()?;
+        let c = dict.get("c")?.as_unsigned_integer()?;
+        let i_val = dict.get("i")?;
+        let i = i_val
+            .as_unsigned_integer()
+            .map(|v| v as u32)
+            .or_else(|| i_val.as_signed_integer().map(|v| v as u32))?;
+        if c == 151 && i == msg_id {
+            Some(parsed)
+        } else {
+            None
         }
-        None
     };
 
     // The `wait_for_timeout` future can in principle panic on malformed
