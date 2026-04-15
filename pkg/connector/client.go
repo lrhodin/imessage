@@ -2880,15 +2880,6 @@ func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.W
 		}
 	}
 
-	// Pre-fill the caller's display name on the FaceTime web join page
-	// so tapping the answer button drops them straight into the call
-	// without the "enter your name" prompt.
-	if link != "" {
-		if slug := displayNameForHandle(c.handle); slug != "" {
-			link = appendFaceTimeLinkName(link, slug)
-		}
-	}
-
 	// Build the notice as markdown so the join link renders as a tappable
 	// anchor in the formatted_body. Plain-URL notices aren't autolinked by
 	// every Matrix client; wrapping the URL in [text](url) guarantees an

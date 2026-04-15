@@ -335,15 +335,6 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return true
 	}
 
-	// Apple's web join flow reads &n=<name> from the URL fragment and
-	// pre-fills the "your name" field, so the caller only has to hit Join.
-	// We don't have an IDS-exposed display name for the account, so derive
-	// one from the caller's own handle local-part.
-	slug := displayNameForHandle(client.handle)
-	if slug != "" {
-		link = appendFaceTimeLinkName(link, slug)
-	}
-
 	recipient := stripIdentifierPrefix(target)
 	ce.Reply(
 		"[**📹 Join FaceTime call**](%s)\n\n"+
@@ -352,33 +343,6 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		link, recipient, link,
 	)
 	return true
-}
-
-// displayNameForHandle turns an iMessage handle (mailto:foo@bar.com or
-// tel:+15551234567) into a human-readable label we can stuff into the web
-// FaceTime join URL's &n= slug. Email handles use the local-part; phone
-// handles fall back to the bare number (better than making the caller type
-// a name, which is the whole point of the slug).
-func displayNameForHandle(handle string) string {
-	bare := stripIdentifierPrefix(handle)
-	if bare == "" {
-		return ""
-	}
-	if at := strings.IndexByte(bare, '@'); at > 0 {
-		return bare[:at]
-	}
-	return bare
-}
-
-// appendFaceTimeLinkName inserts &n=<urlencoded-name> into the URL fragment
-// of a FaceTime join link. Apple's web client reads this to pre-populate the
-// display-name field on the join screen.
-func appendFaceTimeLinkName(link, name string) string {
-	encoded := url.QueryEscape(name)
-	if strings.Contains(link, "#") {
-		return link + "&n=" + encoded
-	}
-	return link + "#n=" + encoded
 }
 
 // newFaceTimeSessionID returns a random uppercase UUID v4 — Apple's FaceTime
