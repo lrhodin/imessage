@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	cryptoRand "crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"html"
 	"net/url"
@@ -406,29 +407,23 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 	return true
 }
 
-// appendFaceTimeLinkName appends &n=<name> to a FaceTime web join link so
-// Apple's join page pre-fills the display-name field. The URL fragment
-// (everything after #) is parsed by Apple's JS, not the server. Use a
-// minimal escape that only percent-encodes characters that would actually
-// break fragment parsing (#, &) — most observable evidence suggests Apple's
-// fragment parser shows percent-encoded sequences literally rather than
-// decoding them, so over-encoding (e.g. + → %2B from url.QueryEscape) is
-// what produces the gibberish display.
+// appendFaceTimeLinkName appends &n=<base64-name> to a FaceTime web join
+// link so Apple's join page pre-fills the display-name field.
+//
+// Apple's web FT page base64-decodes the &n= value (matching the &k= and &p=
+// pattern, both of which are URL-safe base64 of binary data — see upstream
+// facetime.rs:100/557). Sending raw text caused the page to atob() it: e.g.
+// "+18454996730" base64-decodes to 9 bytes (0xFB 0x5F 0x38 0xE7 0x9E 0x3D
+// 0xF7 0xAE 0xF7) which renders as "?_8?[??" — exactly the gibberish the
+// previous attempt (commit f168c0d, reverted in 8d9c8f2) produced.
+//
+// Use URL-safe base64 with no padding to match the encoding upstream uses
+// for the other fragment params.
 func appendFaceTimeLinkName(link, name string) string {
 	if name == "" {
 		return link
 	}
-	var b strings.Builder
-	b.Grow(len(name))
-	for _, r := range name {
-		switch r {
-		case '#', '&', '%':
-			fmt.Fprintf(&b, "%%%02X", r)
-		default:
-			b.WriteRune(r)
-		}
-	}
-	encoded := b.String()
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(name))
 	if strings.Contains(link, "#") {
 		return link + "&n=" + encoded
 	}
