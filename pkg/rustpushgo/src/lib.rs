@@ -5838,7 +5838,7 @@ pub async fn new_client(
                                     workaround_consumed = true;
                                 }
                                 Ok(false) => {
-                                    debug!("StatusKit workaround: receive_message returned None or partial fields, falling through");
+                                    warn!("StatusKit workaround: keysharing Dictionary-payload arrived but receive_message returned None or partial fields — IDS decryption may have failed; falling through to upstream handle()");
                                 }
                                 Err(e) => {
                                     warn!(
@@ -6871,7 +6871,12 @@ impl Client {
         ).await.map_err(|e| WrappedError::GenericError {
             msg: format!("StatusKit targets_for_handles failed: {:?}", e),
         })?;
-        info!("StatusKit: IDS found {} delivery target(s) for {} handle(s)", targets.len(), handles.len());
+        let reachable_handles: std::collections::HashSet<&str> = targets.iter().map(|t| t.participant.as_str()).collect();
+        let unreachable = handles.iter().filter(|h| !reachable_handles.contains(h.as_str())).count();
+        info!(
+            "StatusKit: IDS found {} delivery target(s) for {}/{} handle(s) ({} unreachable)",
+            targets.len(), reachable_handles.len(), handles.len(), unreachable
+        );
 
         // Zero targets here means the cache has stale empty entries from a
         // prior session (they're considered "not dirty" for up to 1 hour by

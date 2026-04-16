@@ -1658,13 +1658,17 @@ func (c *IMClient) findPortalForAliases(ctx context.Context, log zerolog.Logger,
 
 // OnKeysReceived is called by StatusKit when a key-sharing message arrives.
 // New encryption keys mean we can now subscribe to APNs presence channels
-// for handles that previously had no keys. Re-subscribe to pick them up.
+// for handles that previously had no keys. Re-subscribe to pick them up,
+// and reciprocate by sending our key to any handle that keyed us but hasn't
+// received our invite yet (iOS does this automatically; the bridge must do
+// it explicitly or the exchange stays one-sided).
 func (c *IMClient) OnKeysReceived() {
 	log := c.UserLogin.Log.With().
 		Str("component", "statuskit").
 		Logger()
 	log.Info().Msg("StatusKit: key-sharing message received — re-subscribing to presence")
 	go c.subscribeToContactPresence(log)
+	go c.reciprocateStatusSharingKeys(log)
 }
 
 // OnMessage is called by rustpush when a message is received via APNs.

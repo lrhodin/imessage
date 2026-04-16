@@ -986,6 +986,70 @@ func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
 		Msg("Sent periodic StatusKit re-invite to pending ghosts")
 }
 
+// reciprocateStatusSharingKeys sends our StatusKit key to any handle that
+// keyed us (present in state.keys) but that we never invited (no KV entry).
+// On real iOS this reciprocation is automatic; without it the exchange stays
+// one-sided: the peer shared their key with us but never received ours, so
+// they can't see our presence and may stop sharing. Called from OnKeysReceived.
+func (c *IMClient) reciprocateStatusSharingKeys(log zerolog.Logger) {
+	if c.client == nil || c.handle == "" {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warn().Interface("panic", r).Msg("reciprocateStatusSharingKeys panicked — skipped")
+		}
+	}()
+
+	sk, err := c.client.GetStatuskitClient()
+	if err != nil || sk == nil {
+		return
+	}
+	known := sk.GetKnownHandles()
+	if len(known) == 0 {
+		return
+	}
+
+	ctx := context.Background()
+	now := time.Now()
+	var uninvited []string
+	for _, h := range known {
+		last := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitLastInviteKeyPrefix+h))
+		if last != "" {
+			continue
+		}
+		uninvited = append(uninvited, h)
+	}
+	if len(uninvited) == 0 {
+		return
+	}
+
+	senders := c.allHandles
+	if len(senders) == 0 && c.handle != "" {
+		senders = []string{c.handle}
+	}
+	var okCount, failCount int
+	for _, sender := range senders {
+		if err := c.client.InviteToStatusSharing(sender, uninvited); err != nil {
+			failCount++
+			log.Warn().Err(err).Str("sender", sender).Int("count", len(uninvited)).Msg("StatusKit reciprocal invite failed for sender")
+		} else {
+			okCount++
+		}
+	}
+	if okCount > 0 {
+		nowStr := now.Format(time.RFC3339)
+		for _, h := range uninvited {
+			c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+h), nowStr)
+		}
+	}
+	log.Info().
+		Int("uninvited", len(uninvited)).
+		Int("senders_ok", okCount).
+		Int("senders_failed", failCount).
+		Msg("Sent reciprocal StatusKit key invite to handles that keyed us first")
+}
+
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	if c.contacts == nil {
 		return
