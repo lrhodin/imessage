@@ -951,15 +951,17 @@ func (c *IMClient) Connect(ctx context.Context) {
 			// and failed with "StatusKit not initialized". Re-run it now that
 			// the StatusKit client is guaranteed to be ready.
 			c.subscribeToContactPresence(log)
-			// Publish our own status so contacts' iOS discovers this device
-			// and initiates the key exchange automatically. OpenBubbles uses
-			// this passive approach — contacts' devices see the published
-			// status via IDS and send their keys without a proactive invite.
+			// Best-effort status publish so contacts' iOS discovers this device.
+			// Non-fatal: the sharedchannels.auth GSA token may not be available
+			// (e.g. NeedsDevice2FA on token refresh). Invites still work via IDS.
 			if err := c.client.SetStatus(true); err != nil {
-				log.Warn().Err(err).Msg("StatusKit: failed to publish status (contacts may not discover this device)")
+				log.Warn().Err(err).Msg("StatusKit: failed to publish status (non-fatal, invites use IDS)")
 			} else {
-				log.Info().Msg("StatusKit: published status — waiting for contacts to initiate key exchange")
+				log.Info().Msg("StatusKit: published status")
 			}
+			// Send our StatusKit key to known contacts to trigger key exchange.
+			// Uses IDS (not GSA), so this works even when GSA tokens are stale.
+			c.inviteContactsToStatusSharing(log)
 		}
 		select {
 		case err := <-done:
@@ -982,9 +984,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	c.stopChan = make(chan struct{})
 	c.msgBuffer = &messageBuffer{client: c}
 	go c.periodicStateSave(log)
-	// Periodic reinvite disabled — using passive discovery instead.
-	// Contacts' iOS initiates key exchange when it discovers this device.
-	// go c.periodicStatusSharingReinvite(log)
+	go c.periodicStatusSharingReinvite(log)
 	go c.startSharedStreamsWatcher(log)
 
 	// Ensure shared-profile schema and hydrate the in-memory cache from the

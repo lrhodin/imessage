@@ -836,14 +836,11 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 	if len(handles) == 0 {
 		return
 	}
-	// ensure_channel (called inside invite_to_channel) panics with "No my
-	// key!!" if our StatusKit channel hasn't been allocated yet. SetStatus
-	// calls share_status → ensure_channel safely (returns error, never
-	// panics), allocating our channel key before we attempt the invite.
-	if err := c.client.SetStatus(true); err != nil {
-		log.Warn().Err(err).Msg("StatusKit invite: channel not ready (will retry on next restart)")
-		return
-	}
+	// ensure_channel (called inside invite_to_channel) returns Ok immediately
+	// if my_key is already allocated from a prior session. Only the first-ever
+	// allocation needs the sharedchannels GSA token. Don't gate on SetStatus
+	// here — the GSA token may be stale (NeedsDevice2FA) while IDS invites
+	// still work fine.
 	senders := c.allHandles
 	if len(senders) == 0 && c.handle != "" {
 		senders = []string{c.handle}
@@ -960,10 +957,6 @@ func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
 	}
 
 	// SetStatus allocates our channel if not already; safe to call repeatedly.
-	if err := c.client.SetStatus(true); err != nil {
-		log.Warn().Err(err).Msg("StatusKit re-invite: channel not ready")
-		return
-	}
 	senders := c.allHandles
 	if len(senders) == 0 && c.handle != "" {
 		senders = []string{c.handle}
