@@ -4812,6 +4812,25 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	return body
 }
 
+// retrySendOnAPNsFlap retries an APNs-dependent send up to three times across
+// 3s total when a transient APNs flap manifests as "Send timeout; try again".
+// APNs reconnect grace is 30s on our side, so a short retry almost always
+// lands on the restored connection.
+func retrySendOnAPNsFlap(op func() error) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		err = op()
+		if err == nil {
+			return nil
+		}
+		if msg := strings.ToLower(err.Error()); !strings.Contains(msg, "send timeout; try again") && !strings.Contains(msg, "sendtimedout") {
+			return err
+		}
+		time.Sleep(time.Duration(1+attempt) * time.Second)
+	}
+	return err
+}
+
 func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	if c.client == nil {
 		return nil, bridgev2.ErrNotLoggedIn
@@ -4827,10 +4846,20 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
-	uuid, err := c.client.SendMessage(conv, textToSend, nil, c.handle, replyGuid, replyPart, nil)
+	var uuid string
+	err := retrySendOnAPNsFlap(func() error {
+		var sendErr error
+		uuid, sendErr = c.client.SendMessage(conv, textToSend, nil, c.handle, replyGuid, replyPart, nil)
+		return sendErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
+	zerolog.Ctx(ctx).Info().
+		Str("uuid", uuid).
+		Str("portal_id", string(msg.Portal.ID)).
+		Bool("is_sms", c.isPortalSMS(string(msg.Portal.ID))).
+		Msg("Message sent, storing UUID in bridge DB")
 	// Persist UUID immediately so echo detection works even if the portal
 	// is deleted before the APNs echo arrives.
 	if c.cloudStore != nil {
@@ -5028,7 +5057,12 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		caption = &msg.Content.Body
 	}
 
-	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, caption)
+	var uuid string
+	err = retrySendOnAPNsFlap(func() error {
+		var sendErr error
+		uuid, sendErr = c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, caption)
+		return sendErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
@@ -5058,7 +5092,9 @@ func (c *IMClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixT
 	if conv.IsSms {
 		return nil
 	}
-	return c.client.SendTyping(conv, msg.IsTyping, c.handle)
+	return retrySendOnAPNsFlap(func() error {
+		return c.client.SendTyping(conv, msg.IsTyping, c.handle)
+	})
 }
 
 func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) error {
@@ -5078,7 +5114,9 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 		}
 		forUuid = &uuid
 	}
-	err := c.client.SendReadReceipt(conv, c.handle, forUuid)
+	err := retrySendOnAPNsFlap(func() error {
+		return c.client.SendReadReceipt(conv, c.handle, forUuid)
+	})
 	if err != nil {
 		errStr := err.Error()
 		// Suppress non-actionable failures: IDS lookup errors (6001) for
@@ -5107,7 +5145,10 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	}
 	targetGUID := string(msg.EditTarget.ID)
 
-	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
+	err := retrySendOnAPNsFlap(func() error {
+		_, sendErr := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
+		return sendErr
+	})
 	if err == nil {
 		// Work around mautrix-go bridgev2 not incrementing EditCount before saving.
 		msg.EditTarget.EditCount++
@@ -5127,7 +5168,10 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 
 	// Track outbound unsend so we can suppress the APNs echo.
 	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
-	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
+	err := retrySendOnAPNsFlap(func() error {
+		_, sendErr := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
+		return sendErr
+	})
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
 	// while preserving the UUID for echo detection.
@@ -5175,7 +5219,12 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, false)
 			}
 		}
-		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
+		var uuid string
+		err := retrySendOnAPNsFlap(func() error {
+			var sendErr error
+			uuid, sendErr = c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
+			return sendErr
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
 		}
@@ -5188,7 +5237,10 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 	}
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetMessage.ID))
-	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.handle)
+	err := retrySendOnAPNsFlap(func() error {
+		_, sendErr := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.handle)
+		return sendErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to send tapback: %w", err)
 	}
@@ -5222,7 +5274,12 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, true)
 			}
 		}
-		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
+		var uuid string
+		err := retrySendOnAPNsFlap(func() error {
+			var sendErr error
+			uuid, sendErr = c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
+			return sendErr
+		})
 		if err != nil {
 			return err
 		}
@@ -5231,8 +5288,10 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 	}
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetReaction.MessageID))
-	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.handle)
-	return err
+	return retrySendOnAPNsFlap(func() error {
+		_, sendErr := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.handle)
+		return sendErr
+	})
 }
 
 // HandleMatrixDeleteChat is called when the user deletes a chat in Matrix/Beeper.
