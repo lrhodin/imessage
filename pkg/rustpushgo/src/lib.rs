@@ -2027,27 +2027,22 @@ pub async fn restore_token_provider(
     let spd_bytes = base64_decode(&spd_base64);
     let spd: plist::Dictionary = plist::from_bytes(&spd_bytes)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD plist: {}", e) })?;
+
     account.spd = Some(spd);
 
-    // Best-effort PET refresh on restore using persisted credentials.
-    // This avoids private token constructor hacks while still warming auth state.
-    match account.login_email_pass(&username, &hashed_password).await {
-        Ok(icloud_auth::LoginState::LoggedIn) => {
-            info!("restore_token_provider: proactive PET refresh succeeded");
-        }
-        Ok(state) => {
-            warn!(
-                "restore_token_provider: proactive PET refresh returned non-logged-in state: {:?}",
-                state
-            );
-        }
-        Err(err) => {
-            warn!(
-                "restore_token_provider: proactive PET refresh failed (non-fatal): {}",
-                err
-            );
-        }
-    }
+    // GSA tokens (e.g. com.apple.gs.sharedchannels.auth) are populated by
+    // login_email_pass during the initial 2FA-completed login. On restore,
+    // login_email_pass returns NeedsDevice2FA and destructively overwrites
+    // account.tokens with an empty set — so we intentionally skip it here.
+    // FetchedToken has private fields so we cannot reconstruct tokens from
+    // the persisted SPD either. After a fresh login, tokens are available
+    // for the lifetime of that session. On restart, ensure_channel still
+    // works (persisted my_key), invites use IDS (not GSA), and SetStatus
+    // is already best-effort. Only share_status (publishing your own Focus
+    // state) is unavailable until re-login.
+    info!(
+        "restore_token_provider: restored SPD (GSA tokens unavailable until re-login)"
+    );
 
     // PET remains part of persisted payload for compatibility/telemetry.
     let _ = pet;
