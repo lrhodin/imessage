@@ -231,11 +231,9 @@ func armBridgeFaceTimeCall(
 		return "", "", fmt.Errorf("generate session ID: %w", err)
 	}
 
-	createErr := ft.CreateSessionNoRing(sessionID, callerHandle, []string{targetHandle})
-	if createErr != nil && isLikelyDeliveredSendTimeout(createErr) {
-		time.Sleep(500 * time.Millisecond)
-		createErr = ft.CreateSessionNoRing(sessionID, callerHandle, []string{targetHandle})
-	}
+	createErr := retryOnAPNsFlap(func() error {
+		return ft.CreateSessionNoRing(sessionID, callerHandle, []string{targetHandle})
+	})
 	if createErr != nil {
 		return "", sessionID, fmt.Errorf("create_session_no_ring: %w", createErr)
 	}
@@ -244,13 +242,37 @@ func armBridgeFaceTimeCall(
 		return "", sessionID, fmt.Errorf("register_pending_ring: %w", pendErr)
 	}
 
-	link, linkErr := ft.GetSessionLink(sessionID)
+	var link string
+	linkErr := retryOnAPNsFlap(func() error {
+		var innerErr error
+		link, innerErr = ft.GetSessionLink(sessionID)
+		return innerErr
+	})
 	if linkErr != nil {
 		return "", sessionID, fmt.Errorf("get_session_link: %w", linkErr)
 	}
 
 	link = appendFaceTimeLinkName(link, stripIdentifierPrefix(callerHandle))
 	return link, sessionID, nil
+}
+
+// retryOnAPNsFlap retries an APNs-dependent operation up to three times
+// across 3s total when a transient APNs flap manifests as SendTimedOut or
+// "Send timeout; try again". APNs' reconnect grace is 30s on our side, so a
+// short retry almost always lands on the restored connection.
+func retryOnAPNsFlap(op func() error) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		err = op()
+		if err == nil {
+			return nil
+		}
+		if !isLikelyDeliveredSendTimeout(err) {
+			return err
+		}
+		time.Sleep(time.Duration(1+attempt) * time.Second)
+	}
+	return err
 }
 
 var faceTimeURLRegex = regexp.MustCompile(`(?i)(?:facetime://[^\s<>")']+|(?:https?://)?(?:www\.)?facetime\.apple\.com/[^\s<>")']+)`)
