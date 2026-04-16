@@ -32,7 +32,6 @@ import (
 	log "github.com/rs/zerolog/log"
 	"go.mau.fi/util/ffmpeg"
 	"maunium.net/go/mautrix"
-	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
@@ -118,6 +117,51 @@ var cmdSharedDeleteAssets = &commands.FullHandler{
 		Args:        "<album-id> <asset-guid...>",
 	},
 	RequiresLogin: true,
+}
+
+var cmdSharedDeleteRoom = &commands.FullHandler{
+	Name: "shared-delete-room",
+	Func: fnSharedDeleteRoom,
+	Help: commands.HelpMeta{
+		Section:     HelpSectionSharedStreams,
+		Description: "Delete this shared album download room. Run from inside the album room.",
+	},
+	RequiresLogin: true,
+}
+
+func fnSharedDeleteRoom(ce *commands.Event) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("No active login found.")
+		return
+	}
+	client, ok := login.Client.(*IMClient)
+	if !ok || client == nil {
+		ce.Reply("Bridge client not available.")
+		return
+	}
+
+	client.sharedAlbumRoomsMu.Lock()
+	var foundAlbum string
+	for albumGUID, roomID := range client.sharedAlbumRooms {
+		if roomID == ce.RoomID {
+			foundAlbum = albumGUID
+			break
+		}
+	}
+	if foundAlbum == "" {
+		client.sharedAlbumRoomsMu.Unlock()
+		ce.Reply("This is not a shared album download room.")
+		return
+	}
+	delete(client.sharedAlbumRooms, foundAlbum)
+	client.sharedAlbumRoomsMu.Unlock()
+
+	err := client.Main.Bridge.Bot.DeleteRoom(ce.Ctx, ce.RoomID, false)
+	if err != nil {
+		ce.Reply("Failed to delete room: %v", err)
+		return
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +345,7 @@ func handleAssetSelection(ce *commands.Event, client *IMClient, ss *rustpushgo.W
 		selectedNames = append(selectedNames, name)
 	}
 
-	roomID, dp, err := client.getOrCreateAlbumRoom(ce.Ctx, albumGUID, albumName)
+	roomID, err := client.getOrCreateAlbumRoom(ce.Ctx, albumGUID, albumName)
 	if err != nil {
 		ce.Reply("Failed to create album room: %v", err)
 		return
@@ -310,7 +354,7 @@ func handleAssetSelection(ce *commands.Event, client *IMClient, ss *rustpushgo.W
 	ce.Reply("Downloading %d asset(s) from **%s** \u2014 check the dedicated room for progress.", len(selectedGUIDs), albumName)
 
 	// Use background context — ce.Ctx is cancelled when the command handler returns.
-	go client.downloadSharedAlbumAssets(context.Background(), ss, albumGUID, albumName, selectedGUIDs, selectedNames, roomID, dp)
+	go client.downloadSharedAlbumAssets(context.Background(), ss, albumGUID, albumName, selectedGUIDs, selectedNames, roomID)
 }
 
 // parseAssetSelection parses user input like "1", "1,3,5", "1-5", or "all"
@@ -372,17 +416,12 @@ func parseAssetSelection(input string, total int) ([]int, error) {
 // Dedicated album room
 // ---------------------------------------------------------------------------
 
-func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumName string) (id.RoomID, bridgev2.MatrixAPI, error) {
+func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumName string) (id.RoomID, error) {
 	c.sharedAlbumRoomsMu.Lock()
 	defer c.sharedAlbumRoomsMu.Unlock()
 
-	dp := c.UserLogin.User.DoublePuppet(ctx)
-	if dp == nil {
-		return "", nil, fmt.Errorf("double puppet not available — cannot create album room")
-	}
-
 	if roomID, ok := c.sharedAlbumRooms[albumGUID]; ok {
-		return roomID, dp, nil
+		return roomID, nil
 	}
 
 	displayName := albumName
@@ -390,29 +429,40 @@ func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumNam
 		displayName = "Shared Album"
 	}
 
-	// Create the room as the user (via double puppet) with no other members.
-	// This makes it a solo room the user fully owns and can delete from Beeper.
-	roomID, err := dp.CreateRoom(ctx, &mautrix.ReqCreateRoom{
-		Name:   displayName,
-		Preset: "trusted_private_chat",
+	roomID, err := c.Main.Bridge.Bot.CreateRoom(ctx, &mautrix.ReqCreateRoom{
+		Name:                  displayName,
+		Topic:                 fmt.Sprintf("Shared album download \u2014 %s", displayName),
+		IsDirect:              true,
+		Preset:                "trusted_private_chat",
+		Invite:                []id.UserID{c.UserLogin.User.MXID},
+		BeeperAutoJoinInvites: true,
 	})
 	if err != nil {
-		return "", nil, fmt.Errorf("create room: %w", err)
+		return "", fmt.Errorf("create room: %w", err)
 	}
 
 	c.sharedAlbumRooms[albumGUID] = roomID
-	return roomID, dp, nil
+	return roomID, nil
 }
 
 // ---------------------------------------------------------------------------
 // Background download loop
 // ---------------------------------------------------------------------------
 
-func (c *IMClient) downloadSharedAlbumAssets(ctx context.Context, ss *rustpushgo.WrappedSharedStreamsClient, albumGUID, albumName string, assetGUIDs, assetNames []string, roomID id.RoomID, intent bridgev2.MatrixAPI) {
+func (c *IMClient) downloadSharedAlbumAssets(ctx context.Context, ss *rustpushgo.WrappedSharedStreamsClient, albumGUID, albumName string, assetGUIDs, assetNames []string, roomID id.RoomID) {
+	intent := c.Main.Bridge.Bot
 	logger := c.Main.Bridge.Log.With().
 		Str("component", "shared_album_download").
 		Str("album", albumGUID).
 		Logger()
+
+	// Send a welcome/help notice into the album room.
+	welcome := format.RenderMarkdown(fmt.Sprintf(
+		"Downloading %d asset(s) from **%s**.\n\nWhen you're done, send `!im shared-delete-room` here to delete this room.",
+		len(assetGUIDs), albumName), true, false)
+	welcome.MsgType = event.MsgNotice
+	_, _ = intent.SendMessage(ctx, roomID, event.EventMessage, &event.Content{Parsed: welcome}, nil)
+
 	var failed int
 
 	for i, guid := range assetGUIDs {
