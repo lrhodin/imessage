@@ -7302,139 +7302,241 @@ impl Client {
             channel: BASE64_STANDARD.encode(&my_channel_id),
         };
 
-        // Group bundles into batches of <= GROUP_MAX_SIZE encrypted bytes —
-        // upstream InnerSendJob::send_targets (identity_manager.rs:1084) splits
-        // on this threshold. First deploy of the old-wire port shipped a
-        // single 40KB notification and Apple ACK'd status=0 but no peer
-        // reciprocated. Peer iOS may silently drop oversized keysharing
-        // notifications before StatusKit dispatches them even when server
-        // accepts them. Split to match upstream.
+        // --- Retry loop mirroring upstream InnerSendJob::send_targets ---
+        //
+        // Send, collect per-target c=255 responses matching our UUID, classify:
+        //   - status 0 / 5008 → delivered (drop from remaining)
+        //   - status 5032     → recipient needs fresh IDS keys → refresh_handles + retry
+        //   - other           → fatal per-target error (log + drop)
+        // Any targets we never heard back from within the per-retry window are
+        // carried forward into the next round too. Cap retries at 5 like
+        // upstream (identity_manager.rs:1207).
         const GROUP_MAX_SIZE: usize = 5000;
-        let mut groups: Vec<Vec<_>> = Vec::new();
-        let mut current: Vec<_> = Vec::new();
-        let mut current_size: usize = 0;
-        let mut plaintext_total: usize = 0;
-        let mut total_targets_packed: usize = 0;
-        for target in &targets {
-            let Some(handle_config) = config_map.get(&target.participant) else { continue };
-            let mut device = device_template.clone();
-            let mut pc_bytes: Vec<u8> = Vec::new();
-            plist::to_writer_binary(&mut pc_bytes, handle_config).map_err(|e| WrappedError::GenericError {
-                msg: format!("StatusKit personal_config plist encode: {:?}", e),
-            })?;
-            device.personal_config = BASE64_STANDARD.encode(&pc_bytes);
-
-            let mut plaintext: Vec<u8> = Vec::new();
-            plist::to_writer_binary(&mut plaintext, &device).map_err(|e| WrappedError::GenericError {
-                msg: format!("StatusKit device plist encode: {:?}", e),
-            })?;
-            plaintext_total += plaintext.len();
-
-            let encrypted = sk.identity.identity.encrypt_payload(
-                &target.delivery_data,
-                &sk.identity.cache,
-                &plaintext,
-            ).await.map_err(|e| WrappedError::GenericError {
-                msg: format!("StatusKit encrypt_payload for {}: {:?}", target.participant, e),
-            })?;
-            let enc_size = encrypted.0.len();
-
-            current.push(target.build_bundle(false, Some(encrypted)));
-            current_size += enc_size;
-            total_targets_packed += 1;
-
-            if current_size > GROUP_MAX_SIZE {
-                groups.push(std::mem::take(&mut current));
-                current_size = 0;
-            }
-        }
-        if !current.is_empty() {
-            groups.push(current);
-        }
-
-        if groups.is_empty() {
-            return Err(WrappedError::GenericError {
-                msg: "StatusKit invite (old-wire): no bundles built (no matching config entries)".into(),
-            });
-        }
-
+        const KEYSHARING_TOPIC: &str = "com.apple.private.alloy.status.keysharing";
         let uuid_bytes: Vec<u8> = uuid::Uuid::new_v4().as_bytes().to_vec();
-        let topic_hash: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
-        let batch_total = groups.len();
+        let topic_hash: [u8; 20] = openssl::sha::sha1(KEYSHARING_TOPIC.as_bytes());
+        let mut current_targets = targets;
+        let mut retry_count: u8 = 0;
 
-        info!(
-            "StatusKit invite (old-wire): split {} target(s) into {} batch(es) (plaintext_total={})",
-            total_targets_packed, batch_total, plaintext_total
-        );
-
-        for (batch_idx, group) in groups.into_iter().enumerate() {
-            let group_count = group.len();
-            // APS id: upstream uses new_aps_id() (random 1..=i32::MAX). Fresh
-            // per batch so ACKs can be tracked independently. UUID stays stable
-            // across batches — all batches belong to the same IDS message.
-            let msg_id: i32 = ((rand::random::<u32>() >> 1) as i32).max(1);
-
-            // Build the IDS SendMessage dictionary manually. Upstream's
-            // SendMessage struct (identity_manager.rs:1005) has `pub(super)`
-            // fields we can't set from outside the ids module, so we inline the
-            // keysharing-only subset here. Field names/renames match upstream
-            // byte-for-byte.
-            let mut send_dict = plist::Dictionary::new();
-            send_dict.insert("fcn".into(), plist::Value::Integer(((batch_idx as u8 + 1) as i64).into()));
-            send_dict.insert("c".into(), plist::Value::Integer(227i64.into()));
-            send_dict.insert("E".into(), plist::Value::String("pair".into()));
-            send_dict.insert("ua".into(), plist::Value::String(self.os_config.get_version_ua()));
-            send_dict.insert("v".into(), plist::Value::Integer(8i64.into()));
-            send_dict.insert("i".into(), plist::Value::Integer((msg_id as i64).into()));
-            send_dict.insert("U".into(), plist::Value::Data(uuid_bytes.clone()));
-            send_dict.insert("sP".into(), plist::Value::String(sender_handle.clone()));
-            let bundles_value = plist::to_value(&group).map_err(|e| WrappedError::GenericError {
-                msg: format!("StatusKit bundles to_value: {:?}", e),
-            })?;
-            send_dict.insert("dtl".into(), bundles_value);
-
-            let mut payload_bin: Vec<u8> = Vec::new();
-            plist::to_writer_binary(&mut payload_bin, &plist::Value::Dictionary(send_dict))
-                .map_err(|e| WrappedError::GenericError {
-                    msg: format!("StatusKit SendMessage plist encode: {:?}", e),
+        loop {
+            // Build batches and encrypt plaintext per target in this round.
+            let mut groups: Vec<Vec<_>> = Vec::new();
+            let mut current_group: Vec<_> = Vec::new();
+            let mut current_group_size: usize = 0;
+            let mut plaintext_total: usize = 0;
+            let mut total_targets_packed: usize = 0;
+            for target in &current_targets {
+                let Some(handle_config) = config_map.get(&target.participant) else { continue };
+                let mut device = device_template.clone();
+                let mut pc_bytes: Vec<u8> = Vec::new();
+                plist::to_writer_binary(&mut pc_bytes, handle_config).map_err(|e| WrappedError::GenericError {
+                    msg: format!("StatusKit personal_config plist encode: {:?}", e),
                 })?;
+                device.personal_config = BASE64_STANDARD.encode(&pc_bytes);
 
+                let mut plaintext: Vec<u8> = Vec::new();
+                plist::to_writer_binary(&mut plaintext, &device).map_err(|e| WrappedError::GenericError {
+                    msg: format!("StatusKit device plist encode: {:?}", e),
+                })?;
+                plaintext_total += plaintext.len();
+
+                let encrypted = sk.identity.identity.encrypt_payload(
+                    &target.delivery_data,
+                    &sk.identity.cache,
+                    &plaintext,
+                ).await.map_err(|e| WrappedError::GenericError {
+                    msg: format!("StatusKit encrypt_payload for {}: {:?}", target.participant, e),
+                })?;
+                let enc_size = encrypted.0.len();
+
+                current_group.push(target.build_bundle(false, Some(encrypted)));
+                current_group_size += enc_size;
+                total_targets_packed += 1;
+
+                if current_group_size > GROUP_MAX_SIZE {
+                    groups.push(std::mem::take(&mut current_group));
+                    current_group_size = 0;
+                }
+            }
+            if !current_group.is_empty() {
+                groups.push(current_group);
+            }
+
+            if groups.is_empty() {
+                return Err(WrappedError::GenericError {
+                    msg: "StatusKit invite (old-wire): no bundles built (no matching config entries)".into(),
+                });
+            }
+
+            let batch_total = groups.len();
             info!(
-                "StatusKit invite (old-wire): batch {}/{} — {} target(s), bundle_bytes={} aps_id={}",
-                batch_idx + 1, batch_total, group_count, payload_bin.len(), msg_id
+                "StatusKit invite (old-wire) round {}: {} target(s), {} batch(es), plaintext_total={}",
+                retry_count, total_targets_packed, batch_total, plaintext_total
             );
 
-            let aps_token = self.conn.get_token().await;
-            // Subscribe before send to avoid the ACK race.
-            let recv = self.conn.subscribe().await;
+            // Subscribe BEFORE sending any batch so c=255 per-target responses
+            // arriving between batches aren't dropped on the floor.
+            let mut recv_responses = self.conn.subscribe().await;
 
-            self.conn.send(rustpush::APSMessage::Notification {
-                id: msg_id,
-                topic: topic_hash,
-                token: Some(aps_token),
-                payload: plist::Value::Data(payload_bin),
-                channel: None,
-            }).await.map_err(|e| WrappedError::GenericError {
-                msg: format!("StatusKit APS send (old-wire) batch {}: {:?}", batch_idx + 1, e),
-            })?;
+            for (batch_idx, group) in groups.into_iter().enumerate() {
+                let group_count = group.len();
+                let msg_id: i32 = ((rand::random::<u32>() >> 1) as i32).max(1);
 
-            let my_id = msg_id;
-            let ack_result = self.conn.wait_for_timeout(recv, move |msg| {
-                let rustpush::APSMessage::Ack { for_id, status, .. } = msg else { return None };
-                if for_id == my_id { Some(status) } else { None }
-            }).await;
-            match ack_result {
-                Ok(0) => info!("StatusKit invite (old-wire): batch {} ACK status=0 (aps_id={})", batch_idx + 1, msg_id),
-                Ok(status) => {
-                    warn!("StatusKit invite (old-wire): batch {} ACK non-zero status={} (aps_id={})", batch_idx + 1, status, msg_id);
-                    return Err(WrappedError::GenericError {
-                        msg: format!("StatusKit APS ACK status={} on batch {}", status, batch_idx + 1),
-                    });
+                let mut send_dict = plist::Dictionary::new();
+                send_dict.insert("fcn".into(), plist::Value::Integer(((batch_idx as u8 + 1) as i64).into()));
+                send_dict.insert("c".into(), plist::Value::Integer(227i64.into()));
+                send_dict.insert("E".into(), plist::Value::String("pair".into()));
+                send_dict.insert("ua".into(), plist::Value::String(self.os_config.get_version_ua()));
+                send_dict.insert("v".into(), plist::Value::Integer(8i64.into()));
+                send_dict.insert("i".into(), plist::Value::Integer((msg_id as i64).into()));
+                send_dict.insert("U".into(), plist::Value::Data(uuid_bytes.clone()));
+                send_dict.insert("sP".into(), plist::Value::String(sender_handle.clone()));
+                if retry_count > 0 {
+                    send_dict.insert("rc".into(), plist::Value::Integer((retry_count as i64).into()));
                 }
-                Err(e) => {
-                    warn!("StatusKit invite (old-wire): batch {} ACK wait error ({:?}) (aps_id={}) — non-fatal, message on wire", batch_idx + 1, e, msg_id);
+                let bundles_value = plist::to_value(&group).map_err(|e| WrappedError::GenericError {
+                    msg: format!("StatusKit bundles to_value: {:?}", e),
+                })?;
+                send_dict.insert("dtl".into(), bundles_value);
+
+                let mut payload_bin: Vec<u8> = Vec::new();
+                plist::to_writer_binary(&mut payload_bin, &plist::Value::Dictionary(send_dict))
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("StatusKit SendMessage plist encode: {:?}", e),
+                    })?;
+
+                info!(
+                    "StatusKit invite: batch {}/{} ({} target(s), bundle_bytes={}, aps_id={}, retry={})",
+                    batch_idx + 1, batch_total, group_count, payload_bin.len(), msg_id, retry_count
+                );
+
+                let aps_token = self.conn.get_token().await;
+                // Per-batch ACK subscription, independent from recv_responses.
+                let recv_ack = self.conn.subscribe().await;
+                self.conn.send(rustpush::APSMessage::Notification {
+                    id: msg_id,
+                    topic: topic_hash,
+                    token: Some(aps_token),
+                    payload: plist::Value::Data(payload_bin),
+                    channel: None,
+                }).await.map_err(|e| WrappedError::GenericError {
+                    msg: format!("StatusKit APS send batch {}: {:?}", batch_idx + 1, e),
+                })?;
+
+                let my_id = msg_id;
+                let ack_result = self.conn.wait_for_timeout(recv_ack, move |msg| {
+                    let rustpush::APSMessage::Ack { for_id, status, .. } = msg else { return None };
+                    if for_id == my_id { Some(status) } else { None }
+                }).await;
+                match ack_result {
+                    Ok(0) => info!("StatusKit invite: batch {} APS ACK status=0", batch_idx + 1),
+                    Ok(status) => {
+                        warn!("StatusKit invite: batch {} APS ACK non-zero status={}", batch_idx + 1, status);
+                        return Err(WrappedError::GenericError {
+                            msg: format!("StatusKit APS ACK status={} on batch {}", status, batch_idx + 1),
+                        });
+                    }
+                    Err(e) => {
+                        warn!("StatusKit invite: batch {} APS ACK wait error ({:?})", batch_idx + 1, e);
+                    }
                 }
             }
+
+            // Collect per-target c=255 responses. Each response has:
+            //   c = 255 (command), U = invite uuid, t = target push_token, s = status
+            let mut remaining = current_targets.clone();
+            let mut refresh_list: Vec<_> = Vec::new();
+            let mut sent_count: usize = 0;
+            let mut err_count: usize = 0;
+            let per_retry_timeout = std::time::Duration::from_secs(60 * (retry_count as u64 + 1));
+            let deadline = std::time::Instant::now() + per_retry_timeout;
+
+            while !remaining.is_empty() {
+                let remaining_dur = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining_dur.is_zero() { break; }
+
+                let filter_uuid = uuid_bytes.clone();
+                let wait_fut = self.conn.wait_for(&mut recv_responses, move |msg| {
+                    let rustpush::APSMessage::Notification { payload, .. } = msg else { return None };
+                    let dict_val = match payload {
+                        plist::Value::Data(bytes) => plist::from_bytes::<plist::Value>(&bytes).ok()?,
+                        v => v,
+                    };
+                    let dict = match dict_val {
+                        plist::Value::Dictionary(d) => d,
+                        _ => return None,
+                    };
+                    let c = dict.get("c").and_then(|v| v.as_unsigned_integer())? as u8;
+                    if c != 255 { return None; }
+                    let u = dict.get("U").and_then(|v| v.as_data())?;
+                    if u != filter_uuid.as_slice() { return None; }
+                    let t = dict.get("t").and_then(|v| v.as_data()).map(|b| b.to_vec());
+                    let s = dict.get("s").and_then(|v| v.as_signed_integer()).unwrap_or(0);
+                    Some((t, s))
+                });
+
+                let (token_opt, status) = match tokio::time::timeout(remaining_dur, wait_fut).await {
+                    Ok(Ok(parsed)) => parsed,
+                    _ => break,
+                };
+                let Some(token) = token_opt else { continue };
+                let Some(idx) = remaining.iter().position(|t| t.delivery_data.push_token == token) else { continue };
+                match status {
+                    5032 => {
+                        let p = remaining[idx].participant.clone();
+                        info!("StatusKit invite: target {} returned status=5032 — queuing key refresh", p);
+                        refresh_list.push(remaining.remove(idx));
+                    }
+                    0 | 5008 => {
+                        remaining.remove(idx);
+                        sent_count += 1;
+                    }
+                    other => {
+                        let p = remaining[idx].participant.clone();
+                        warn!("StatusKit invite: target {} returned status={} (dropping)", p, other);
+                        remaining.remove(idx);
+                        err_count += 1;
+                    }
+                }
+            }
+
+            info!(
+                "StatusKit invite round {} results: {} sent, {} errors, {} refresh-pending, {} no-response",
+                retry_count, sent_count, err_count, refresh_list.len(), remaining.len()
+            );
+
+            if remaining.is_empty() && refresh_list.is_empty() {
+                info!("StatusKit invite: all {} target(s) resolved after {} round(s)", total_targets_packed, retry_count as u32 + 1);
+                break;
+            }
+
+            if retry_count >= 5 {
+                warn!(
+                    "StatusKit invite: retry limit reached; giving up on {} no-response + {} unrefreshed target(s)",
+                    remaining.len(), refresh_list.len()
+                );
+                break;
+            }
+
+            if !refresh_list.is_empty() {
+                match sk.identity.refresh_handles(KEYSHARING_TOPIC, sender_handle.as_str(), &refresh_list[..]).await {
+                    Ok(refreshed) => {
+                        info!("StatusKit invite: refresh_handles returned {} refreshed target(s)", refreshed.len());
+                        remaining.extend(refreshed);
+                    }
+                    Err(e) => {
+                        warn!("StatusKit invite: refresh_handles failed: {:?} — dropping refresh batch", e);
+                    }
+                }
+            }
+
+            if remaining.is_empty() {
+                // All we had was 5032s and refresh_handles failed — nothing to retry.
+                break;
+            }
+
+            current_targets = remaining;
+            retry_count += 1;
         }
 
         Ok(())
