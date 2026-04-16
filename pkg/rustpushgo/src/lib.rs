@@ -5398,20 +5398,7 @@ impl WrappedSharedStreamsClient {
     }
 
     pub async fn get_album_assets(&self, album: String) -> Result<Vec<SharedAssetInfo>, WrappedError> {
-        // Read cached GUIDs from state (populated by the watcher's periodic
-        // get_album_summary calls). This avoids a second authenticated request
-        // that would fail with TokenMissing.
-        let guids = {
-            let state = self.inner.state.read().await;
-            match state.albums.iter().find(|a| a.albumguid == album) {
-                Some(a) if !a.assets.is_empty() => a.assets.clone(),
-                _ => {
-                    drop(state);
-                    // Cold start: watcher hasn't run yet, fetch now.
-                    self.inner.get_album_summary(&album).await?
-                }
-            }
-        };
+        let guids = self.inner.get_album_summary(&album).await?;
         if guids.is_empty() {
             return Ok(vec![]);
         }
@@ -6629,6 +6616,15 @@ impl Client {
         *self.cloud_messages_client.lock().await = None;
         *self.cloud_keychain_client.lock().await = None;
         *self.profiles_client.lock().await = None;
+    }
+
+    /// Reset the cached Shared Streams client and force-refresh the MME
+    /// delegate so the next operation gets fresh auth tokens.
+    pub async fn reset_sharedstreams_client(&self) {
+        *self.sharedstreams_client.lock().await = None;
+        if let Some(tp) = &self.token_provider {
+            let _ = tp.inner.refresh_mme().await;
+        }
     }
 
     /// Initialize the StatusKit presence system. Must be called after login

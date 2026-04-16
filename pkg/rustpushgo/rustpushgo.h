@@ -260,6 +260,11 @@ void* uniffi_rustpushgo_fn_method_client_reset_cloud_client(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_reset_sharedstreams_client(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void uniffi_rustpushgo_fn_method_client_reset_statuskit_cursors(
 	void* ptr,
 	RustCallStatus* out_status
@@ -1675,6 +1680,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_purge_recoverable_zones(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_reset_cloud_client(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_reset_sharedstreams_client(
 	RustCallStatus* out_status
 );
 
