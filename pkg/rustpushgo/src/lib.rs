@@ -7082,7 +7082,19 @@ impl Client {
     /// tel: (or other) aliases that share the same sender_correlation_identifier
     /// as `handle` according to data already cached from prior message processing.
     /// Returns an empty Vec if the handle is not in the cache yet.
+    ///
+    /// Checks both `com.apple.madrid` (populated by iMessage traffic) and
+    /// `com.apple.private.alloy.status.keysharing` (populated by StatusKit
+    /// invite/receive). At fresh startup the Madrid cache is empty until an
+    /// iMessage is sent; the keysharing cache is populated as soon as
+    /// invite_to_channel runs. Falling through to keysharing lets the
+    /// periodic re-invite path find aliases on subsequent ticks.
     pub async fn resolve_handle_cached(&self, handle: String, known_handles: Vec<String>) -> Vec<String> {
+        const SERVICES: &[&str] = &[
+            "com.apple.madrid",
+            "com.apple.private.alloy.status.keysharing",
+        ];
+
         let my_handles = self.client.identity.get_handles().await;
         let my_handle = match my_handles.first() {
             Some(h) => h.clone(),
@@ -7090,27 +7102,29 @@ impl Client {
         };
 
         let cache = self.client.identity.cache.lock().await;
-        let correlation_id = match cache.get_correlation_id("com.apple.madrid", &my_handle, &handle) {
-            Some(cid) if !cid.is_empty() => cid,
-            _ => {
-                info!("resolve_handle_cached: {} not in IDS cache", handle);
-                return vec![];
-            }
-        };
+        for &service in SERVICES {
+            let correlation_id = match cache.get_correlation_id(service, &my_handle, &handle) {
+                Some(cid) if !cid.is_empty() => cid,
+                _ => continue,
+            };
 
-        let mut aliases = vec![];
-        for known_handle in &known_handles {
-            if known_handle == &handle {
-                continue;
-            }
-            if let Some(cid) = cache.get_correlation_id("com.apple.madrid", &my_handle, known_handle) {
-                if cid == correlation_id {
-                    aliases.push(known_handle.clone());
+            let mut aliases = vec![];
+            for known_handle in &known_handles {
+                if known_handle == &handle {
+                    continue;
+                }
+                if let Some(cid) = cache.get_correlation_id(service, &my_handle, known_handle) {
+                    if cid == correlation_id {
+                        aliases.push(known_handle.clone());
+                    }
                 }
             }
+            info!("resolve_handle_cached: {} → {} alias(es) via {} (correlation {})", handle, aliases.len(), service, correlation_id);
+            return aliases;
         }
-        info!("resolve_handle_cached: {} → {} alias(es) from cache (correlation {})", handle, aliases.len(), correlation_id);
-        aliases
+
+        info!("resolve_handle_cached: {} not in IDS cache", handle);
+        vec![]
     }
 
     /// Reset all StatusKit APNs channel cursors (last_msg_ns) to 1 in the
