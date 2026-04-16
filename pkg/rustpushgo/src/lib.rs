@@ -2963,6 +2963,157 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
     }
 }
 
+// Overlay around FTClient::handle that tolerates Apple sending cmd 207/209
+// wire messages with `ConversationParticipantDidJoinContext.message = None`.
+// Upstream's handler at facetime.rs:1272/1344 hard-requires that field and
+// returns PushError::BadMsg when it's missing, which means the bridge never
+// records the joiner in session.participants. When wife answers an
+// outbound call (or when a link-tap joiner completes), her device's
+// server-originated 207 trips this path and the session state diverges
+// from Apple's — symptom is "this call is not available" on the callee.
+//
+// Strategy: always try upstream first so successful paths stay on the
+// reference implementation. Only on BadMsg do we re-decode the wire
+// message locally (using upstream's pub types: FTWireMessage +
+// facetimep::ConversationParticipantDidJoinContext) and register the
+// joiner ourselves. No upstream source changes — see feedback_no_patch_rustpush.
+async fn ft_handle_with_join_recovery(
+    ft: &rustpush::facetime::FTClient,
+    msg: rustpush::APSMessage,
+) -> Result<Option<rustpush::facetime::FTMessage>, rustpush::PushError> {
+    // Locally-mirrored wire-message shape. FTWireMessage's fields are
+    // private upstream, so we can't deserialize into it directly — but the
+    // plist schema is stable (same serde rename attrs as upstream), so a
+    // parallel struct here gives us the fields we need without touching
+    // upstream source.
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(crate = "serde", rename_all = "kebab-case")]
+    struct LocalFTWire {
+        #[serde(rename = "s")]
+        session: String,
+        #[serde(default)]
+        client_context_data_key: Option<plist::Value>,
+        #[serde(default)]
+        participant_id_key: Option<LocalParticipantId>,
+    }
+
+    #[derive(serde::Deserialize, Debug, Clone, Copy)]
+    #[serde(crate = "serde", untagged)]
+    enum LocalParticipantId {
+        Signed(i64),
+        Unsigned(u64),
+    }
+    impl LocalParticipantId {
+        fn as_u64(self) -> u64 {
+            match self {
+                Self::Signed(i) => i as u64,
+                Self::Unsigned(i) => i,
+            }
+        }
+    }
+
+    // Try upstream first.
+    let upstream_result = ft.handle(msg.clone()).await;
+    if !matches!(&upstream_result, Err(rustpush::PushError::BadMsg)) {
+        return upstream_result;
+    }
+
+    // Re-decrypt to inspect cmd and payload. identity.receive_message has
+    // no side effects beyond decryption, so a second call is safe.
+    let recv = match ft
+        .identity
+        .receive_message(
+            msg,
+            &[
+                "com.apple.private.alloy.facetime.multi",
+                "com.apple.private.alloy.facetime.video",
+            ],
+        )
+        .await
+    {
+        Ok(Some(r)) => r,
+        _ => return upstream_result,
+    };
+
+    // Only recover 207 (JoinEvent) and 209 (GroupUpdate).
+    if recv.command != 207 && recv.command != 209 {
+        return upstream_result;
+    }
+
+    let Some(message_unenc) = recv.message_unenc else { return upstream_result };
+    let Some(sender) = recv.sender.clone() else { return upstream_result };
+    let Some(target) = recv.target.clone() else { return upstream_result };
+    let Some(token_bytes) = recv.token.clone() else { return upstream_result };
+    let Some(ns_since_epoch) = recv.ns_since_epoch else { return upstream_result };
+
+    let payload_value: plist::Value = match message_unenc.plist() {
+        Ok(v) => v,
+        Err(_) => return upstream_result,
+    };
+    let wire: LocalFTWire = match plist::from_value(&payload_value) {
+        Ok(w) => w,
+        Err(_) => return upstream_result,
+    };
+
+    // Apply minimal state mutation: session lookup/creation + joiner
+    // registration. We intentionally skip session.unpack_members (the
+    // upstream helper is private) — member-list drift is cosmetic; the
+    // load-bearing piece is session.participants so Apple-side state
+    // lines up when Apple retries delivery or the callee's device
+    // queries participant tokens.
+    let mut state = ft.state.write().await;
+    let session = state.sessions.entry(wire.session.clone()).or_default();
+    session.group_id = wire.session.clone();
+    if !session.my_handles.contains(&target) {
+        session.my_handles.push(target.clone());
+    }
+    let guid = session.group_id.clone();
+
+    let emitted = if recv.command == 207 {
+        let participant_id = match wire.participant_id_key {
+            Some(id) => id.as_u64(),
+            None => return upstream_result,
+        };
+        session.participants.insert(
+            participant_id.to_string(),
+            rustpush::facetime::FTParticipant {
+                token: Some(base64_encode(&token_bytes)),
+                participant_id,
+                last_join_date: Some(ns_since_epoch / 1_000_000),
+                handle: sender.clone(),
+                active: None,
+            },
+        );
+
+        if session.is_propped && sender.starts_with("temp:") {
+            // Matches upstream's behavior at facetime.rs:1315 — once someone
+            // has joined via link tap, the call is live and the propped-up
+            // invitation can retire.
+            let _ = ft.unprop_conv(session).await;
+        }
+
+        Some(rustpush::facetime::FTMessage::JoinEvent {
+            guid: guid.clone(),
+            participant: participant_id,
+            handle: sender.clone(),
+            // ring=false: without the message field we can't tell whether
+            // Apple's carrying an Invitation type. Missing the ring flag
+            // is strictly better than failing the handshake entirely.
+            ring: false,
+        })
+    } else {
+        // 209 (GroupUpdate) — nothing to emit; local state is best-effort.
+        None
+    };
+
+    info!(
+        "FaceTime cmd={} BadMsg recovery: session={} sender={} target={} participant={:?}",
+        recv.command, guid, sender, target, wire.participant_id_key,
+    );
+
+    Ok(emitted)
+}
+
 async fn auto_approve_bridge_letmein(
     facetime: &rustpush::facetime::FTClient,
     request: &rustpush::facetime::LetMeInRequest,
@@ -5674,8 +5825,11 @@ pub async fn new_client(
 
                 // Consume FaceTime APNs events to keep FT state live and
                 // surface incoming-call attempts to Go as synthetic notice
-                // triggers.
-                match ft_for_recv.handle(msg.clone()).await {
+                // triggers. ft_handle_with_join_recovery wraps upstream's
+                // handle() and falls back to local decoding for cmd 207/209
+                // when Apple sends them without the context.message field —
+                // see the helper's docstring for why.
+                match ft_handle_with_join_recovery(ft_for_recv.as_ref(), msg.clone()).await {
                     Ok(Some(ft_message)) => {
                         if let rustpush::facetime::FTMessage::LetMeInRequest(request) = &ft_message {
                             if let Err(e) = auto_approve_bridge_letmein(ft_for_recv.as_ref(), request).await {
