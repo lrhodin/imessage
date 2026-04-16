@@ -378,27 +378,36 @@ func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumNam
 	}
 
 	botMXID := c.Main.Bridge.Bot.GetMXID()
-	roomID, err := c.Main.Bridge.Bot.CreateRoom(ctx, &mautrix.ReqCreateRoom{
-		Name:                  displayName,
-		Topic:                 fmt.Sprintf("Shared album download \u2014 %s", displayName),
-		IsDirect:              true,
-		Preset:                "trusted_private_chat",
-		Invite:                []id.UserID{c.UserLogin.User.MXID},
-		BeeperAutoJoinInvites: true,
+
+	// Create the room as the user (via double puppet) so the user owns it
+	// and can delete it from Beeper. The bot is invited so it can send
+	// downloaded media into the room.
+	dp := c.UserLogin.User.DoublePuppet(ctx)
+	if dp == nil {
+		return "", fmt.Errorf("double puppet not available — cannot create album room")
+	}
+
+	roomID, err := dp.CreateRoom(ctx, &mautrix.ReqCreateRoom{
+		Name:    displayName,
+		Topic:   fmt.Sprintf("Shared album download \u2014 %s", displayName),
+		Preset:  "trusted_private_chat",
+		Invite:  []id.UserID{botMXID},
 	})
 	if err != nil {
 		return "", fmt.Errorf("create room: %w", err)
 	}
 
-	// Register the room in the user's m.direct account data via the double
-	// puppet so Matrix clients (including Beeper) treat it as a true DM that
-	// the user can delete rather than a group room they can only leave.
-	if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
-		if dmAPI, ok := dp.(bridgev2.MarkAsDMMatrixAPI); ok {
-			if markErr := dmAPI.MarkAsDM(ctx, roomID, botMXID); markErr != nil {
-				log.Warn().Err(markErr).Stringer("room_id", roomID).Msg("Failed to mark shared album room as DM")
-			}
+	// Mark as DM in the user's m.direct account data so Beeper shows it
+	// as a deletable DM rather than a group room.
+	if dmAPI, ok := dp.(bridgev2.MarkAsDMMatrixAPI); ok {
+		if markErr := dmAPI.MarkAsDM(ctx, roomID, botMXID); markErr != nil {
+			log.Warn().Err(markErr).Stringer("room_id", roomID).Msg("Failed to mark shared album room as DM")
 		}
+	}
+
+	// Ensure the bot has actually joined so it can send media later.
+	if joinErr := c.Main.Bridge.Bot.EnsureJoined(ctx, roomID); joinErr != nil {
+		log.Warn().Err(joinErr).Stringer("room_id", roomID).Msg("Bot failed to join shared album room")
 	}
 
 	c.sharedAlbumRooms[albumGUID] = roomID
