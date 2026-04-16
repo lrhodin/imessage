@@ -5908,6 +5908,88 @@ pub async fn new_client(
                             }
                             } // else (non-c=255)
                         }
+
+                        // --- status.personal handler ---
+                        // Contacts broadcast their Focus state directly via IDS on
+                        // this topic whenever it changes. Unlike the Shared Channels
+                        // path (keysharing + presence.mode.status), this doesn't
+                        // require a prior key exchange — the IDS encryption is
+                        // sufficient. This catches contacts whose devices distributed
+                        // channel keys before the bridge was registered.
+                        let personal_topic_hash: [u8; 20] = openssl::sha::sha1(
+                            "com.apple.private.alloy.status.personal".as_bytes(),
+                        );
+                        if *msg_topic == personal_topic_hash
+                            && !matches!(payload, plist::Value::Data(_))
+                            && !workaround_consumed
+                        {
+                            let personal_result: Result<bool, String> = async {
+                                let recv = sk
+                                    .identity
+                                    .receive_message(
+                                        sk_msg_ref.clone(),
+                                        &["com.apple.private.alloy.status.personal"],
+                                    )
+                                    .await
+                                    .map_err(|e| format!("personal receive_message: {e}"))?;
+                                let Some(recv) = recv else {
+                                    return Ok(false);
+                                };
+                                let Some(message) = recv.message_unenc else {
+                                    return Ok(false);
+                                };
+                                let Some(sender) = recv.sender else {
+                                    return Ok(false);
+                                };
+
+                                // Mirror upstream PrivateStatusMessage structs.
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PTag { #[serde(rename = "a")] bundle: String, #[serde(rename = "b")] id: Option<String> }
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PState { #[serde(rename = "b")] r#type: String }
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PActive { #[serde(rename = "d")] tag: PTag, #[serde(rename = "c")] state: PState }
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PStatusState { #[serde(rename = "a", default)] active: Vec<PActive> }
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PUpdate { #[serde(rename = "c")] state: PStatusState }
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PMessage { #[serde(rename = "d")] update: PUpdate }
+
+                                let parsed: PMessage = message.plist()
+                                    .map_err(|e| format!("personal plist parse: {e}"))?;
+
+                                // Determine Focus state: if any active mode exists,
+                                // user is in Focus; otherwise available.
+                                let focus_active = &parsed.update.state.active;
+                                let (available, mode) = if focus_active.is_empty() {
+                                    (true, None)
+                                } else {
+                                    // Use the first active Focus mode's identifier.
+                                    let mode_id = focus_active[0].tag.id.clone()
+                                        .or_else(|| Some(focus_active[0].state.r#type.clone()));
+                                    (false, mode_id)
+                                };
+
+                                info!(
+                                    "StatusKit personal status from {}: available={} mode={:?} (active_modes={})",
+                                    sender, available, mode, focus_active.len()
+                                );
+
+                                if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                    cb.on_status_update(sender, mode, available);
+                                }
+                                Ok(true)
+                            }.await;
+
+                            match personal_result {
+                                Ok(true) => { workaround_consumed = true; }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    warn!("StatusKit personal handler failed: {}", e);
+                                }
+                            }
+                        }
                     }
 
                     if workaround_consumed {
