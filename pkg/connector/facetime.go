@@ -802,6 +802,22 @@ func extractFaceTimeJoinLink(msg *rustpushgo.WrappedMessage) string {
 	return ""
 }
 
+// extractFaceTimeGuid pulls the session guid from a FACETIME_RING / FACETIME_MISSED
+// marker string.  The Rust-side facetime_event_to_wrapped formats these as
+// "[[FACETIME_RING]] guid=<UUID> [<link>]".
+func extractFaceTimeGuid(text string) string {
+	const prefix = "guid="
+	idx := strings.Index(text, prefix)
+	if idx < 0 {
+		return ""
+	}
+	rest := text[idx+len(prefix):]
+	if sp := strings.IndexByte(rest, ' '); sp > 0 {
+		return rest[:sp]
+	}
+	return strings.TrimSpace(rest)
+}
+
 func firstFaceTimeLinkInText(text string) string {
 	for _, candidate := range faceTimeURLRegex.FindAllString(text, -1) {
 		if normalized := normalizeFaceTimeLink(candidate); normalized != "" {

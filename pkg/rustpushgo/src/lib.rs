@@ -3130,13 +3130,18 @@ async fn auto_approve_bridge_letmein(
     facetime: &rustpush::facetime::FTClient,
     request: &rustpush::facetime::LetMeInRequest,
 ) -> Result<(), rustpush::PushError> {
-    // Only auto-approve for links owned by this bridge and tagged for bridge usage.
+    // Only auto-approve for links owned by this bridge. Persistent links
+    // (from get_link_for_usage) have usage=Some("bridge"); session-specific
+    // links (from get_session_link) have usage=None but session_link=Some.
+    // Both are bridge-created and safe to auto-approve.
     let (link_handle, linked_group, member_group, ringing_group) = {
         let state = facetime.state.read().await;
         let Some(link) = state.links.get(&request.pseud) else {
             return Ok(());
         };
-        if link.usage.as_deref() != Some("bridge") {
+        let is_bridge_usage = link.usage.as_deref() == Some("bridge");
+        let is_session_link = link.session_link.is_some();
+        if !is_bridge_usage && !is_session_link {
             return Ok(());
         }
 
@@ -3170,12 +3175,19 @@ async fn auto_approve_bridge_letmein(
         (link.handle.clone(), linked_group, member_group, ringing_group)
     };
 
-    let match_kind = if linked_group.is_some() {
+    // Priority: ringing > linked > member. An actively-ringing session is
+    // always the user's immediate concern (inbound-call case); a stale
+    // session_link from a prior tap would otherwise win via `linked` and
+    // route the tap to the wrong session. `linked` is still preferred over
+    // `member` since it's a deliberate pin, and session-specific links
+    // (outbound !im facetime) always hit `linked` first because their
+    // session is fresh (is_ringing_inaccurate=false until the ring fires).
+    let match_kind = if ringing_group.is_some() {
+        "ringing"
+    } else if linked_group.is_some() {
         "linked"
     } else if member_group.is_some() {
         "member"
-    } else if ringing_group.is_some() {
-        "ringing"
     } else {
         "cold-start"
     };
@@ -3184,7 +3196,7 @@ async fn auto_approve_bridge_letmein(
         match_kind, request.pseud, request.requestor, link_handle,
     );
 
-    let approved_group = if let Some(group) = linked_group.or(member_group).or(ringing_group) {
+    let approved_group = if let Some(group) = ringing_group.or(linked_group).or(member_group) {
         group
     } else {
         let group = uuid::Uuid::new_v4().to_string().to_uppercase();

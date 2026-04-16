@@ -2869,13 +2869,23 @@ func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.W
 
 	link := firstFaceTimeLinkInText(rawText)
 	if link == "" {
-		// Caller didn't embed a link (native FaceTime ring). Generate the
-		// bridge's own FaceTime link so the user always has something to tap.
+		// Native FaceTime ring — no link embedded. Use the session guid
+		// from the marker text to mint a session-specific link that joins
+		// the caller's actual session (not a stale bridge link).
 		if ft, ftErr := c.client.GetFacetimeClient(); ftErr == nil {
-			if generated, genErr := getFaceTimeLinkWithRecovery(ft, c.handle); genErr == nil {
-				link = generated
-			} else {
-				log.Warn().Err(genErr).Msg("FaceTimeRing: failed to generate fallback FaceTime link")
+			if guid := extractFaceTimeGuid(rawText); guid != "" {
+				if sessionLink, slErr := ft.GetSessionLink(guid); slErr == nil {
+					link = sessionLink
+				} else {
+					log.Debug().Err(slErr).Str("guid", guid).Msg("FaceTimeRing: GetSessionLink failed, falling back to bridge link")
+				}
+			}
+			if link == "" {
+				if generated, genErr := getFaceTimeLinkWithRecovery(ft, c.handle); genErr == nil {
+					link = generated
+				} else {
+					log.Warn().Err(genErr).Msg("FaceTimeRing: failed to generate fallback FaceTime link")
+				}
 			}
 		}
 	}
