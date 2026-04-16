@@ -5912,40 +5912,7 @@ pub async fn new_client(
                     // HTTP requests and tokio mutexes couldn't complete properly in
                     // an isolated current-thread runtime.
                     let sk_clone = sk.clone();
-                    // Fix upstream Data/Dictionary mismatch for ALL StatusKit topics.
-                    // aps.rs:880 greedily decodes payload bytes into a Dictionary, but
-                    // statuskit.rs:719 destructures with Value::Data — silently
-                    // returning Ok(None) for Dictionary payloads. Re-encode Dictionary
-                    // payloads back to Data so upstream handle() can process them.
-                    let msg_clone = {
-                        let statuskit_topics: [[u8; 20]; 4] = [
-                            openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes()),
-                            openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes()),
-                            openssl::sha::sha1("com.apple.icloud.presence.channel.management".as_bytes()),
-                            openssl::sha::sha1("com.apple.private.alloy.status.personal".as_bytes()),
-                        ];
-                        if let rustpush::APSMessage::Notification { id, topic: t, token: tk, payload: ref p, channel: ref ch } = msg {
-                            if statuskit_topics.contains(&t) && !matches!(p, plist::Value::Data(_)) {
-                                // Re-encode the Dictionary payload as Data bytes.
-                                let mut reencoded = Vec::new();
-                                if plist::to_writer_binary(&mut reencoded, p).is_ok() {
-                                    rustpush::APSMessage::Notification {
-                                        id,
-                                        topic: t,
-                                        token: tk,
-                                        payload: plist::Value::Data(reencoded),
-                                        channel: ch.clone(),
-                                    }
-                                } else {
-                                    msg.clone()
-                                }
-                            } else {
-                                msg.clone()
-                            }
-                        } else {
-                            msg.clone()
-                        }
-                    };
+                    let msg_clone = msg.clone();
                     let handle_result = tokio::task::spawn(async move {
                         sk_clone.handle(msg_clone).await
                     }).await;
