@@ -4837,6 +4837,78 @@ impl WrappedFaceTimeClient {
         Ok(())
     }
 
+    // Create a FaceTime session without ringing any participant. Used by the
+    // portal-room !im facetime flow: session is allocated + registered with
+    // Apple's relay (so the join link is valid), but no Invitation wire is
+    // fanned out. The contact's phone rings only when the caller taps the
+    // link — that JoinEvent triggers maybe_fire_pending_ring which calls
+    // ft.ring() with the queued targets.
+    //
+    // Difference from create_session:
+    // - is_ringing_inaccurate starts false, so prop_up_conv's !ring branch
+    //   doesn't divert into RespondedElsewhere (facetime.rs:708).
+    // - prop_up_conv(session, false) so the wire message carries no
+    //   ConversationMessageType::Invitation on any target (facetime.rs:759).
+    //
+    // Net effect on Apple's side: session allocated + propped (state=live)
+    // but nobody's device rings.
+    pub async fn create_session_no_ring(
+        &self,
+        group_id: String,
+        handle: String,
+        participants: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        use rustpush::facetime::{FTMember, FTMode, FTSession};
+        use std::collections::HashMap;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let members = participants
+            .iter()
+            .chain(std::iter::once(&handle))
+            .map(|p| FTMember {
+                nickname: None,
+                handle: p.clone(),
+            })
+            .collect();
+
+        let session = FTSession {
+            group_id: group_id.clone(),
+            my_handles: vec![handle.clone()],
+            participants: HashMap::new(),
+            link: None,
+            members,
+            report_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+            start_time: Some(now_ms),
+            last_rekey: None,
+            is_propped: false,
+            is_ringing_inaccurate: false,
+            mode: Some(FTMode::Outgoing),
+            recent_member_adds: HashMap::new(),
+        };
+
+        let mut state = self.inner.state.write().await;
+        state.sessions.insert(group_id.clone(), session);
+        let session = state.sessions.get_mut(&group_id).expect("just inserted");
+
+        self.inner
+            .ensure_allocations(session, &[])
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("ensure_allocations failed: {:?}", e),
+            })?;
+        self.inner
+            .prop_up_conv(session, false)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("prop_up_conv(ring=false) failed: {:?}", e),
+            })?;
+        Ok(())
+    }
+
     pub async fn add_members(
         &self,
         session_id: String,

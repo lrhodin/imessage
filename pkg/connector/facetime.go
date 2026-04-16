@@ -348,16 +348,20 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return true
 	}
 
-	// CreateSession fires an Invitation to the target via upstream's
-	// prop_up_conv(ring=true) — this IS the ring. The session also gets
-	// is_ringing_inaccurate=true, which auto_approve_bridge_letmein uses as
-	// its "which session does this link-joiner belong in?" hint.
+	// CreateSessionNoRing allocates the session + propagates to Apple's relay
+	// (so the bridge link is a valid join target), but sends no Invitation
+	// wire — nobody rings yet. The contact's phone rings only after the
+	// caller taps the join link: their JoinEvent triggers
+	// maybe_fire_pending_ring on the Rust side, which calls ft.ring() with
+	// the queued target. This ordering ensures the caller is actually in the
+	// session before the callee is pulled in, so wife's device doesn't see
+	// "call not available" when she answers an empty call.
 	// Send-ack occasionally times out; retry once with the same sessionID
 	// since the announcement is idempotent on group_id.
-	createErr := ft.CreateSession(sessionID, client.handle, []string{target})
+	createErr := ft.CreateSessionNoRing(sessionID, client.handle, []string{target})
 	if createErr != nil && isLikelyDeliveredSendTimeout(createErr) {
 		time.Sleep(500 * time.Millisecond)
-		createErr = ft.CreateSession(sessionID, client.handle, []string{target})
+		createErr = ft.CreateSessionNoRing(sessionID, client.handle, []string{target})
 	}
 	if createErr != nil {
 		switch {
@@ -368,6 +372,16 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		default:
 			ce.Reply("Failed to start FaceTime call: %v", createErr)
 		}
+		return true
+	}
+
+	// Queue the ring. maybe_fire_pending_ring in the FT receive loop will
+	// invoke ft.ring() against [target] the first time a participant other
+	// than client.handle joins this session — i.e. the moment the caller
+	// taps the join link. 60s TTL protects against the caller never tapping
+	// (the entry expires and the call is silently dropped).
+	if pendErr := ft.RegisterPendingRing(sessionID, client.handle, []string{target}, 60); pendErr != nil {
+		ce.Reply("Failed to arm ring for FaceTime call: %v", pendErr)
 		return true
 	}
 
@@ -412,9 +426,9 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 	// open the web FaceTime client in the default browser. Same link,
 	// platform-appropriate handling.
 	ce.Reply(
-		"📞 **Calling %s** — their phone is ringing now.\n\n"+
+		"📞 **FaceTime call ready for %s.**\n\n"+
 			"[**🌐 Join FaceTime call**](%s)\n\n"+
-			"Tap to join the same call %s's phone is ringing for. Works on iOS, macOS, Android, Windows, and Linux — Apple's Universal Link handler opens the FaceTime app on Apple devices and the browser everywhere else.\n\n"+
+			"⚠️ **Tapping this link will ring %s's phone.** The ring fires the moment you join — open the link when you're ready to be on camera. If you don't tap within 60 seconds the session is dropped and nothing rings. Works on iOS, macOS, Android, Windows, and Linux.\n\n"+
 			"Raw URL: %s",
 		bare, webLink, bare, webLink,
 	)

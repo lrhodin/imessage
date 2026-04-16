@@ -1204,6 +1204,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_create_session_no_ring(uniffiStatus)
+		})
+		if checksum != 9956 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_create_session_no_ring: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedfacetimeclient_delete_link(uniffiStatus)
 		})
 		if checksum != 57656 {
@@ -4280,6 +4289,31 @@ func (_self *WrappedFaceTimeClient) CreateSession(groupId string, handle string,
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedfacetimeclient_create_session(
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(groupId)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)), rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(participants)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *WrappedFaceTimeClient) CreateSessionNoRing(groupId string, handle string, participants []string) error {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedFaceTimeClient")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedfacetimeclient_create_session_no_ring(
 				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(groupId)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)), rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(participants)),
 				status,
 			))
