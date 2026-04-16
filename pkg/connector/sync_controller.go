@@ -842,6 +842,35 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 		log.Warn().Int("raw_count", rawCount).Msg("StatusKit invite: zero ghost handles after self-filter — backfill likely incomplete, will retry on next periodic tick")
 		return
 	}
+	// Expand each ghost handle to all correlated aliases from the IDS cache.
+	// A contact's keysharing sub-service registration may live on only one of
+	// their handle forms (e.g. mailto: but not tel:). Passing the raw ghost
+	// list means invites only reach the form we happen to have rowed up;
+	// expanding via sender_correlation_identifier fans the invite out to every
+	// known alias so the device actually registered for keysharing is hit.
+	expanded := make(map[string]struct{}, len(handles))
+	for _, h := range handles {
+		expanded[h] = struct{}{}
+	}
+	var aliasAdded int
+	for _, h := range handles {
+		for _, alias := range c.client.ResolveHandleCached(h, handles) {
+			if _, isSelf := selfHandles[alias]; isSelf {
+				continue
+			}
+			if _, exists := expanded[alias]; !exists {
+				expanded[alias] = struct{}{}
+				aliasAdded++
+			}
+		}
+	}
+	if aliasAdded > 0 {
+		handles = handles[:0]
+		for h := range expanded {
+			handles = append(handles, h)
+		}
+		log.Info().Int("aliases_added", aliasAdded).Int("total", len(handles)).Msg("StatusKit invite: expanded via IDS correlation")
+	}
 	// ensure_channel (called inside invite_to_channel) returns Ok immediately
 	// if my_key is already allocated from a prior session. Only the first-ever
 	// allocation needs the sharedchannels GSA token. Don't gate on SetStatus
@@ -957,6 +986,37 @@ func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
 			}
 		}
 		pending = append(pending, h)
+	}
+	// Mirror the invite-path expansion: fan pending ghosts out to every known
+	// alias so the handle form actually registered for keysharing is hit,
+	// not just whichever form we happened to row up.
+	if len(pending) > 0 {
+		expanded := make(map[string]struct{}, len(pending))
+		for _, h := range pending {
+			expanded[h] = struct{}{}
+		}
+		var aliasAdded int
+		for _, h := range pending {
+			for _, alias := range c.client.ResolveHandleCached(h, allHandles) {
+				if _, isSelf := selfHandles[alias]; isSelf {
+					continue
+				}
+				if _, responded := knownSet[alias]; responded {
+					continue
+				}
+				if _, exists := expanded[alias]; !exists {
+					expanded[alias] = struct{}{}
+					aliasAdded++
+				}
+			}
+		}
+		if aliasAdded > 0 {
+			pending = pending[:0]
+			for h := range expanded {
+				pending = append(pending, h)
+			}
+			log.Info().Int("aliases_added", aliasAdded).Int("total", len(pending)).Msg("StatusKit re-invite: expanded via IDS correlation")
+		}
 	}
 
 	if len(pending) == 0 {
