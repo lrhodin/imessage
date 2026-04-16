@@ -293,7 +293,7 @@ func handleAssetSelection(ce *commands.Event, client *IMClient, ss *rustpushgo.W
 		selected = append(selected, assets[idx])
 	}
 
-	roomID, err := client.getOrCreateAlbumRoom(ce.Ctx, albumGUID, albumName)
+	roomID, dp, err := client.getOrCreateAlbumRoom(ce.Ctx, albumGUID, albumName)
 	if err != nil {
 		ce.Reply("Failed to create album room: %v", err)
 		return
@@ -302,7 +302,7 @@ func handleAssetSelection(ce *commands.Event, client *IMClient, ss *rustpushgo.W
 	ce.Reply("Downloading %d asset(s) from **%s** \u2014 check the dedicated room for progress.", len(selected), albumName)
 
 	// Use background context — ce.Ctx is cancelled when the command handler returns.
-	go client.downloadSharedAlbumAssets(context.Background(), ss, albumGUID, albumName, selected, roomID)
+	go client.downloadSharedAlbumAssets(context.Background(), ss, albumGUID, albumName, selected, roomID, dp)
 }
 
 // parseAssetSelection parses user input like "1", "1,3,5", "1-5", or "all"
@@ -364,12 +364,17 @@ func parseAssetSelection(input string, total int) ([]int, error) {
 // Dedicated album room
 // ---------------------------------------------------------------------------
 
-func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumName string) (id.RoomID, error) {
+func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumName string) (id.RoomID, bridgev2.MatrixAPI, error) {
 	c.sharedAlbumRoomsMu.Lock()
 	defer c.sharedAlbumRoomsMu.Unlock()
 
+	dp := c.UserLogin.User.DoublePuppet(ctx)
+	if dp == nil {
+		return "", nil, fmt.Errorf("double puppet not available — cannot create album room")
+	}
+
 	if roomID, ok := c.sharedAlbumRooms[albumGUID]; ok {
-		return roomID, nil
+		return roomID, dp, nil
 	}
 
 	displayName := albumName
@@ -377,54 +382,29 @@ func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumNam
 		displayName = "Shared Album"
 	}
 
-	botMXID := c.Main.Bridge.Bot.GetMXID()
-
-	// Create the room as the user (via double puppet) so the user owns it
-	// and can delete it from Beeper. The bot is invited so it can send
-	// downloaded media into the room.
-	dp := c.UserLogin.User.DoublePuppet(ctx)
-	if dp == nil {
-		return "", fmt.Errorf("double puppet not available — cannot create album room")
-	}
-
+	// Create the room as the user (via double puppet) with no other members.
+	// This makes it a solo room the user fully owns and can delete from Beeper.
 	roomID, err := dp.CreateRoom(ctx, &mautrix.ReqCreateRoom{
-		Name:    displayName,
-		Topic:   fmt.Sprintf("Shared album download \u2014 %s", displayName),
-		Preset:  "trusted_private_chat",
-		Invite:  []id.UserID{botMXID},
+		Name:   displayName,
+		Preset: "trusted_private_chat",
 	})
 	if err != nil {
-		return "", fmt.Errorf("create room: %w", err)
-	}
-
-	// Mark as DM in the user's m.direct account data so Beeper shows it
-	// as a deletable DM rather than a group room.
-	if dmAPI, ok := dp.(bridgev2.MarkAsDMMatrixAPI); ok {
-		if markErr := dmAPI.MarkAsDM(ctx, roomID, botMXID); markErr != nil {
-			log.Warn().Err(markErr).Stringer("room_id", roomID).Msg("Failed to mark shared album room as DM")
-		}
-	}
-
-	// Ensure the bot has actually joined so it can send media later.
-	if joinErr := c.Main.Bridge.Bot.EnsureJoined(ctx, roomID); joinErr != nil {
-		log.Warn().Err(joinErr).Stringer("room_id", roomID).Msg("Bot failed to join shared album room")
+		return "", nil, fmt.Errorf("create room: %w", err)
 	}
 
 	c.sharedAlbumRooms[albumGUID] = roomID
-	return roomID, nil
+	return roomID, dp, nil
 }
 
 // ---------------------------------------------------------------------------
 // Background download loop
 // ---------------------------------------------------------------------------
 
-func (c *IMClient) downloadSharedAlbumAssets(ctx context.Context, ss *rustpushgo.WrappedSharedStreamsClient, albumGUID, albumName string, assets []rustpushgo.SharedAssetInfo, roomID id.RoomID) {
+func (c *IMClient) downloadSharedAlbumAssets(ctx context.Context, ss *rustpushgo.WrappedSharedStreamsClient, albumGUID, albumName string, assets []rustpushgo.SharedAssetInfo, roomID id.RoomID, intent bridgev2.MatrixAPI) {
 	logger := c.Main.Bridge.Log.With().
 		Str("component", "shared_album_download").
 		Str("album", albumGUID).
 		Logger()
-
-	intent := c.Main.Bridge.Bot
 	var failed int
 
 	for i, asset := range assets {
