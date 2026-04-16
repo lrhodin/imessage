@@ -3219,24 +3219,48 @@ async fn auto_approve_bridge_letmein(
         }
     }
 
-    // Note: respond_letmein internally calls add_members which fans an
-    // AddMember wire to (session.members ∪ new_members). Since session.members
-    // still contains the bridge owner's handle here, the wire reaches the
-    // owner's other Apple devices (Mac), causing the Mac to ring on every
-    // link tap. An earlier attempt stripped own from session.members around
-    // this call but appeared to break wife's initial ring on subsequent
-    // !im facetime invocations — possibly because the strip races with
-    // something else holding session.members. Revert to plain pass-through
-    // until we can either (a) reproduce the regression cleanly, or (b)
-    // expose IDSSendMessage from upstream so we can craft a self-only
-    // RespondedElsewhere without touching members at all.
-    facetime.respond_letmein(request.clone(), Some(&approved_group)).await?;
-    info!(
-        "FaceTime auto-approved LetMeIn request for bridge link: requestor={} group={} usage=bridge",
-        request.requestor,
-        approved_group
-    );
-    Ok(())
+    // respond_letmein: sends LetMeInResponse then add_members/ring over APNs.
+    // APNs can flap (early eof → SendTimedOut) especially right after boot.
+    //
+    // Subtlety: respond_letmein's first action for delegated requests is
+    // removing the delegation_uuid from delegated_requests. If the later
+    // send fails and we retry with the same request, it hits "Already
+    // responded" and no-ops silently — member never added. Strip
+    // delegation_uuid on retries so the check is skipped; duplicate
+    // LetMeInResponse sends are harmless (web client decrypts the first),
+    // and add_members is idempotent (already-present member triggers ring
+    // instead of re-add).
+    let mut last_err: Option<rustpush::PushError> = None;
+    for attempt in 0..3u32 {
+        let mut retry_request = request.clone();
+        if attempt > 0 {
+            retry_request.delegation_uuid = None;
+        }
+        match facetime.respond_letmein(retry_request, Some(&approved_group)).await {
+            Ok(()) => {
+                info!(
+                    "FaceTime auto-approved LetMeIn request for bridge link: requestor={} group={} usage=bridge",
+                    request.requestor,
+                    approved_group
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                let is_timeout = matches!(&e, rustpush::PushError::SendTimedOut);
+                last_err = Some(e);
+                if !is_timeout || attempt >= 2 {
+                    break;
+                }
+                warn!(
+                    "FaceTime letmein respond_letmein timed out (attempt {}), retrying in {}s",
+                    attempt + 1,
+                    attempt + 1
+                );
+                tokio::time::sleep(std::time::Duration::from_secs((attempt + 1) as u64)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or(rustpush::PushError::SendTimedOut))
 }
 
 async fn facetime_event_to_wrapped(
@@ -5925,7 +5949,23 @@ pub async fn new_client(
                 // handle() and falls back to local decoding for cmd 207/209
                 // when Apple sends them without the context.message field —
                 // see the helper's docstring for why.
-                match ft_handle_with_join_recovery(ft_for_recv.as_ref(), msg.clone()).await {
+                //
+                // Retry on SendTimedOut: upstream's handle_letmein sends a
+                // delegation message_session INSIDE handle() — if APNs flaps
+                // at that moment, the entire LetMeIn is dropped before our
+                // auto_approve even runs. A single retry after 2s usually
+                // lands on the reconnected APNs.
+                let ft_result = {
+                    let first = ft_handle_with_join_recovery(ft_for_recv.as_ref(), msg.clone()).await;
+                    if matches!(&first, Err(rustpush::PushError::SendTimedOut)) {
+                        warn!("FaceTime handle SendTimedOut, retrying in 2s");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        ft_handle_with_join_recovery(ft_for_recv.as_ref(), msg.clone()).await
+                    } else {
+                        first
+                    }
+                };
+                match ft_result {
                     Ok(Some(ft_message)) => {
                         if let rustpush::facetime::FTMessage::LetMeInRequest(request) = &ft_message {
                             if let Err(e) = auto_approve_bridge_letmein(ft_for_recv.as_ref(), request).await {
