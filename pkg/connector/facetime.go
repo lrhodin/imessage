@@ -211,11 +211,11 @@ const bridgeFaceTimeLinkUsage = "bridge"
 
 // armBridgeFaceTimeCall does the Rust-side dance shared by the outbound
 // !im facetime command and the missed-call callback notice: mint a session
-// with no ring, queue a pending ring against the target, fetch + pin the
-// persistent bridge link, and pre-fill the web FT join page's display-name
-// field with the caller's handle. The returned webLink is safe to surface
-// in a user-visible notice — tapping it (on any platform) will trigger the
-// caller's join, which in turn fires the Invitation to the target.
+// with no ring, queue a pending ring against the target, mint a session-
+// specific join link (no letmein indirection), and pre-fill the web FT join
+// page's display-name field with the caller's handle. Tapping the returned
+// link joins this specific session directly — upstream's ConversationParticipantDidJoin
+// wire then fires the JoinEvent that triggers the pending ring to the target.
 //
 // ringTTLSecs is the pending-ring lifetime: 60s for the live `!im facetime`
 // flow (caller is actively waiting), much longer for missed-call callbacks
@@ -244,14 +244,9 @@ func armBridgeFaceTimeCall(
 		return "", sessionID, fmt.Errorf("register_pending_ring: %w", pendErr)
 	}
 
-	link, linkErr := getFaceTimeLinkWithRecovery(ft, callerHandle)
+	link, linkErr := ft.GetSessionLink(sessionID)
 	if linkErr != nil {
-		return "", sessionID, fmt.Errorf("get_link_for_usage: %w", linkErr)
-	}
-
-	if bindErr := ft.BindBridgeLinkToSession(callerHandle, bridgeFaceTimeLinkUsage, sessionID); bindErr != nil {
-		// Non-fatal: link-tap will fall back to member/ringing match.
-		_ = bindErr
+		return "", sessionID, fmt.Errorf("get_session_link: %w", linkErr)
 	}
 
 	link = appendFaceTimeLinkName(link, stripIdentifierPrefix(callerHandle))
