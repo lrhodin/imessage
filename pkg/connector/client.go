@@ -2948,20 +2948,37 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 		name = "someone"
 	}
 
-	// Build callback buttons that target the caller directly via Apple's
-	// facetime:// URL scheme. We already have the caller's IDS handle in
-	// msg.Sender (mailto:<email> or tel:<E.164>) — strip the prefix and
-	// pass the bare handle to FaceTime so tapping the link dials THEM,
-	// not a generic bridge session. Works on iOS / macOS native clients;
-	// browser/Android clients won't honor the scheme and will see the
-	// raw URL (still useful as a phone-number / email reference).
+	// Build a call-back button that uses the bridge's pending-ring flow,
+	// same mechanism as the outbound `!im facetime` command:
+	//   - Mint a no-ring session targeting the caller we missed.
+	//   - Queue a pending ring (longer TTL since the user may not see the
+	//     notice immediately — up to an hour).
+	//   - Fetch + pin the bridge's persistent link to that session, with
+	//     &n= prefilled to our handle so the web FT join page lands with
+	//     the name field populated.
+	// When the user taps, letmein approve adds them to the session; that
+	// JoinEvent fires maybe_fire_pending_ring which ft.ring()s the caller
+	// — and by then we're already a live participant, so the callee's
+	// answer connects cleanly.
+	//
+	// Falls back to the old facetime:// scheme only if the bridge link flow
+	// errors out; facetime:// works on iOS/macOS native but not web/Android,
+	// which is why it was never a complete solution.
 	bare := stripIdentifierPrefix(senderHandle)
 	noticeMarkdown := "📞 **Missed FaceTime call from " + name + ".**"
-	if bare != "" {
-		videoURL := "facetime://" + bare
-		audioURL := "facetime-audio://" + bare
-		noticeMarkdown += "\n\n[**📹 Call back (Video)**](" + videoURL + ") · [**📞 Call back (Audio)**](" + audioURL + ")"
-		noticeMarkdown += "\n\nDirect dial: " + bare
+	if bare != "" && c.handle != "" {
+		if ft, ftErr := c.client.GetFacetimeClient(); ftErr == nil {
+			if webLink, _, armErr := armBridgeFaceTimeCall(ft, c.handle, senderHandle, 3600); armErr == nil {
+				noticeMarkdown += "\n\n[**📞 Call back " + name + "**](" + webLink + ")"
+				noticeMarkdown += "\n\n⚠️ **Tapping this link will ring " + name + "'s phone.** The ring fires the moment you join — open the link when you're ready to be on camera. Works on iOS, macOS, Android, Windows, and Linux.\n\nRaw URL: " + webLink
+			} else {
+				log.Warn().Err(armErr).Str("caller", senderHandle).Msg("FaceTimeMissed: bridge-link callback arm failed; falling back to facetime:// scheme")
+				videoURL := "facetime://" + bare
+				audioURL := "facetime-audio://" + bare
+				noticeMarkdown += "\n\n[**📹 Call back (Video)**](" + videoURL + ") · [**📞 Call back (Audio)**](" + audioURL + ")"
+				noticeMarkdown += "\n\nDirect dial: " + bare
+			}
+		}
 	}
 
 	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)

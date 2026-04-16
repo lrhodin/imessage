@@ -2953,12 +2953,24 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
         }
     };
     match ft.ring(&session, &targets, false).await {
-        Ok(_) => info!(
-            "pending ring: rang {} target(s) in session {} (triggered by join from {})",
-            targets.len(),
-            guid,
-            joiner_handle
-        ),
+        Ok(_) => {
+            info!(
+                "pending ring: rang {} target(s) in session {} (triggered by join from {})",
+                targets.len(),
+                guid,
+                joiner_handle
+            );
+            // Flip is_ringing_inaccurate=true now that the Invitation is on
+            // the wire. create_session_no_ring starts it false to suppress
+            // prop_up_conv's RespondedElsewhere diversion; we need it true
+            // here so upstream's missed-call detection (facetime.rs:1411)
+            // trips if the callee declines / times out — otherwise a
+            // no-answer call silently drops instead of surfacing as Missed.
+            let mut state = ft.state.write().await;
+            if let Some(session) = state.sessions.get_mut(guid) {
+                session.is_ringing_inaccurate = true;
+            }
+        }
         Err(e) => warn!("pending ring: ft.ring failed for session {}: {:?}", guid, e),
     }
 }

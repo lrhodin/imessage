@@ -209,6 +209,55 @@ var cmdFaceTimeRemoveMembers = &commands.FullHandler{
 // calls return the same URL until it is explicitly cleared.
 const bridgeFaceTimeLinkUsage = "bridge"
 
+// armBridgeFaceTimeCall does the Rust-side dance shared by the outbound
+// !im facetime command and the missed-call callback notice: mint a session
+// with no ring, queue a pending ring against the target, fetch + pin the
+// persistent bridge link, and pre-fill the web FT join page's display-name
+// field with the caller's handle. The returned webLink is safe to surface
+// in a user-visible notice — tapping it (on any platform) will trigger the
+// caller's join, which in turn fires the Invitation to the target.
+//
+// ringTTLSecs is the pending-ring lifetime: 60s for the live `!im facetime`
+// flow (caller is actively waiting), much longer for missed-call callbacks
+// (the user may not see the notice for a while).
+func armBridgeFaceTimeCall(
+	ft *rustpushgo.WrappedFaceTimeClient,
+	callerHandle string,
+	targetHandle string,
+	ringTTLSecs uint64,
+) (webLink string, sessionID string, err error) {
+	sessionID, err = newFaceTimeSessionID()
+	if err != nil {
+		return "", "", fmt.Errorf("generate session ID: %w", err)
+	}
+
+	createErr := ft.CreateSessionNoRing(sessionID, callerHandle, []string{targetHandle})
+	if createErr != nil && isLikelyDeliveredSendTimeout(createErr) {
+		time.Sleep(500 * time.Millisecond)
+		createErr = ft.CreateSessionNoRing(sessionID, callerHandle, []string{targetHandle})
+	}
+	if createErr != nil {
+		return "", sessionID, fmt.Errorf("create_session_no_ring: %w", createErr)
+	}
+
+	if pendErr := ft.RegisterPendingRing(sessionID, callerHandle, []string{targetHandle}, ringTTLSecs); pendErr != nil {
+		return "", sessionID, fmt.Errorf("register_pending_ring: %w", pendErr)
+	}
+
+	link, linkErr := getFaceTimeLinkWithRecovery(ft, callerHandle)
+	if linkErr != nil {
+		return "", sessionID, fmt.Errorf("get_link_for_usage: %w", linkErr)
+	}
+
+	if bindErr := ft.BindBridgeLinkToSession(callerHandle, bridgeFaceTimeLinkUsage, sessionID); bindErr != nil {
+		// Non-fatal: link-tap will fall back to member/ringing match.
+		_ = bindErr
+	}
+
+	link = appendFaceTimeLinkName(link, stripIdentifierPrefix(callerHandle))
+	return link, sessionID, nil
+}
+
 var faceTimeURLRegex = regexp.MustCompile(`(?i)(?:facetime://[^\s<>")']+|(?:https?://)?(?:www\.)?facetime\.apple\.com/[^\s<>")']+)`)
 
 func fnFaceTime(ce *commands.Event) {
@@ -340,83 +389,19 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return true
 	}
 
-	// Fresh group_id per call so sessions don't collide. Apple's wire format
-	// expects an uppercase v4 UUID.
-	sessionID, err := newFaceTimeSessionID()
+	webLink, sessionID, err := armBridgeFaceTimeCall(ft, client.handle, target, 60)
 	if err != nil {
-		ce.Reply("Failed to generate session ID: %v", err)
-		return true
-	}
-
-	// CreateSessionNoRing allocates the session + propagates to Apple's relay
-	// (so the bridge link is a valid join target), but sends no Invitation
-	// wire — nobody rings yet. The contact's phone rings only after the
-	// caller taps the join link: their JoinEvent triggers
-	// maybe_fire_pending_ring on the Rust side, which calls ft.ring() with
-	// the queued target. This ordering ensures the caller is actually in the
-	// session before the callee is pulled in, so wife's device doesn't see
-	// "call not available" when she answers an empty call.
-	// Send-ack occasionally times out; retry once with the same sessionID
-	// since the announcement is idempotent on group_id.
-	createErr := ft.CreateSessionNoRing(sessionID, client.handle, []string{target})
-	if createErr != nil && isLikelyDeliveredSendTimeout(createErr) {
-		time.Sleep(500 * time.Millisecond)
-		createErr = ft.CreateSessionNoRing(sessionID, client.handle, []string{target})
-	}
-	if createErr != nil {
 		switch {
-		case isNonRetryableResourceClosed(createErr):
-			ce.Reply("Failed to start FaceTime call: %v\n\nThe bridge's iMessage connection is in a terminal state — retrying this command won't help. The bridge needs to reconnect (try again in a minute, or log out and back in if it persists).", createErr)
-		case isLikelyDeliveredSendTimeout(createErr):
-			ce.Reply("Failed to start FaceTime call: %v\n\nSend-ack timeouts usually clear on a second try — run `!im facetime` again.", createErr)
+		case isNonRetryableResourceClosed(err):
+			ce.Reply("Failed to start FaceTime call: %v\n\nThe bridge's iMessage connection is in a terminal state — retrying this command won't help. The bridge needs to reconnect (try again in a minute, or log out and back in if it persists).", err)
+		case isLikelyDeliveredSendTimeout(err):
+			ce.Reply("Failed to start FaceTime call: %v\n\nSend-ack timeouts usually clear on a second try — run `!im facetime` again.", err)
 		default:
-			ce.Reply("Failed to start FaceTime call: %v", createErr)
+			ce.Reply("Failed to start FaceTime call: %v", err)
 		}
 		return true
 	}
-
-	// Queue the ring. maybe_fire_pending_ring in the FT receive loop will
-	// invoke ft.ring() against [target] the first time a participant other
-	// than client.handle joins this session — i.e. the moment the caller
-	// taps the join link. 60s TTL protects against the caller never tapping
-	// (the entry expires and the call is silently dropped).
-	if pendErr := ft.RegisterPendingRing(sessionID, client.handle, []string{target}, 60); pendErr != nil {
-		ce.Reply("Failed to arm ring for FaceTime call: %v", pendErr)
-		return true
-	}
-
-	// Fetch (or mint) the bridge's persistent personal link tagged with
-	// bridgeFaceTimeLinkUsage ("bridge"). That exact tag is what
-	// auto_approve_bridge_letmein keys off when routing a link-tap request
-	// into the session we just created.
-	webLink, linkErr := getFaceTimeLinkWithRecovery(ft, client.handle)
-	if linkErr != nil {
-		ce.Reply("Call started and %s's phone is ringing, but fetching the bridge FaceTime link failed: %v\n\nTry `!im facetime-clear` and then `!im facetime` again to reset the link state.", stripIdentifierPrefix(target), linkErr)
-		return true
-	}
-
-	// Pin the persistent bridge link to the session we just created so the
-	// letmein approver's linked_group branch matches deterministically when
-	// the user taps the link. Without this, session_link is None on the first
-	// tap and the approver has to fall through to member/ringing heuristics
-	// — which miss under cold-start / stale-state conditions and fabricate
-	// an empty session (the "0 people" symptom).
-	if bindErr := ft.BindBridgeLinkToSession(client.handle, bridgeFaceTimeLinkUsage, sessionID); bindErr != nil {
-		zerolog.Ctx(ce.Ctx).Warn().
-			Err(bindErr).
-			Str("session_id", sessionID).
-			Str("handle", client.handle).
-			Msg("failed to bind bridge FaceTime link to session; link-tap will fall back to member/ringing match")
-	}
-
-	// Append &n=<handle> so Apple's web join page pre-populates the display
-	// name field — caller hits Join instead of typing a name. Previous
-	// attempt (commit f168c0d) used url.QueryEscape, which percent-encodes +
-	// to %2B; Apple's web FT fragment parser appears to display the encoded
-	// form literally instead of decoding, so callers saw "%2B18454996730"
-	// (looks like Unicode gibberish) instead of "+18454996730". Send the
-	// bare handle without percent-encoding — + is a legal fragment char.
-	webLink = appendFaceTimeLinkName(webLink, stripIdentifierPrefix(client.handle))
+	_ = sessionID
 
 	bare := stripIdentifierPrefix(target)
 
