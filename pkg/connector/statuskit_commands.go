@@ -18,12 +18,27 @@ package connector
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"maunium.net/go/mautrix/bridgev2/commands"
 
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
+
+// wellKnownFocusModes lists the standard iOS Focus/DND mode identifiers in a
+// user-friendly order. Custom modes use opaque UUIDs and can still be passed
+// directly as a raw argument.
+var wellKnownFocusModes = []struct {
+	ID    string
+	Label string
+}{
+	{"com.apple.donotdisturb.mode.default", "Do Not Disturb"},
+	{"com.apple.donotdisturb.mode.sleep", "Sleep"},
+	{"com.apple.focus.mode.driving", "Driving"},
+	{"com.apple.focus.mode.personal", "Personal"},
+	{"com.apple.focus.mode.work", "Work"},
+}
 
 var cmdStatuskitState = &commands.FullHandler{
 	Name: "statuskit-state",
@@ -40,8 +55,8 @@ var cmdStatuskitShare = &commands.FullHandler{
 	Func: fnStatuskitShare,
 	Help: commands.HelpMeta{
 		Section:     HelpSectionStatusKit,
-		Description: "Publish your StatusKit shared-status. Use `on` to mark yourself available; use `off <mode>` where <mode> is the iOS Focus UUID to publish as away in that mode.",
-		Args:        "on | off <mode>",
+		Description: "Publish your StatusKit shared-status. Use `on` to mark yourself available; use `off` to pick a Focus mode from a list.",
+		Args:        "on | off",
 	},
 	RequiresLogin: true,
 }
@@ -146,7 +161,7 @@ func fnStatuskitState(ce *commands.Event) {
 
 func fnStatuskitShare(ce *commands.Event) {
 	if len(ce.Args) < 1 {
-		ce.Reply("Usage: `!statuskit-share <on|off> [mode]`")
+		ce.Reply("Usage: `$cmdprefix statuskit-share <on|off>`")
 		return
 	}
 	sk, ok := statusKitClientFromEvent(ce)
@@ -158,22 +173,58 @@ func fnStatuskitShare(ce *commands.Event) {
 		ce.Reply("%v", err)
 		return
 	}
-	var mode *string
-	if len(ce.Args) > 1 {
-		m := strings.TrimSpace(ce.Args[1])
-		if m != "" {
-			mode = &m
+
+	// "on" path — no mode needed.
+	if active {
+		if err := sk.ShareStatus(true, nil); err != nil {
+			ce.Reply("Failed to publish StatusKit share status: %v", err)
+			return
 		}
-	}
-	if err := sk.ShareStatus(active, mode); err != nil {
-		ce.Reply("Failed to publish StatusKit share status: %v", err)
+		ce.Reply("Published StatusKit share state: available")
 		return
 	}
-	if mode != nil {
-		ce.Reply("Published StatusKit share state: active=%v mode=%s", active, *mode)
-	} else {
-		ce.Reply("Published StatusKit share state: active=%v", active)
+
+	// "off" — show numbered list of Focus modes.
+	var sb strings.Builder
+	sb.WriteString("Select a Focus mode:\n\n")
+	for i, m := range wellKnownFocusModes {
+		fmt.Fprintf(&sb, "%d. **%s**\n", i+1, m.Label)
 	}
+	sb.WriteString("\nReply with a number to select, or `$cmdprefix cancel` to cancel.")
+	ce.Reply(sb.String())
+
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "select focus mode",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			input := strings.TrimSpace(ce.RawArgs)
+
+			n, err := strconv.Atoi(input)
+			if err != nil || n < 1 || n > len(wellKnownFocusModes) {
+				ce.Reply("Please reply with a number between 1 and %d, or `$cmdprefix cancel` to cancel.", len(wellKnownFocusModes))
+				return
+			}
+			mode := wellKnownFocusModes[n-1].ID
+
+			commands.StoreCommandState(ce.User, nil)
+
+			sk, ok := statusKitClientFromEvent(ce)
+			if !ok {
+				return
+			}
+			if err := sk.ShareStatus(false, &mode); err != nil {
+				ce.Reply("Failed to publish StatusKit share status: %v", err)
+				return
+			}
+			label := mode
+			for _, m := range wellKnownFocusModes {
+				if m.ID == mode {
+					label = m.Label
+					break
+				}
+			}
+			ce.Reply("Published StatusKit share state: away (%s)", label)
+		}),
+	})
 }
 
 func fnStatuskitResetKeys(ce *commands.Event) {
