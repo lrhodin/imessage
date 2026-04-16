@@ -4890,12 +4890,10 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
-	var uuid string
-	err := retrySendOnAPNsFlap(func() error {
-		var sendErr error
-		uuid, sendErr = c.client.SendMessage(conv, textToSend, nil, c.handle, replyGuid, replyPart, nil)
-		return sendErr
-	})
+	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
+	// UUID (lib.rs:~7373). No Go-side retry here — a retry would generate a
+	// fresh MessageInst and orphan delivery receipts for the first attempt.
+	uuid, err := c.client.SendMessage(conv, textToSend, nil, c.handle, replyGuid, replyPart, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
@@ -5101,12 +5099,9 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		caption = &msg.Content.Body
 	}
 
-	var uuid string
-	err = retrySendOnAPNsFlap(func() error {
-		var sendErr error
-		uuid, sendErr = c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, caption)
-		return sendErr
-	})
+	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
+	// UUID — no Go-side retry here (would orphan delivery receipts).
+	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, caption)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
@@ -5263,12 +5258,8 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, false)
 			}
 		}
-		var uuid string
-		err := retrySendOnAPNsFlap(func() error {
-			var sendErr error
-			uuid, sendErr = c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
-			return sendErr
-		})
+		// Rust-side retry handles SendTimedOut with stable UUID.
+		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
 		}
@@ -5318,12 +5309,8 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, true)
 			}
 		}
-		var uuid string
-		err := retrySendOnAPNsFlap(func() error {
-			var sendErr error
-			uuid, sendErr = c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
-			return sendErr
-		})
+		// Rust-side retry handles SendTimedOut with stable UUID.
+		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
 		if err != nil {
 			return err
 		}

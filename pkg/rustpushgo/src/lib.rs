@@ -6845,6 +6845,44 @@ impl Client {
     }
 }
 
+// Plain (non-FFI) impl for internal helpers that use upstream rustpush types
+// (MessageInst, SendJob, PushError) not safe to cross the uniffi boundary.
+impl Client {
+    /// Retry client.send on PushError::SendTimedOut, reusing the same
+    /// MessageInst (and therefore the same UUID) across attempts. A timed-out
+    /// send may have already reached Apple; if we retry with a fresh
+    /// MessageInst the second attempt carries a new UUID and Apple ends up
+    /// with two messages. The delivery receipt for the first attempt then
+    /// references a UUID we never persisted and the bridge drops it as
+    /// "target message not in bridge DB". Reusing the msg keeps UUID stable
+    /// across retries so at most one UUID ever reaches Apple.
+    async fn send_with_flap_retry(
+        &self,
+        msg: &mut rustpush::MessageInst,
+    ) -> Result<rustpush::SendJob, rustpush::PushError> {
+        const MAX_ATTEMPTS: u32 = 3;
+        for attempt in 0..MAX_ATTEMPTS {
+            match self.client.send(msg).await {
+                Ok(job) => return Ok(job),
+                Err(rustpush::PushError::SendTimedOut) if attempt + 1 < MAX_ATTEMPTS => {
+                    warn!(
+                        "SendTimedOut on attempt {}/{} for uuid={}; retrying with same MessageInst",
+                        attempt + 1,
+                        MAX_ATTEMPTS,
+                        msg.id
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        1000 + 1000 * attempt as u64,
+                    ))
+                    .await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(rustpush::PushError::SendTimedOut)
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl Client {
     /// Reset the cached CloudKit client so the next CloudKit operation
@@ -7484,7 +7522,7 @@ impl Client {
             &handle,
             Message::Message(normal),
         );
-        match self.client.send(&mut msg).await {
+        match self.send_with_flap_retry(&mut msg).await {
             Ok(_) => Ok(msg.id.clone()),
             Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
                 // iMessage failed — no IDS targets. Retry as SMS (without rich link).
@@ -7499,7 +7537,7 @@ impl Client {
                     &handle,
                     Message::Message(NormalMessage::new(actual_text, sms_service)),
                 );
-                self.client.send(&mut sms_msg).await
+                self.send_with_flap_retry(&mut sms_msg).await
                     .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS: {}", e) })?;
                 Ok(sms_msg.id.clone())
             }
@@ -8251,7 +8289,7 @@ impl Client {
                 embedded_profile: None,
             }),
         );
-        match self.client.send(&mut msg).await {
+        match self.send_with_flap_retry(&mut msg).await {
             Ok(_) => Ok(msg.id.clone()),
             Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
                 info!("No IDS targets for attachment, falling back to SMS for {:?}", conv.participants);
@@ -8283,7 +8321,7 @@ impl Client {
                         embedded_profile: None,
                     }),
                 );
-                self.client.send(&mut sms_msg).await
+                self.send_with_flap_retry(&mut sms_msg).await
                     .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS attachment: {}", e) })?;
                 Ok(sms_msg.id.clone())
             }
