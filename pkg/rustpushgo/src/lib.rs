@@ -4358,8 +4358,22 @@ impl LoginSession {
                     .unwrap_or(false);
                 let has_required_services = wrapped.inner[0].registration.contains_key(MADRID_SERVICE.name)
                     && wrapped.inner[0].registration.contains_key(MULTIPLEX_SERVICE.name);
+                // Also validate MULTIPLEX cert isn't expired and data_hash
+                // (sub_services + client_data) hasn't changed since registration.
+                // A stale MULTIPLEX registration makes the bridge invisible to
+                // contacts querying IDS for keysharing sub-service targets.
+                let multiplex_valid = wrapped.inner[0]
+                    .registration.get(MULTIPLEX_SERVICE.name)
+                    .map(|r| {
+                        let not_expired = r.calculate_rereg_time_s().map(|t| t > 0).unwrap_or(false);
+                        let hash_matches = r.data_hash == MULTIPLEX_SERVICE.hash_data();
+                        if !not_expired { info!("MULTIPLEX registration expired — will re-register"); }
+                        if !hash_matches { info!("MULTIPLEX data_hash changed (sub_services or client_data updated) — will re-register"); }
+                        not_expired && hash_matches
+                    })
+                    .unwrap_or(false);
 
-                if has_valid_registration && has_required_services {
+                if has_valid_registration && has_required_services && multiplex_valid {
                     info!("Reusing existing registration (still valid for iMessage services, skipping register endpoint)");
                     let mut existing = wrapped.inner.clone();
                     existing[0].auth_keypair = fresh_user.auth_keypair.clone();
