@@ -5780,6 +5780,21 @@ pub async fn new_client(
                                     return Ok::<bool, String>(false);
                                 };
                                 let Some(message_unenc) = recv.message_unenc else {
+                                    // c=97 with no IDS fields = key request from a
+                                    // contact's device. Trigger on_keys_received so
+                                    // the Go side re-sends invites to all contacts.
+                                    if recv.command == 97 {
+                                        // Log the raw payload for protocol analysis.
+                                        let raw_keys = if let plist::Value::Dictionary(ref d) = payload {
+                                            d.keys().cloned().collect::<Vec<_>>().join(", ")
+                                        } else { "<non-dict>".into() };
+                                        info!("StatusKit c=97 key request received (sender={:?}, payload keys=[{}]) — triggering re-invite",
+                                            recv.sender, raw_keys);
+                                        if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                            cb.on_keys_received();
+                                        }
+                                        return Ok(true);
+                                    }
                                     // c=255 ACKs and other non-encrypted messages lack P/E/t fields,
                                     // so the decryption block in receive_message is skipped entirely.
                                     warn!("StatusKit workaround: message_unenc is None (c={} sender={:?} sP={} P={} E={} t={}) — no decrypted payload; likely server ACK or missing IDS keys",
