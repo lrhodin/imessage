@@ -78,7 +78,6 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdFindMyFriends,
 		cmdFindMyFriendsImport,
 		cmdSharedAlbums,
-		cmdSharedPhotos,
 		cmdSharedSubscribe,
 		cmdSharedSubscribeToken,
 		cmdSharedUnsubscribe,

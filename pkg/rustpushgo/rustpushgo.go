@@ -1546,11 +1546,29 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_download_file(uniffiStatus)
+		})
+		if checksum != 57741 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_download_file: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_export_state_json(uniffiStatus)
 		})
 		if checksum != 8939 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_export_state_json: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_get_album_assets(uniffiStatus)
+		})
+		if checksum != 12757 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_get_album_assets: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -1587,6 +1605,15 @@ func uniffiCheckChecksums() {
 		if checksum != 44544 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_list_album_ids: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_list_albums(uniffiStatus)
+		})
+		if checksum != 20350 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_list_albums: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -5442,6 +5469,31 @@ func (_self *WrappedSharedStreamsClient) DeleteAssets(album string, assets []str
 		})
 }
 
+func (_self *WrappedSharedStreamsClient) DownloadFile(album string, assetGuid string) ([]byte, error) {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedSharedStreamsClient")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_download_file(
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(album)), rustBufferToC(FfiConverterStringINSTANCE.Lower(assetGuid)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterBytesINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *WrappedSharedStreamsClient) ExportStateJson() (string, error) {
 	_pointer := _self.ffiObject.incrementPointer("*WrappedSharedStreamsClient")
 	defer _self.ffiObject.decrementPointer()
@@ -5462,6 +5514,31 @@ func (_self *WrappedSharedStreamsClient) ExportStateJson() (string, error) {
 			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
 		},
 		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *WrappedSharedStreamsClient) GetAlbumAssets(album string) ([]SharedAssetInfo, error) {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedSharedStreamsClient")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_get_album_assets(
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(album)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterSequenceTypeSharedAssetInfoINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
 		})
@@ -5561,6 +5638,30 @@ func (_self *WrappedSharedStreamsClient) ListAlbumIds() []string {
 			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
 		},
 		FfiConverterSequenceStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *WrappedSharedStreamsClient) ListAlbums() []SharedAlbumInfo {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedSharedStreamsClient")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithResult(func(status *C.RustCallStatus) *C.void {
+		// rustFutureFunc
+		return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_list_albums(
+			_pointer,
+			status,
+		))
+	},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterSequenceTypeSharedAlbumInfoINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
 		})
@@ -6329,6 +6430,114 @@ func (c FfiConverterTypeIDSUsersWithIdentityRecord) Write(writer io.Writer, valu
 type FfiDestroyerTypeIdsUsersWithIdentityRecord struct{}
 
 func (_ FfiDestroyerTypeIdsUsersWithIdentityRecord) Destroy(value IdsUsersWithIdentityRecord) {
+	value.Destroy()
+}
+
+type SharedAlbumInfo struct {
+	Albumguid string
+	Name      *string
+	Fullname  *string
+	Email     *string
+}
+
+func (r *SharedAlbumInfo) Destroy() {
+	FfiDestroyerString{}.Destroy(r.Albumguid)
+	FfiDestroyerOptionalString{}.Destroy(r.Name)
+	FfiDestroyerOptionalString{}.Destroy(r.Fullname)
+	FfiDestroyerOptionalString{}.Destroy(r.Email)
+}
+
+type FfiConverterTypeSharedAlbumInfo struct{}
+
+var FfiConverterTypeSharedAlbumInfoINSTANCE = FfiConverterTypeSharedAlbumInfo{}
+
+func (c FfiConverterTypeSharedAlbumInfo) Lift(rb RustBufferI) SharedAlbumInfo {
+	return LiftFromRustBuffer[SharedAlbumInfo](c, rb)
+}
+
+func (c FfiConverterTypeSharedAlbumInfo) Read(reader io.Reader) SharedAlbumInfo {
+	return SharedAlbumInfo{
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeSharedAlbumInfo) Lower(value SharedAlbumInfo) RustBuffer {
+	return LowerIntoRustBuffer[SharedAlbumInfo](c, value)
+}
+
+func (c FfiConverterTypeSharedAlbumInfo) Write(writer io.Writer, value SharedAlbumInfo) {
+	FfiConverterStringINSTANCE.Write(writer, value.Albumguid)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Name)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Fullname)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Email)
+}
+
+type FfiDestroyerTypeSharedAlbumInfo struct{}
+
+func (_ FfiDestroyerTypeSharedAlbumInfo) Destroy(value SharedAlbumInfo) {
+	value.Destroy()
+}
+
+type SharedAssetInfo struct {
+	Assetguid   string
+	Filename    string
+	DateCreated string
+	MediaType   string
+	Width       string
+	Height      string
+	Size        string
+}
+
+func (r *SharedAssetInfo) Destroy() {
+	FfiDestroyerString{}.Destroy(r.Assetguid)
+	FfiDestroyerString{}.Destroy(r.Filename)
+	FfiDestroyerString{}.Destroy(r.DateCreated)
+	FfiDestroyerString{}.Destroy(r.MediaType)
+	FfiDestroyerString{}.Destroy(r.Width)
+	FfiDestroyerString{}.Destroy(r.Height)
+	FfiDestroyerString{}.Destroy(r.Size)
+}
+
+type FfiConverterTypeSharedAssetInfo struct{}
+
+var FfiConverterTypeSharedAssetInfoINSTANCE = FfiConverterTypeSharedAssetInfo{}
+
+func (c FfiConverterTypeSharedAssetInfo) Lift(rb RustBufferI) SharedAssetInfo {
+	return LiftFromRustBuffer[SharedAssetInfo](c, rb)
+}
+
+func (c FfiConverterTypeSharedAssetInfo) Read(reader io.Reader) SharedAssetInfo {
+	return SharedAssetInfo{
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeSharedAssetInfo) Lower(value SharedAssetInfo) RustBuffer {
+	return LowerIntoRustBuffer[SharedAssetInfo](c, value)
+}
+
+func (c FfiConverterTypeSharedAssetInfo) Write(writer io.Writer, value SharedAssetInfo) {
+	FfiConverterStringINSTANCE.Write(writer, value.Assetguid)
+	FfiConverterStringINSTANCE.Write(writer, value.Filename)
+	FfiConverterStringINSTANCE.Write(writer, value.DateCreated)
+	FfiConverterStringINSTANCE.Write(writer, value.MediaType)
+	FfiConverterStringINSTANCE.Write(writer, value.Width)
+	FfiConverterStringINSTANCE.Write(writer, value.Height)
+	FfiConverterStringINSTANCE.Write(writer, value.Size)
+}
+
+type FfiDestroyerTypeSharedAssetInfo struct{}
+
+func (_ FfiDestroyerTypeSharedAssetInfo) Destroy(value SharedAssetInfo) {
 	value.Destroy()
 }
 
@@ -8443,6 +8652,92 @@ type FfiDestroyerSequenceTypeEscrowDeviceInfo struct{}
 func (FfiDestroyerSequenceTypeEscrowDeviceInfo) Destroy(sequence []EscrowDeviceInfo) {
 	for _, value := range sequence {
 		FfiDestroyerTypeEscrowDeviceInfo{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceTypeSharedAlbumInfo struct{}
+
+var FfiConverterSequenceTypeSharedAlbumInfoINSTANCE = FfiConverterSequenceTypeSharedAlbumInfo{}
+
+func (c FfiConverterSequenceTypeSharedAlbumInfo) Lift(rb RustBufferI) []SharedAlbumInfo {
+	return LiftFromRustBuffer[[]SharedAlbumInfo](c, rb)
+}
+
+func (c FfiConverterSequenceTypeSharedAlbumInfo) Read(reader io.Reader) []SharedAlbumInfo {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]SharedAlbumInfo, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterTypeSharedAlbumInfoINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceTypeSharedAlbumInfo) Lower(value []SharedAlbumInfo) RustBuffer {
+	return LowerIntoRustBuffer[[]SharedAlbumInfo](c, value)
+}
+
+func (c FfiConverterSequenceTypeSharedAlbumInfo) Write(writer io.Writer, value []SharedAlbumInfo) {
+	if len(value) > math.MaxInt32 {
+		panic("[]SharedAlbumInfo is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterTypeSharedAlbumInfoINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceTypeSharedAlbumInfo struct{}
+
+func (FfiDestroyerSequenceTypeSharedAlbumInfo) Destroy(sequence []SharedAlbumInfo) {
+	for _, value := range sequence {
+		FfiDestroyerTypeSharedAlbumInfo{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceTypeSharedAssetInfo struct{}
+
+var FfiConverterSequenceTypeSharedAssetInfoINSTANCE = FfiConverterSequenceTypeSharedAssetInfo{}
+
+func (c FfiConverterSequenceTypeSharedAssetInfo) Lift(rb RustBufferI) []SharedAssetInfo {
+	return LiftFromRustBuffer[[]SharedAssetInfo](c, rb)
+}
+
+func (c FfiConverterSequenceTypeSharedAssetInfo) Read(reader io.Reader) []SharedAssetInfo {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]SharedAssetInfo, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterTypeSharedAssetInfoINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceTypeSharedAssetInfo) Lower(value []SharedAssetInfo) RustBuffer {
+	return LowerIntoRustBuffer[[]SharedAssetInfo](c, value)
+}
+
+func (c FfiConverterSequenceTypeSharedAssetInfo) Write(writer io.Writer, value []SharedAssetInfo) {
+	if len(value) > math.MaxInt32 {
+		panic("[]SharedAssetInfo is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterTypeSharedAssetInfoINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceTypeSharedAssetInfo struct{}
+
+func (FfiDestroyerSequenceTypeSharedAssetInfo) Destroy(sequence []SharedAssetInfo) {
+	for _, value := range sequence {
+		FfiDestroyerTypeSharedAssetInfo{}.Destroy(value)
 	}
 }
 

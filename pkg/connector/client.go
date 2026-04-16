@@ -164,6 +164,11 @@ type IMClient struct {
 	sharedStreamAssetCache   map[string]map[string]struct{}
 	sharedStreamAssetCacheMu sync.Mutex
 
+	// sharedAlbumRooms caches dedicated Matrix rooms created for browsing
+	// shared album content. Keyed by album GUID; ephemeral per session.
+	sharedAlbumRooms   map[string]id.RoomID
+	sharedAlbumRoomsMu sync.Mutex
+
 	// statusKitBotRulePushed is set to true after we successfully install a
 	// sender push rule via the double puppet that silences push notifications
 	// from the bridge bot. Done once per session; the rule is durable on the

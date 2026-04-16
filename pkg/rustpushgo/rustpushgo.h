@@ -957,8 +957,21 @@ void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_delete_assets(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_download_file(
+	void* ptr,
+	RustBuffer album,
+	RustBuffer asset_guid,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_export_state_json(
 	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_get_album_assets(
+	void* ptr,
+	RustBuffer album,
 	RustCallStatus* out_status
 );
 
@@ -981,6 +994,11 @@ void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_get_changes(
 );
 
 void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_list_album_ids(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_list_albums(
 	void* ptr,
 	RustCallStatus* out_status
 );
@@ -2008,7 +2026,15 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_delete_ass
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_download_file(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_export_state_json(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_get_album_assets(
 	RustCallStatus* out_status
 );
 
@@ -2025,6 +2051,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_get_change
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_list_album_ids(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_list_albums(
 	RustCallStatus* out_status
 );
 
