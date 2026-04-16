@@ -212,93 +212,65 @@ func handleAlbumSelection(ce *commands.Event, client *IMClient, albums []rustpus
 		return
 	}
 
-	// Get the GUID list first — this is lightweight and also populates the
-	// album name in the cached state.
-	var guids []string
+	// Single authenticated call — reads cached GUIDs from state (no network)
+	// then fetches full asset metadata. Avoids the double-auth-request that
+	// caused TokenMissing.
+	var assets []rustpushgo.SharedAssetInfo
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				err = fmt.Errorf("shared streams client panicked: %v", r)
 			}
 		}()
-		guids, err = ss.GetAlbumSummary(albumGUID)
+		assets, err = ss.GetAlbumAssets(albumGUID)
 	}()
 	if err != nil {
-		ce.Reply("Failed to fetch album summary for **%s**: %v", albumName, err)
+		ce.Reply("Failed to fetch assets for **%s**: %v", albumName, err)
 		return
 	}
-	if len(guids) == 0 {
+	if len(assets) == 0 {
 		ce.Reply("**%s** is empty.", albumName)
 		return
 	}
 
-	// Try to get rich metadata (filenames, dates, dimensions). This makes a
-	// second authenticated request that can fail if the auth token expired.
-	// Fall back to GUID-only display if it fails.
-	shown := guids
+	shown := assets
 	truncated := false
 	if len(shown) > 50 {
 		shown = shown[len(shown)-50:]
 		truncated = true
 	}
 
-	var richAssets []rustpushgo.SharedAssetInfo
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				richAssets = nil
-			}
-		}()
-		var richErr error
-		richAssets, richErr = ss.GetAlbumAssets(albumGUID, shown)
-		if richErr != nil {
-			richAssets = nil
-		}
-	}()
-
-	// If rich metadata succeeded, use it (truncated to match shown GUIDs).
-	if richAssets != nil && len(richAssets) > 50 {
-		richAssets = richAssets[len(richAssets)-50:]
-	}
-
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("**%s** \u2014 %d asset(s)", albumName, len(guids)))
+	sb.WriteString(fmt.Sprintf("**%s** \u2014 %d asset(s)", albumName, len(assets)))
 	if truncated {
-		sb.WriteString(fmt.Sprintf(" (showing latest 50 of %d)", len(guids)))
+		sb.WriteString(fmt.Sprintf(" (showing latest 50 of %d)", len(assets)))
 	}
 	sb.WriteString("\n\n")
 
-	if richAssets != nil && len(richAssets) > 0 {
-		for i, a := range richAssets {
-			dims := ""
-			if a.Width != "" && a.Height != "" && a.Width != "0" && a.Height != "0" {
-				dims = fmt.Sprintf(", %s\u00d7%s", a.Width, a.Height)
-			}
-			date := ""
-			if a.DateCreated != "" {
-				if t, parseErr := time.Parse(time.RFC3339, a.DateCreated); parseErr == nil {
-					date = fmt.Sprintf(", %s", t.Format("2006-01-02"))
-				}
-			}
-			mediaLabel := a.MediaType
-			if mediaLabel == "" {
-				mediaLabel = "file"
-			}
-			sb.WriteString(fmt.Sprintf("%d. **%s** (%s%s%s)\n", i+1, a.Filename, mediaLabel, dims, date))
+	for i, a := range shown {
+		dims := ""
+		if a.Width != "" && a.Height != "" && a.Width != "0" && a.Height != "0" {
+			dims = fmt.Sprintf(", %s\u00d7%s", a.Width, a.Height)
 		}
-	} else {
-		for i, guid := range shown {
-			sb.WriteString(fmt.Sprintf("%d. `%s`\n", i+1, guid))
+		date := ""
+		if a.DateCreated != "" {
+			if t, parseErr := time.Parse(time.RFC3339, a.DateCreated); parseErr == nil {
+				date = fmt.Sprintf(", %s", t.Format("2006-01-02"))
+			}
 		}
+		mediaLabel := a.MediaType
+		if mediaLabel == "" {
+			mediaLabel = "file"
+		}
+		sb.WriteString(fmt.Sprintf("%d. **%s** (%s%s%s)\n", i+1, a.Filename, mediaLabel, dims, date))
 	}
 	sb.WriteString("\nReply with number(s), a range (1-5), or `all` to download. `$cmdprefix cancel` to cancel.")
 	ce.Reply(sb.String())
 
-	// The download step uses GUIDs directly (not rich metadata), so pass them.
 	commands.StoreCommandState(ce.User, &commands.CommandState{
 		Action: "select shared album assets",
 		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
-			handleAssetSelection(ce, client, ss, albumGUID, albumName, shown, richAssets)
+			handleAssetSelection(ce, client, ss, albumGUID, albumName, shown)
 		}),
 		Cancel: func() {},
 	})
@@ -308,33 +280,25 @@ func handleAlbumSelection(ce *commands.Event, client *IMClient, albums []rustpus
 // Step 3: download selected assets
 // ---------------------------------------------------------------------------
 
-func handleAssetSelection(ce *commands.Event, client *IMClient, ss *rustpushgo.WrappedSharedStreamsClient, albumGUID, albumName string, guids []string, richAssets []rustpushgo.SharedAssetInfo) {
+func handleAssetSelection(ce *commands.Event, client *IMClient, ss *rustpushgo.WrappedSharedStreamsClient, albumGUID, albumName string, assets []rustpushgo.SharedAssetInfo) {
 	commands.StoreCommandState(ce.User, nil)
 
 	input := strings.TrimSpace(ce.RawArgs)
-	indices, err := parseAssetSelection(input, len(guids))
+	indices, err := parseAssetSelection(input, len(assets))
 	if err != nil {
 		ce.Reply("%v", err)
 		return
 	}
 
 	selectedGUIDs := make([]string, 0, len(indices))
+	selectedNames := make([]string, 0, len(indices))
 	for _, idx := range indices {
-		selectedGUIDs = append(selectedGUIDs, guids[idx])
-	}
-
-	// Build display names for progress messages.
-	selectedNames := make([]string, len(selectedGUIDs))
-	for i, guid := range selectedGUIDs {
-		selectedNames[i] = guid
-		if richAssets != nil {
-			for _, a := range richAssets {
-				if a.Assetguid == guid {
-					selectedNames[i] = a.Filename
-					break
-				}
-			}
+		selectedGUIDs = append(selectedGUIDs, assets[idx].Assetguid)
+		name := assets[idx].Filename
+		if name == "" {
+			name = assets[idx].Assetguid
 		}
+		selectedNames = append(selectedNames, name)
 	}
 
 	roomID, dp, err := client.getOrCreateAlbumRoom(ce.Ctx, albumGUID, albumName)

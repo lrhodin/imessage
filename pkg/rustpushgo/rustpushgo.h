@@ -972,7 +972,6 @@ void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_export_state_json(
 void* uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_get_album_assets(
 	void* ptr,
 	RustBuffer album,
-	RustBuffer guids,
 	RustCallStatus* out_status
 );
 

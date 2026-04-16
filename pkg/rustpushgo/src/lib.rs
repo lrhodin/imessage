@@ -5397,7 +5397,21 @@ impl WrappedSharedStreamsClient {
         }).collect()
     }
 
-    pub async fn get_album_assets(&self, album: String, guids: Vec<String>) -> Result<Vec<SharedAssetInfo>, WrappedError> {
+    pub async fn get_album_assets(&self, album: String) -> Result<Vec<SharedAssetInfo>, WrappedError> {
+        // Read cached GUIDs from state (populated by the watcher's periodic
+        // get_album_summary calls). This avoids a second authenticated request
+        // that would fail with TokenMissing.
+        let guids = {
+            let state = self.inner.state.read().await;
+            match state.albums.iter().find(|a| a.albumguid == album) {
+                Some(a) if !a.assets.is_empty() => a.assets.clone(),
+                _ => {
+                    drop(state);
+                    // Cold start: watcher hasn't run yet, fetch now.
+                    self.inner.get_album_summary(&album).await?
+                }
+            }
+        };
         if guids.is_empty() {
             return Ok(vec![]);
         }
