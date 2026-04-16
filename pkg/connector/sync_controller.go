@@ -762,10 +762,17 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 	}
 	defer rows.Close()
 
+	selfHandles := make(map[string]struct{}, len(c.allHandles))
+	for _, h := range c.allHandles {
+		selfHandles[h] = struct{}{}
+	}
 	var handles []string
 	for rows.Next() {
 		var ghostID string
 		if err := rows.Scan(&ghostID); err != nil {
+			continue
+		}
+		if _, isSelf := selfHandles[ghostID]; isSelf {
 			continue
 		}
 		handles = append(handles, ghostID)
@@ -807,10 +814,17 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 		log.Warn().Err(err).Msg("StatusKit invite: failed to query ghosts")
 		return
 	}
+	selfHandles := make(map[string]struct{}, len(c.allHandles))
+	for _, h := range c.allHandles {
+		selfHandles[h] = struct{}{}
+	}
 	var handles []string
 	for rows.Next() {
 		var ghostID string
 		if err := rows.Scan(&ghostID); err != nil {
+			continue
+		}
+		if _, isSelf := selfHandles[ghostID]; isSelf {
 			continue
 		}
 		handles = append(handles, ghostID)
@@ -877,10 +891,17 @@ func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
 		log.Warn().Err(err).Msg("StatusKit re-invite: failed to query ghosts")
 		return
 	}
+	selfHandles := make(map[string]struct{}, len(c.allHandles))
+	for _, h := range c.allHandles {
+		selfHandles[h] = struct{}{}
+	}
 	var allHandles []string
 	for rows.Next() {
 		var ghostID string
 		if err := rows.Scan(&ghostID); err != nil {
+			continue
+		}
+		if _, isSelf := selfHandles[ghostID]; isSelf {
 			continue
 		}
 		allHandles = append(allHandles, ghostID)
