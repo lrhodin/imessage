@@ -5699,12 +5699,42 @@ pub async fn new_client(
                     // private. The device is inserted into the public
                     // sk.state.keys map and persisted via the same code path
                     // upstream's update_state callback uses.
+                    // Normalize StatusKit payloads: upstream statuskit.rs:719
+                    // destructures with Value::Data, but aps.rs:880 greedily
+                    // decodes plist bytes into Dictionary. The workaround below
+                    // handles Dictionary payloads. Conversely, Data payloads
+                    // whose bytes ARE valid plist fail in receive_message's
+                    // plist::from_value (it sees Data, not a Dictionary). Fix
+                    // both directions: decode Data→Dictionary so ALL StatusKit
+                    // messages go through the workaround's Dictionary path.
+                    // Normalize Data→Dictionary for StatusKit topics so the
+                    // workaround's Dictionary path can handle all messages.
+                    let sk_msg = {
+                        let sk_topics: [[u8; 20]; 4] = [
+                            openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes()),
+                            openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes()),
+                            openssl::sha::sha1("com.apple.icloud.presence.channel.management".as_bytes()),
+                            openssl::sha::sha1("com.apple.private.alloy.status.personal".as_bytes()),
+                        ];
+                        if let rustpush::APSMessage::Notification { topic: t, payload: plist::Value::Data(ref bytes), .. } = msg {
+                            if sk_topics.contains(&t) {
+                                if let Ok(decoded) = plist::from_bytes::<plist::Value>(bytes) {
+                                    if matches!(decoded, plist::Value::Dictionary(_)) {
+                                        let rustpush::APSMessage::Notification { id, topic, token, channel, .. } = msg.clone() else { unreachable!() };
+                                        Some(rustpush::APSMessage::Notification { id, topic, token, payload: decoded, channel })
+                                    } else { None }
+                                } else { None }
+                            } else { None }
+                        } else { None }
+                    };
+                    let sk_msg_ref = sk_msg.as_ref().unwrap_or(&msg);
+
                     let mut workaround_consumed = false;
                     if let rustpush::APSMessage::Notification {
                         topic: msg_topic,
                         payload,
                         ..
-                    } = &msg
+                    } = sk_msg_ref
                     {
                         let keysharing_topic_hash: [u8; 20] = openssl::sha::sha1(
                             "com.apple.private.alloy.status.keysharing".as_bytes(),
@@ -5739,7 +5769,7 @@ pub async fn new_client(
                                 let recv = sk
                                     .identity
                                     .receive_message(
-                                        msg.clone(),
+                                        sk_msg_ref.clone(),
                                         &["com.apple.private.alloy.status.keysharing"],
                                     )
                                     .await
@@ -5912,9 +5942,9 @@ pub async fn new_client(
                     // HTTP requests and tokio mutexes couldn't complete properly in
                     // an isolated current-thread runtime.
                     let sk_clone = sk.clone();
-                    let msg_clone = msg.clone();
+                    let sk_msg_for_handle = sk_msg_ref.clone();
                     let handle_result = tokio::task::spawn(async move {
-                        sk_clone.handle(msg_clone).await
+                        sk_clone.handle(sk_msg_for_handle).await
                     }).await;
                     // Build a human-readable topic label for diagnostic log lines.
                     let topic_label = if let Some(t) = msg_topic {
