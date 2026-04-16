@@ -4637,12 +4637,27 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 	msgID := makeMessageID(msg.Uuid)
 	dbMessages, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, msgID)
 	if err != nil || len(dbMessages) == 0 {
-		log.Debug().
-			Err(err).
+		// Case-insensitive fallback — SMS relays may normalize UUID case
+		altUUID := strings.ToUpper(msg.Uuid)
+		if altUUID == msg.Uuid {
+			altUUID = strings.ToLower(msg.Uuid)
+		}
+		altMsgID := makeMessageID(altUUID)
+		dbMessages, err = c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, altMsgID)
+		if err != nil || len(dbMessages) == 0 {
+			log.Debug().
+				Err(err).
+				Str("uuid", msg.Uuid).
+				Str("portal_id", string(portalKey.ID)).
+				Str("receiver", string(portal.Receiver)).
+				Msg("Dropping delivery receipt: target message not in bridge DB")
+			return
+		}
+		log.Info().
 			Str("uuid", msg.Uuid).
+			Str("alt_uuid", altUUID).
 			Str("portal_id", string(portalKey.ID)).
-			Msg("Dropping delivery receipt: target message not in bridge DB")
-		return
+			Msg("Delivery receipt matched via case-insensitive UUID fallback")
 	}
 
 	normalizedSender := normalizeIdentifierForPortalID(ptrStringOr(msg.Sender, ""))
