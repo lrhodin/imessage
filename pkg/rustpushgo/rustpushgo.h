@@ -217,6 +217,11 @@ void* uniffi_rustpushgo_fn_method_client_get_passwords_client(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_get_registered_services(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_get_sharedstreams_client(
 	void* ptr,
 	RustCallStatus* out_status
@@ -1648,6 +1653,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_get_icloud_auth_headers(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_get_passwords_client(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_get_registered_services(
 	RustCallStatus* out_status
 );
 

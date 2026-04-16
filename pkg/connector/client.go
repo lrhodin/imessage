@@ -942,6 +942,24 @@ func (c *IMClient) Connect(ctx context.Context) {
 			done <- c.client.InitStatuskit(c)
 		}()
 		subscribeAfterInit := func(err error) {
+			// Registration state is independent of StatusKit init — log it
+			// unconditionally so we can see MULTIPLEX presence even when
+			// init fails. If MULTIPLEX is absent, key exchange cannot work
+			// regardless of how many invites we send.
+			services := c.client.GetRegisteredServices()
+			multiplexPresent := false
+			for _, s := range services {
+				if s == "com.apple.private.alloy.multiplex1" {
+					multiplexPresent = true
+					break
+				}
+			}
+			log.Info().
+				Bool("multiplex_registered", multiplexPresent).
+				Strs("registered_services", services).
+				Bool("init_ok", err == nil).
+				Msg("StatusKit startup")
+
 			if err != nil {
 				log.Warn().Err(err).Msg("StatusKit initialization failed — presence updates unavailable")
 				return
@@ -962,6 +980,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 			// Send our StatusKit key to known contacts to trigger key exchange.
 			// Uses IDS (not GSA), so this works even when GSA tokens are stale.
 			c.inviteContactsToStatusSharing(log)
+
+			// Complement the `StatusKit startup` line above with the peer-key
+			// count, which is only available once the StatusKit client is ready.
+			if sk, skErr := c.client.GetStatuskitClient(); skErr == nil && sk != nil {
+				log.Info().Int("known_peer_keys", len(sk.GetKnownHandles())).Msg("StatusKit peer keys loaded")
+			}
 		}
 		select {
 		case err := <-done:

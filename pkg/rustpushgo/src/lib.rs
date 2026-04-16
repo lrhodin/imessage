@@ -4422,6 +4422,45 @@ impl LoginSession {
             }
         };
 
+        // StatusKit key exchange requires MULTIPLEX. If register() returned
+        // without MULTIPLEX in the user's registration map (e.g. the MADRID-only
+        // fallback above fired, or Apple 6005'd MULTIPLEX in the combined call),
+        // attempt one targeted register() with MULTIPLEX alone before giving up.
+        // Some IDS endpoints return 6005 on bundled eligibility checks but accept
+        // a standalone MULTIPLEX registration. Never let MULTIPLEX failure
+        // tank iMessage — the whole point of the MADRID-only fallback above is
+        // to keep iMessage alive when auxiliary services misbehave.
+        let mut users = users;
+        if !users.is_empty() && !users[0].registration.contains_key(MULTIPLEX_SERVICE.name) {
+            let present: Vec<&str> = users[0].registration.keys().map(|s| s.as_str()).collect();
+            error!(
+                "MULTIPLEX registration absent after register(); present services=[{}] — attempting MULTIPLEX-only retry; StatusKit key exchange will not work without it",
+                present.join(", ")
+            );
+            match register(
+                &*os_config,
+                &*conn.state.read().await,
+                &[&MULTIPLEX_SERVICE],
+                &mut users,
+                &identity,
+            ).await {
+                Ok(()) if users[0].registration.contains_key(MULTIPLEX_SERVICE.name) => {
+                    info!("MULTIPLEX-only retry succeeded — StatusKit key exchange available");
+                }
+                Ok(()) => {
+                    error!(
+                        "MULTIPLEX-only retry returned Ok but MULTIPLEX still absent from registration map — continuing without StatusKit; iMessage unaffected"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "MULTIPLEX-only retry failed: {} — continuing without StatusKit; iMessage unaffected. Grep for this line + raise a TPP if StatusKit is needed",
+                        e
+                    );
+                }
+            }
+        }
+
         // Take ownership of the account to create a TokenProvider.
         // The MobileMe delegate from `delegates` is seeded into the WrappedTokenProvider
         // so the first get_contacts_url() / create_keychain_clients() call doesn't
@@ -5734,14 +5773,15 @@ pub async fn new_client(
                     // plist::from_value (it sees Data, not a Dictionary). Fix
                     // both directions: decode Data→Dictionary so ALL StatusKit
                     // messages go through the workaround's Dictionary path.
-                    // Normalize Data→Dictionary for StatusKit topics so the
-                    // workaround's Dictionary path can handle all messages.
+                    // Normalize Data→Dictionary for the keysharing topic only:
+                    // the upstream silent-drop bug at statuskit.rs:719 is specific
+                    // to keysharing-payload destructuring. The other three StatusKit
+                    // topics (presence.mode.status, presence.channel.management,
+                    // status.personal) flow through sk.handle() natively and were
+                    // working at 31ad87b — don't divert them into our workaround.
                     let sk_msg = {
-                        let sk_topics: [[u8; 20]; 4] = [
+                        let sk_topics: [[u8; 20]; 1] = [
                             openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes()),
-                            openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes()),
-                            openssl::sha::sha1("com.apple.icloud.presence.channel.management".as_bytes()),
-                            openssl::sha::sha1("com.apple.private.alloy.status.personal".as_bytes()),
                         ];
                         if let rustpush::APSMessage::Notification { topic: t, payload: plist::Value::Data(ref bytes), .. } = msg {
                             if sk_topics.contains(&t) {
@@ -5807,20 +5847,20 @@ pub async fn new_client(
                                     return Ok::<bool, String>(false);
                                 };
                                 let Some(message_unenc) = recv.message_unenc else {
-                                    // c=97 with no IDS fields = key request from a
-                                    // contact's device. Trigger on_keys_received so
-                                    // the Go side re-sends invites to all contacts.
+                                    // TPP-confirmed noise: c=97 on keysharing topic has
+                                    // plist keys [cT,h,e,U,c,hs,s,b] — no IDS envelope
+                                    // fields (sP/tP/P/t/E). Not a peer keysharing reply.
+                                    // Log for future protocol analysis; do NOT fire
+                                    // on_keys_received (would cause reciprocate-invite
+                                    // storm on every noise packet). Return Ok(false)
+                                    // so upstream handle() still gets a chance.
                                     if recv.command == 97 {
-                                        // Log the raw payload for protocol analysis.
                                         let raw_keys = if let plist::Value::Dictionary(ref d) = payload {
                                             d.keys().cloned().collect::<Vec<_>>().join(", ")
                                         } else { "<non-dict>".into() };
-                                        info!("StatusKit c=97 key request received (sender={:?}, payload keys=[{}]) — triggering re-invite",
+                                        debug!("StatusKit c=97 noise observed (sender={:?}, payload keys=[{}])",
                                             recv.sender, raw_keys);
-                                        if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
-                                            cb.on_keys_received();
-                                        }
-                                        return Ok(true);
+                                        return Ok(false);
                                     }
                                     // c=255 ACKs and other non-encrypted messages lack P/E/t fields,
                                     // so the decryption block in receive_message is skipped entirely.
@@ -7164,6 +7204,19 @@ impl Client {
 
     pub async fn get_handles(&self) -> Vec<String> {
         self.client.identity.get_handles().await
+    }
+
+    /// Returns the list of IDS service names present in this user's registration
+    /// map (e.g. "com.apple.madrid", "com.apple.private.alloy.multiplex1").
+    /// StatusKit key exchange requires "com.apple.private.alloy.multiplex1" to
+    /// appear in this list; if it doesn't, we never subscribe to the keysharing
+    /// topic and contacts' c=227 replies never reach us.
+    pub async fn get_registered_services(&self) -> Vec<String> {
+        let users = self.client.identity.users.read().await;
+        if users.is_empty() {
+            return vec![];
+        }
+        users[0].registration.keys().cloned().collect()
     }
 
     /// Get iCloud auth headers (Authorization + anisette) for MobileMe API calls.
