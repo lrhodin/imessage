@@ -4678,25 +4678,57 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 		return
 	}
 
+	// Race window: after we send an outgoing message, bridgev2's framework
+	// inserts the Message row into the DB AFTER HandleMatrixMessage returns,
+	// but on APNs-flap retry the stored-message echo can trigger this handler
+	// within ~2ms of the FFI returning — before the framework has committed
+	// the insert. Retry with a short backoff so the insert has time to land.
+	// On the non-race path the first query succeeds immediately; overhead
+	// only pays when the miss is real.
 	msgID := makeMessageID(msg.Uuid)
-	dbMessages, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, msgID)
-	if err != nil || len(dbMessages) == 0 {
-		// Case-insensitive fallback — SMS relays may normalize UUID case
-		altUUID := strings.ToUpper(msg.Uuid)
-		if altUUID == msg.Uuid {
-			altUUID = strings.ToLower(msg.Uuid)
+	altUUID := strings.ToUpper(msg.Uuid)
+	if altUUID == msg.Uuid {
+		altUUID = strings.ToLower(msg.Uuid)
+	}
+	altMsgID := makeMessageID(altUUID)
+	tryLookup := func() ([]*database.Message, bool, error) {
+		dbM, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, msgID)
+		if err == nil && len(dbM) > 0 {
+			return dbM, false, nil
 		}
-		altMsgID := makeMessageID(altUUID)
-		dbMessages, err = c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, altMsgID)
-		if err != nil || len(dbMessages) == 0 {
-			log.Debug().
-				Err(err).
-				Str("uuid", msg.Uuid).
-				Str("portal_id", string(portalKey.ID)).
-				Str("receiver", string(portal.Receiver)).
-				Msg("Dropping delivery receipt: target message not in bridge DB")
-			return
+		dbAlt, altErr := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, altMsgID)
+		if altErr == nil && len(dbAlt) > 0 {
+			return dbAlt, true, nil
 		}
+		// Propagate the case-sensitive error (primary path); alt is just a fallback.
+		return nil, false, err
+	}
+
+	var dbMessages []*database.Message
+	var lookupErr error
+	var matchedAlt bool
+	backoff := []time.Duration{0, 100 * time.Millisecond, 300 * time.Millisecond, 700 * time.Millisecond, 1500 * time.Millisecond}
+	for _, d := range backoff {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		dbMessages, matchedAlt, lookupErr = tryLookup()
+		if lookupErr == nil && len(dbMessages) > 0 {
+			break
+		}
+	}
+
+	if lookupErr != nil || len(dbMessages) == 0 {
+		log.Debug().
+			Err(lookupErr).
+			Str("uuid", msg.Uuid).
+			Str("portal_id", string(portalKey.ID)).
+			Str("receiver", string(portal.Receiver)).
+			Msg("Dropping delivery receipt: target message not in bridge DB")
+		return
+	}
+
+	if matchedAlt {
 		log.Info().
 			Str("uuid", msg.Uuid).
 			Str("alt_uuid", altUUID).
