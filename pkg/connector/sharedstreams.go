@@ -119,9 +119,9 @@ var cmdSharedDeleteAssets = &commands.FullHandler{
 	RequiresLogin: true,
 }
 
-var cmdSharedDeleteRoom = &commands.FullHandler{
-	Name: "shared-delete-room",
-	Func: fnSharedDeleteRoom,
+var cmdDeleteRoom = &commands.FullHandler{
+	Name: "delete-room",
+	Func: fnDeleteRoom,
 	Help: commands.HelpMeta{
 		Section:     HelpSectionSharedStreams,
 		Description: "Delete this shared album download room. Run from inside the album room.",
@@ -129,7 +129,7 @@ var cmdSharedDeleteRoom = &commands.FullHandler{
 	RequiresLogin: true,
 }
 
-func fnSharedDeleteRoom(ce *commands.Event) {
+func fnDeleteRoom(ce *commands.Event) {
 	login := ce.User.GetDefaultLogin()
 	if login == nil {
 		ce.Reply("No active login found.")
@@ -458,7 +458,7 @@ func (c *IMClient) downloadSharedAlbumAssets(ctx context.Context, ss *rustpushgo
 
 	// Send a welcome/help notice into the album room.
 	welcome := format.RenderMarkdown(fmt.Sprintf(
-		"Downloading %d asset(s) from **%s**.\n\nWhen you're done, send `!im shared-delete-room` here to delete this room.",
+		"Downloading %d asset(s) from **%s**.\n\nWhen you're done, send `!im delete-room` here to delete this room.",
 		len(assetGUIDs), albumName), true, false)
 	welcome.MsgType = event.MsgNotice
 	_, _ = intent.SendMessage(ctx, roomID, event.EventMessage, &event.Content{Parsed: welcome}, nil)

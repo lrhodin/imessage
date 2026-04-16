@@ -84,7 +84,7 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdSharedState,
 		cmdSharedAssetsJSON,
 		cmdSharedDeleteAssets,
-		cmdSharedDeleteRoom,
+		cmdDeleteRoom,
 		cmdStatuskitState,
 		cmdStatuskitShare,
 		cmdStatuskitResetKeys,
