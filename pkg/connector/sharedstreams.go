@@ -32,6 +32,7 @@ import (
 	log "github.com/rs/zerolog/log"
 	"go.mau.fi/util/ffmpeg"
 	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/format"
@@ -376,6 +377,7 @@ func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumNam
 		displayName = "Shared Album"
 	}
 
+	botMXID := c.Main.Bridge.Bot.GetMXID()
 	roomID, err := c.Main.Bridge.Bot.CreateRoom(ctx, &mautrix.ReqCreateRoom{
 		Name:                  displayName,
 		Topic:                 fmt.Sprintf("Shared album download \u2014 %s", displayName),
@@ -386,6 +388,17 @@ func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumNam
 	})
 	if err != nil {
 		return "", fmt.Errorf("create room: %w", err)
+	}
+
+	// Register the room in the user's m.direct account data via the double
+	// puppet so Matrix clients (including Beeper) treat it as a true DM that
+	// the user can delete rather than a group room they can only leave.
+	if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
+		if dmAPI, ok := dp.(bridgev2.MarkAsDMMatrixAPI); ok {
+			if markErr := dmAPI.MarkAsDM(ctx, roomID, botMXID); markErr != nil {
+				log.Warn().Err(markErr).Stringer("room_id", roomID).Msg("Failed to mark shared album room as DM")
+			}
+		}
 	}
 
 	c.sharedAlbumRooms[albumGUID] = roomID
