@@ -5719,6 +5719,16 @@ pub async fn new_client(
                             } else {
                                 None
                             };
+
+                            // c=255 = server ACK for our own outgoing invite.
+                            // No sender, no encrypted payload — skip entirely.
+                            if diag_cmd_workaround == Some(255) {
+                                debug!("StatusKit workaround: skipping c=255 server ACK on keysharing topic");
+                                // Don't set workaround_consumed — let it fall
+                                // through to upstream handle() which also skips
+                                // c=255 via its own suppression path.
+                            } else {
+
                             let diag_has_sP = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("sP") } else { false };
                             let diag_has_P = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("P") } else { false };
                             let diag_has_E = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("E") } else { false };
@@ -5866,6 +5876,7 @@ pub async fn new_client(
                                     );
                                 }
                             }
+                            } // else (non-c=255)
                         }
                     }
 
