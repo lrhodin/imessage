@@ -4383,13 +4383,26 @@ impl LoginSession {
                         "Existing registration missing required services or expired, must re-register"
                     );
                     let mut users = vec![fresh_user];
-                    register(
+                    match register(
                         &*os_config,
                         &*conn.state.read().await,
                         &[&MADRID_SERVICE, &MULTIPLEX_SERVICE],
                         &mut users,
                         &identity,
-                    ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
+                    ).await {
+                        Ok(()) => {},
+                        Err(e) => {
+                            warn!("Combined MADRID+MULTIPLEX registration failed: {} — retrying MADRID-only", e);
+                            users[0].registration.clear();
+                            register(
+                                &*os_config,
+                                &*conn.state.read().await,
+                                &[&MADRID_SERVICE],
+                                &mut users,
+                                &identity,
+                            ).await.map_err(|e| WrappedError::GenericError { msg: format!("MADRID-only registration also failed: {}", e) })?;
+                        }
+                    }
                     users
                 }
             }
