@@ -3742,7 +3742,7 @@ pub fn init_logger() {
         //   RUST_LOG=debug                       # everything
         std::env::set_var(
             "RUST_LOG",
-            "warn,rustpush=info,rustpushgo=info",
+            "warn,rustpush=warn,rustpushgo=info",
         );
     }
     let _ = pretty_env_logger::try_init();
@@ -5219,16 +5219,9 @@ impl WrappedStatusKitClient {
         sender_handle: String,
         handles: Vec<WrappedStatusKitInviteHandle>,
     ) -> Result<(), WrappedError> {
-        let handle_names: Vec<&str> = handles.iter().map(|h| h.handle.as_str()).collect();
-        info!(
-            "StatusKit manual invite: sender={} handles={:?} (with modes)",
-            sender_handle, handle_names
-        );
         let mapped = handles
             .into_iter()
             .map(|h| {
-                let modes_debug = h.allowed_modes.clone();
-                info!("StatusKit manual invite target: {} modes={:?}", h.handle, modes_debug);
                 (
                     h.handle,
                     rustpush::statuskit::StatusKitPersonalConfig {
@@ -5237,9 +5230,7 @@ impl WrappedStatusKitClient {
                 )
             })
             .collect::<HashMap<_, _>>();
-        info!("StatusKit manual invite: calling invite_to_channel...");
         self.inner.invite_to_channel(&sender_handle, mapped).await?;
-        info!("StatusKit manual invite: invite_to_channel completed OK");
         Ok(())
     }
 
@@ -6897,19 +6888,6 @@ impl Client {
         } else {
             targets
         };
-        // Log per-handle target breakdown for diagnosis.
-        {
-            let cache = sk.identity.cache.lock().await;
-            for h in &handles {
-                let h_targets = cache.get_participants_targets(
-                    "com.apple.private.alloy.status.keysharing",
-                    &sender_handle,
-                    &[h.clone()],
-                );
-                info!("StatusKit invite target breakdown: {} → {} device(s)", h, h_targets.len());
-            }
-        }
-        info!("StatusKit: IDS resolved {} delivery target(s) for {} handle(s) (after cache check)", targets.len(), handles.len());
         if targets.is_empty() {
             return Err(WrappedError::GenericError {
                 msg: "StatusKit invite aborted: IDS returned zero targets after cache invalidation — peers may not be registered for keysharing topic".into(),
@@ -6933,33 +6911,9 @@ impl Client {
                 }))
                 .collect();
 
-        // Verify internal target count matches wrapper's count. The upstream
-        // invite_to_channel does its own get_participants_targets lookup; if it
-        // returns empty (cache miss under a different key), the IDS send is
-        // silently skipped. Log the internal count to detect this.
-        {
-            let internal_cache = sk.identity.cache.lock().await;
-            let internal_targets = internal_cache.get_participants_targets(
-                "com.apple.private.alloy.status.keysharing",
-                &sender_handle,
-                &handles.iter().map(|s| s.as_str().to_string()).collect::<Vec<_>>(),
-            );
-            info!(
-                "StatusKit: internal get_participants_targets returned {} target(s) for sender={} (wrapper found {})",
-                internal_targets.len(),
-                sender_handle,
-                targets.len(),
-            );
-            if internal_targets.is_empty() && !targets.is_empty() {
-                warn!("StatusKit: MISMATCH — wrapper found {} targets but internal lookup found 0! The IDS send will be a no-op.", targets.len());
-            }
-        }
-
-        info!("StatusKit: inviting {} handle(s) to key exchange (sender={})", handles.len(), sender_handle);
         sk.invite_to_channel(&sender_handle, config_map).await.map_err(|e| WrappedError::GenericError {
             msg: format!("StatusKit invite_to_channel failed: {:?}", e),
         })?;
-        info!("StatusKit: invite_to_channel completed successfully for {} handle(s)", handles.len());
         Ok(())
     }
 
