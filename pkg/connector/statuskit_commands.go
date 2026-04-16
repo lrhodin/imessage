@@ -113,6 +113,16 @@ var cmdStatuskitInviteToChannel = &commands.FullHandler{
 	RequiresLogin: true,
 }
 
+var cmdStatuskitInviteAll = &commands.FullHandler{
+	Name: "statuskit-invite-all",
+	Func: fnStatuskitInviteAll,
+	Help: commands.HelpMeta{
+		Section:     HelpSectionStatusKit,
+		Description: "Send StatusKit invites to all known ghosts and subscribe to their presence — same as the post-backfill hook.",
+	},
+	RequiresLogin: true,
+}
+
 func statusKitClientFromEvent(ce *commands.Event) (*rustpushgo.WrappedStatusKitClient, bool) {
 	login := ce.User.GetDefaultLogin()
 	if login == nil {
@@ -315,4 +325,23 @@ func fnStatuskitInviteToChannel(ce *commands.Event) {
 		return
 	}
 	ce.Reply("Invited %d handle(s) to StatusKit channel.", len(invites))
+}
+
+func fnStatuskitInviteAll(ce *commands.Event) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("No active login found.")
+		return
+	}
+	client, ok := login.Client.(*IMClient)
+	if !ok || client == nil {
+		ce.Reply("Bridge client not available.")
+		return
+	}
+	ce.Reply("Sending StatusKit invites to all ghosts and subscribing to presence...")
+	go func() {
+		log := client.UserLogin.Log.With().Str("trigger", "statuskit-invite-all").Logger()
+		client.subscribeToContactPresence(log)
+		client.inviteContactsToStatusSharing(log)
+	}()
 }

@@ -92,6 +92,7 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdStatuskitRequestHandles,
 		cmdStatuskitClearInterest,
 		cmdStatuskitInviteToChannel,
+		cmdStatuskitInviteAll,
 	}
 	return cmds
 }
