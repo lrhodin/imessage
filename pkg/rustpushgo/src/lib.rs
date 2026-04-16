@@ -6933,6 +6933,28 @@ impl Client {
                 }))
                 .collect();
 
+        // Verify internal target count matches wrapper's count. The upstream
+        // invite_to_channel does its own get_participants_targets lookup; if it
+        // returns empty (cache miss under a different key), the IDS send is
+        // silently skipped. Log the internal count to detect this.
+        {
+            let internal_cache = sk.identity.cache.lock().await;
+            let internal_targets = internal_cache.get_participants_targets(
+                "com.apple.private.alloy.status.keysharing",
+                &sender_handle,
+                &handles.iter().map(|s| s.as_str().to_string()).collect::<Vec<_>>(),
+            );
+            info!(
+                "StatusKit: internal get_participants_targets returned {} target(s) for sender={} (wrapper found {})",
+                internal_targets.len(),
+                sender_handle,
+                targets.len(),
+            );
+            if internal_targets.is_empty() && !targets.is_empty() {
+                warn!("StatusKit: MISMATCH — wrapper found {} targets but internal lookup found 0! The IDS send will be a no-op.", targets.len());
+            }
+        }
+
         info!("StatusKit: inviting {} handle(s) to key exchange (sender={})", handles.len(), sender_handle);
         sk.invite_to_channel(&sender_handle, config_map).await.map_err(|e| WrappedError::GenericError {
             msg: format!("StatusKit invite_to_channel failed: {:?}", e),
