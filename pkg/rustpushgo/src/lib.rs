@@ -3742,7 +3742,7 @@ pub fn init_logger() {
         //   RUST_LOG=debug                       # everything
         std::env::set_var(
             "RUST_LOG",
-            "warn,rustpush=warn,rustpushgo=info",
+            "warn,rustpush=info,rustpushgo=info",
         );
     }
     let _ = pretty_env_logger::try_init();
@@ -5219,9 +5219,16 @@ impl WrappedStatusKitClient {
         sender_handle: String,
         handles: Vec<WrappedStatusKitInviteHandle>,
     ) -> Result<(), WrappedError> {
+        let handle_names: Vec<&str> = handles.iter().map(|h| h.handle.as_str()).collect();
+        info!(
+            "StatusKit manual invite: sender={} handles={:?} (with modes)",
+            sender_handle, handle_names
+        );
         let mapped = handles
             .into_iter()
             .map(|h| {
+                let modes_debug = h.allowed_modes.clone();
+                info!("StatusKit manual invite target: {} modes={:?}", h.handle, modes_debug);
                 (
                     h.handle,
                     rustpush::statuskit::StatusKitPersonalConfig {
@@ -5230,7 +5237,9 @@ impl WrappedStatusKitClient {
                 )
             })
             .collect::<HashMap<_, _>>();
+        info!("StatusKit manual invite: calling invite_to_channel...");
         self.inner.invite_to_channel(&sender_handle, mapped).await?;
+        info!("StatusKit manual invite: invite_to_channel completed OK");
         Ok(())
     }
 
