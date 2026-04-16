@@ -5397,8 +5397,7 @@ impl WrappedSharedStreamsClient {
         }).collect()
     }
 
-    pub async fn get_album_assets(&self, album: String) -> Result<Vec<SharedAssetInfo>, WrappedError> {
-        let guids = self.inner.get_album_summary(&album).await?;
+    pub async fn get_album_assets(&self, album: String, guids: Vec<String>) -> Result<Vec<SharedAssetInfo>, WrappedError> {
         if guids.is_empty() {
             return Ok(vec![]);
         }

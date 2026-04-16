@@ -1566,7 +1566,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_get_album_assets(uniffiStatus)
 		})
-		if checksum != 12757 {
+		if checksum != 3486 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedsharedstreamsclient_get_album_assets: UniFFI API checksum mismatch")
 		}
@@ -5519,14 +5519,14 @@ func (_self *WrappedSharedStreamsClient) ExportStateJson() (string, error) {
 		})
 }
 
-func (_self *WrappedSharedStreamsClient) GetAlbumAssets(album string) ([]SharedAssetInfo, error) {
+func (_self *WrappedSharedStreamsClient) GetAlbumAssets(album string, guids []string) ([]SharedAssetInfo, error) {
 	_pointer := _self.ffiObject.incrementPointer("*WrappedSharedStreamsClient")
 	defer _self.ffiObject.decrementPointer()
 	return uniffiRustCallAsyncWithErrorAndResult(
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedsharedstreamsclient_get_album_assets(
-				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(album)),
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(album)), rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(guids)),
 				status,
 			))
 		},
