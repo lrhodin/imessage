@@ -6587,9 +6587,47 @@ impl Client {
         let sk = self.shared_statuskit.read().await.clone().ok_or(WrappedError::GenericError {
             msg: "StatusKit not initialized".into(),
         })?;
-        let token = sk.request_handles(&handles).await;
+
+        // Contacts may key back under a different handle form than their ghost
+        // ID (e.g. mailto: vs tel:). Augment the ghost list with every "from"
+        // handle persisted in statuskit-state.plist so request_handles matches
+        // all available channels regardless of handle form.
+        let ghost_count = handles.len();
+        let mut augmented = handles;
+        {
+            let mut extra: Vec<String> = Vec::new();
+            let state_path = subsystem_state_path("statuskit-state.plist");
+            if let Ok(data) = std::fs::read(&state_path) {
+                if let Ok(value) = plist::from_bytes::<plist::Value>(&data) {
+                    if let Some(dict) = value.as_dictionary() {
+                        if let Some(keys_dict) = dict.get("keys").and_then(|v| v.as_dictionary()) {
+                            let handle_set: std::collections::HashSet<&str> =
+                                augmented.iter().map(|s| s.as_str()).collect();
+                            for (_channel_id, entry) in keys_dict {
+                                if let Some(from_str) = entry.as_dictionary()
+                                    .and_then(|d| d.get("from"))
+                                    .and_then(|v| v.as_string())
+                                {
+                                    if !handle_set.contains(from_str) {
+                                        extra.push(from_str.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            augmented.extend(extra);
+        }
+
+        let token = sk.request_handles(&augmented).await;
         self.statuskit_interest_tokens.lock().await.push(token);
-        info!("Requested presence subscription for {} handle(s) — APNs channels are created as key-sharing messages arrive", handles.len());
+        info!(
+            "Requested presence subscription for {} handle(s) ({} ghost + {} from keys)",
+            augmented.len(),
+            ghost_count,
+            augmented.len() - ghost_count,
+        );
         Ok(())
     }
 

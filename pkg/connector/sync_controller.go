@@ -755,7 +755,7 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 	c.lastPresenceSubscribe = time.Now()
 
 	ctx := context.Background()
-	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost")
+	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost WHERE bridge_id=$1", c.Main.Bridge.ID)
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to query ghosts for presence subscription")
 		return
