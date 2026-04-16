@@ -5316,6 +5316,25 @@ impl WrappedStatusKitClient {
 
 }
 
+#[derive(uniffi::Record)]
+pub struct SharedAlbumInfo {
+    pub albumguid: String,
+    pub name: Option<String>,
+    pub fullname: Option<String>,
+    pub email: Option<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct SharedAssetInfo {
+    pub assetguid: String,
+    pub filename: String,
+    pub date_created: String,
+    pub media_type: String,
+    pub width: String,
+    pub height: String,
+    pub size: String,
+}
+
 #[derive(uniffi::Object)]
 pub struct WrappedSharedStreamsClient {
     inner: Arc<rustpush::sharedstreams::SharedStreamClient<BridgeDefaultAnisetteProvider>>,
@@ -5366,6 +5385,56 @@ impl WrappedSharedStreamsClient {
     pub async fn delete_assets(&self, album: String, assets: Vec<String>) -> Result<(), WrappedError> {
         self.inner.delete_asset(&album, assets).await?;
         Ok(())
+    }
+
+    pub async fn list_albums(&self) -> Vec<SharedAlbumInfo> {
+        let state = self.inner.state.read().await;
+        state.albums.iter().map(|a| SharedAlbumInfo {
+            albumguid: a.albumguid.clone(),
+            name: a.name.clone(),
+            fullname: a.fullname.clone(),
+            email: a.email.clone(),
+        }).collect()
+    }
+
+    pub async fn get_album_assets(&self, album: String) -> Result<Vec<SharedAssetInfo>, WrappedError> {
+        let guids = self.inner.get_album_summary(&album).await?;
+        if guids.is_empty() {
+            return Ok(vec![]);
+        }
+        let details = self.inner.get_assets(&album, &guids).await?;
+        Ok(details.iter().map(|d| {
+            let primary = d.files.iter().max_by_key(|f| f.size.parse::<u64>().unwrap_or(0));
+            let media_type = if d.collectionmetadata.video_duration.is_some() {
+                "video".to_string()
+            } else {
+                "image".to_string()
+            };
+            SharedAssetInfo {
+                assetguid: d.assetguid.clone(),
+                filename: d.filename.clone(),
+                date_created: format!("{:?}", d.collectionmetadata.date_created),
+                media_type,
+                width: primary.map(|f| f.width.clone()).unwrap_or_default(),
+                height: primary.map(|f| f.height.clone()).unwrap_or_default(),
+                size: primary.map(|f| f.size.clone()).unwrap_or_default(),
+            }
+        }).collect())
+    }
+
+    pub async fn download_file(&self, album: String, asset_guid: String) -> Result<Vec<u8>, WrappedError> {
+        let details = self.inner.get_assets(&album, &[asset_guid.clone()]).await?;
+        let asset = details.into_iter().next().ok_or(WrappedError::GenericError {
+            msg: format!("Asset {} not found in album {}", asset_guid, album),
+        })?;
+        let primary = asset.files.into_iter()
+            .max_by_key(|f| f.size.parse::<u64>().unwrap_or(0))
+            .ok_or(WrappedError::GenericError {
+                msg: "Asset has no files".to_string(),
+            })?;
+        let mut buf = Cursor::new(Vec::new());
+        self.inner.get_file(&mut [(&primary, &mut buf)], |_, _| {}).await?;
+        Ok(buf.into_inner())
     }
 }
 
@@ -6819,6 +6888,18 @@ impl Client {
         } else {
             targets
         };
+        // Log per-handle target breakdown for diagnosis.
+        {
+            let cache = sk.identity.cache.lock().await;
+            for h in &handles {
+                let h_targets = cache.get_participants_targets(
+                    "com.apple.private.alloy.status.keysharing",
+                    &sender_handle,
+                    &[h.clone()],
+                );
+                info!("StatusKit invite target breakdown: {} → {} device(s)", h, h_targets.len());
+            }
+        }
         info!("StatusKit: IDS resolved {} delivery target(s) for {} handle(s) (after cache check)", targets.len(), handles.len());
         if targets.is_empty() {
             return Err(WrappedError::GenericError {
@@ -6826,17 +6907,29 @@ impl Client {
             });
         }
 
+        // Populate allowed_modes with standard Focus mode IDs so the
+        // receiver's iOS sees a real sharing request. An empty list may
+        // cause iOS to silently ignore the invite.
+        let standard_modes: Vec<String> = vec![
+            "com.apple.donotdisturb.mode.default".into(),
+            "com.apple.donotdisturb.mode.sleep".into(),
+            "com.apple.focus.mode.driving".into(),
+            "com.apple.focus.mode.personal".into(),
+            "com.apple.focus.mode.work".into(),
+        ];
         let config_map: std::collections::HashMap<String, rustpush::statuskit::StatusKitPersonalConfig> =
             handles.iter()
                 .map(|h| (h.clone(), rustpush::statuskit::StatusKitPersonalConfig {
-                    allowed_modes: vec![],
+                    allowed_modes: standard_modes.clone(),
                 }))
                 .collect();
 
-        info!("StatusKit: inviting {} handle(s) to key exchange", handles.len());
+        info!("StatusKit: inviting {} handle(s) to key exchange (sender={})", handles.len(), sender_handle);
         sk.invite_to_channel(&sender_handle, config_map).await.map_err(|e| WrappedError::GenericError {
             msg: format!("StatusKit invite_to_channel failed: {:?}", e),
-        })
+        })?;
+        info!("StatusKit: invite_to_channel completed successfully for {} handle(s)", handles.len());
+        Ok(())
     }
 
 
