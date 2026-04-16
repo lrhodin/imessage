@@ -7197,9 +7197,206 @@ impl Client {
                 }))
                 .collect();
 
-        sk.invite_to_channel(&sender_handle, config_map).await.map_err(|e| WrappedError::GenericError {
-            msg: format!("StatusKit invite_to_channel failed: {:?}", e),
+        // ------------------------------------------------------------------
+        // Send the keysharing invite using the pre-packed APS wire shape
+        // (Value::Data(plist_to_bin(&dict))) rather than going through
+        // sk.invite_to_channel — which delegates to the new upstream packed
+        // encoder and packs the invite's IDS dictionary as structured
+        // packed-attribute fields. Peer iOS StatusKit on
+        // com.apple.private.alloy.status.keysharing only consumes the opaque-
+        // Data form (tag=6). See rustpush upstream 6f4e8dd "Packed APS
+        // encoding" — before that commit, APSMessage::Notification.payload
+        // was Vec<u8> and invite bytes hit the wire verbatim in APSRawField
+        // id=3. Wrapping as Value::Data routes through APSPackedValue::Data
+        // to reproduce that semantic without patching upstream.
+        // ------------------------------------------------------------------
+
+        sk.ensure_channel().await.map_err(|e| WrappedError::GenericError {
+            msg: format!("StatusKit ensure_channel failed: {:?}", e),
         })?;
+
+        let (shared_message_bytes, my_channel_id) = {
+            use prost::Message as _;
+            use openssl::ec::EcKey;
+            use openssl::pkey::Private;
+            use rustpush::CompactECKey;
+            use rustpush::statuskit::statuskitp::{AllocatedChannel, SharedKey, SharedKeys, SharedMessage};
+
+            let state = sk.state.read().await;
+            let my_key = state.my_key.as_ref().ok_or(WrappedError::GenericError {
+                msg: "StatusKit my_key missing after ensure_channel".into(),
+            })?;
+
+            // StatusKitMyKey's struct fields are private. We read them via a
+            // plist-value round-trip using upstream's own Serialize impl.
+            let value = plist::to_value(my_key).map_err(|e| WrappedError::GenericError {
+                msg: format!("StatusKit my_key to_value: {:?}", e),
+            })?;
+            let dict = value.into_dictionary().ok_or(WrappedError::GenericError {
+                msg: "StatusKit my_key did not serialize to a dictionary".into(),
+            })?;
+
+            let channel_bytes = dict.get("channel").and_then(|v| v.as_data())
+                .ok_or(WrappedError::GenericError { msg: "my_key.channel missing".into() })?
+                .to_vec();
+            let signature_der = dict.get("signature").and_then(|v| v.as_data())
+                .ok_or(WrappedError::GenericError { msg: "my_key.signature missing".into() })?
+                .to_vec();
+            let key_bytes = dict.get("key").and_then(|v| v.as_data())
+                .ok_or(WrappedError::GenericError { msg: "my_key.key missing".into() })?
+                .to_vec();
+
+            let channel = AllocatedChannel::decode(&channel_bytes[..]).map_err(|e| WrappedError::GenericError {
+                msg: format!("AllocatedChannel decode: {}", e),
+            })?;
+            let ec = EcKey::<Private>::private_key_from_der(&signature_der).map_err(|e| WrappedError::GenericError {
+                msg: format!("signature EcKey from_der: {}", e),
+            })?;
+            let compact: CompactECKey<Private> = ec.try_into().map_err(|e| WrappedError::GenericError {
+                msg: format!("signature CompactECKey try_into: {:?}", e),
+            })?;
+            let shared_key = SharedKey::decode(&key_bytes[..]).map_err(|e| WrappedError::GenericError {
+                msg: format!("SharedKey decode: {}", e),
+            })?;
+
+            let shared_message = SharedMessage {
+                keys: Some(SharedKeys { keys: vec![shared_key] }),
+                sig_key: compact.compress().to_vec(),
+            };
+
+            (shared_message.encode_to_vec(), channel.channel_id)
+        };
+
+        // StatusKitRawSharedDevice is private in upstream; mirror its field
+        // layout (same wire rename map).
+        #[derive(serde::Serialize, Clone)]
+        struct LocalRawSharedDevice {
+            #[serde(rename = "r")]
+            keys: String,
+            #[serde(rename = "d")]
+            time_sent_s: f64,
+            #[serde(rename = "p")]
+            personal_config: String,
+            #[serde(rename = "s")]
+            bundle: String,
+            #[serde(rename = "c")]
+            channel: String,
+        }
+
+        let device_template = LocalRawSharedDevice {
+            keys: BASE64_STANDARD.encode(&shared_message_bytes),
+            time_sent_s: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+            personal_config: String::new(),
+            bundle: "com.apple.focus.status".to_string(),
+            channel: BASE64_STANDARD.encode(&my_channel_id),
+        };
+
+        let mut bundles = Vec::with_capacity(targets.len());
+        let mut plaintext_total: usize = 0;
+        for target in &targets {
+            let Some(handle_config) = config_map.get(&target.participant) else { continue };
+            let mut device = device_template.clone();
+            let mut pc_bytes: Vec<u8> = Vec::new();
+            plist::to_writer_binary(&mut pc_bytes, handle_config).map_err(|e| WrappedError::GenericError {
+                msg: format!("StatusKit personal_config plist encode: {:?}", e),
+            })?;
+            device.personal_config = BASE64_STANDARD.encode(&pc_bytes);
+
+            let mut plaintext: Vec<u8> = Vec::new();
+            plist::to_writer_binary(&mut plaintext, &device).map_err(|e| WrappedError::GenericError {
+                msg: format!("StatusKit device plist encode: {:?}", e),
+            })?;
+            plaintext_total += plaintext.len();
+
+            let encrypted = sk.identity.identity.encrypt_payload(
+                &target.delivery_data,
+                &sk.identity.cache,
+                &plaintext,
+            ).await.map_err(|e| WrappedError::GenericError {
+                msg: format!("StatusKit encrypt_payload for {}: {:?}", target.participant, e),
+            })?;
+
+            bundles.push(target.build_bundle(false, Some(encrypted)));
+        }
+
+        if bundles.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: "StatusKit invite (old-wire): no bundles built (no matching config entries)".into(),
+            });
+        }
+
+        // APS id: upstream uses new_aps_id() (random 1..=i32::MAX). new_aps_id
+        // isn't re-exported by our wrapper, so we generate inline with the
+        // same domain.
+        let msg_id: i32 = ((rand::random::<u32>() >> 1) as i32).max(1);
+        let uuid_bytes: Vec<u8> = uuid::Uuid::new_v4().as_bytes().to_vec();
+
+        // Build the IDS SendMessage dictionary manually. Upstream's SendMessage
+        // struct (identity_manager.rs:1005) has `pub(super)` fields we can't
+        // set from outside the ids module, so we inline the keysharing-only
+        // subset here. Field names/renames match upstream byte-for-byte.
+        let mut send_dict = plist::Dictionary::new();
+        send_dict.insert("fcn".into(), plist::Value::Integer(1i64.into()));
+        send_dict.insert("c".into(), plist::Value::Integer(227i64.into()));
+        send_dict.insert("E".into(), plist::Value::String("pair".into()));
+        send_dict.insert("ua".into(), plist::Value::String(self.os_config.get_version_ua()));
+        send_dict.insert("v".into(), plist::Value::Integer(8i64.into()));
+        send_dict.insert("i".into(), plist::Value::Integer((msg_id as i64).into()));
+        send_dict.insert("U".into(), plist::Value::Data(uuid_bytes));
+        send_dict.insert("sP".into(), plist::Value::String(sender_handle.clone()));
+        let bundles_value = plist::to_value(&bundles).map_err(|e| WrappedError::GenericError {
+            msg: format!("StatusKit bundles to_value: {:?}", e),
+        })?;
+        send_dict.insert("dtl".into(), bundles_value);
+
+        let mut payload_bin: Vec<u8> = Vec::new();
+        plist::to_writer_binary(&mut payload_bin, &plist::Value::Dictionary(send_dict))
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("StatusKit SendMessage plist encode: {:?}", e),
+            })?;
+
+        info!(
+            "StatusKit invite (old-wire): packed {} target(s) into bundle (plaintext_bytes={}, bundle_bytes={}, aps_id={})",
+            bundles.len(), plaintext_total, payload_bin.len(), msg_id
+        );
+
+        let topic_hash: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
+        let aps_token = self.conn.get_token().await;
+
+        // Subscribe before send to avoid the ACK race.
+        let recv = self.conn.subscribe().await;
+
+        self.conn.send(rustpush::APSMessage::Notification {
+            id: msg_id,
+            topic: topic_hash,
+            token: Some(aps_token),
+            payload: plist::Value::Data(payload_bin),
+            channel: None,
+        }).await.map_err(|e| WrappedError::GenericError {
+            msg: format!("StatusKit APS send (old-wire): {:?}", e),
+        })?;
+
+        let my_id = msg_id;
+        let ack_result = self.conn.wait_for_timeout(recv, move |msg| {
+            let rustpush::APSMessage::Ack { for_id, status, .. } = msg else { return None };
+            if for_id == my_id { Some(status) } else { None }
+        }).await;
+        match ack_result {
+            Ok(0) => info!("StatusKit invite (old-wire): APS ACK status=0 (aps_id={})", msg_id),
+            Ok(status) => {
+                warn!("StatusKit invite (old-wire): APS ACK non-zero status={} (aps_id={})", status, msg_id);
+                return Err(WrappedError::GenericError {
+                    msg: format!("StatusKit APS ACK status={}", status),
+                });
+            }
+            Err(e) => {
+                warn!("StatusKit invite (old-wire): ACK wait error ({:?}) (aps_id={}) — treating as non-fatal, message on wire", e, msg_id);
+            }
+        }
+
         Ok(())
     }
 
