@@ -5818,12 +5818,20 @@ pub async fn new_client(
                             };
 
                             // c=255 = server ACK for our own outgoing invite.
-                            // No sender, no encrypted payload — skip entirely.
-                            if diag_cmd_workaround == Some(255) {
-                                debug!("StatusKit workaround: skipping c=255 server ACK on keysharing topic");
+                            // c=120 = IDS per-target error (recipient unreachable,
+                            //         key-refresh needed, etc.) — one per failing
+                            //         target, repeated as Apple retries delivery.
+                            // Both are non-keysharing envelopes (no P/E/sT), so
+                            // the workaround's decrypt path produces nothing
+                            // useful. Skip to avoid log spam.
+                            if diag_cmd_workaround == Some(255) || diag_cmd_workaround == Some(120) {
+                                debug!(
+                                    "StatusKit workaround: skipping c={} server ACK/error on keysharing topic",
+                                    diag_cmd_workaround.unwrap()
+                                );
                                 // Don't set workaround_consumed — let it fall
                                 // through to upstream handle() which also skips
-                                // c=255 via its own suppression path.
+                                // these via its own suppression path.
                             } else {
 
                             let diag_has_sP = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("sP") } else { false };
