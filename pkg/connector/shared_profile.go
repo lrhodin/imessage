@@ -191,10 +191,35 @@ func (c *IMClient) ensureSharedProfileSchema(ctx context.Context) error {
 // still have the record/decryption keys to retry.
 func (c *IMClient) handleSharedProfile(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
 	if msg.Sender == nil || *msg.Sender == "" {
+		log.Debug().Msg("handleSharedProfile: dropped (empty sender)")
 		return
 	}
 	sender := *msg.Sender
 	log = log.With().Str("sender", sender).Logger()
+
+	// Trace entry so we can tell from server logs whether peer ShareProfile
+	// messages are reaching the Go handler at all (vs being dropped in the
+	// Rust receive loop before upstream parses the iMessage command).
+	inlineName := ""
+	if msg.ShareProfileDisplayName != nil {
+		inlineName = *msg.ShareProfileDisplayName
+	}
+	inlineFirst := ""
+	if msg.ShareProfileFirstName != nil {
+		inlineFirst = *msg.ShareProfileFirstName
+	}
+	inlineAvatarLen := 0
+	if msg.ShareProfileAvatar != nil {
+		inlineAvatarLen = len(*msg.ShareProfileAvatar)
+	}
+	log.Info().
+		Bool("has_record_key", msg.ShareProfileRecordKey != nil && *msg.ShareProfileRecordKey != "").
+		Bool("has_decryption_key", msg.ShareProfileDecryptionKey != nil && len(*msg.ShareProfileDecryptionKey) > 0).
+		Bool("has_poster", msg.ShareProfileHasPoster).
+		Str("inline_display_name", inlineName).
+		Str("inline_first_name", inlineFirst).
+		Int("inline_avatar_bytes", inlineAvatarLen).
+		Msg("handleSharedProfile entered")
 
 	if msg.ShareProfileRecordKey == nil || msg.ShareProfileDecryptionKey == nil {
 		log.Debug().Msg("ShareProfile message has no record/decryption key, ignoring")
