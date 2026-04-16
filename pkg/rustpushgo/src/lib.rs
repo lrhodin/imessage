@@ -6764,7 +6764,24 @@ impl Client {
             msg: "No TokenProvider available".into(),
         })?;
         let state_path = subsystem_state_path("statuskit-state.plist");
-        let state = read_plist_state::<rustpush::statuskit::StatusKitState>(&state_path).unwrap_or_default();
+        let state = match read_plist_state::<rustpush::statuskit::StatusKitState>(&state_path) {
+            Some(s) => {
+                info!(
+                    "StatusKit state: loaded {} peer key(s), my_key={}, path={}",
+                    s.keys.len(),
+                    s.my_key.is_some(),
+                    state_path
+                );
+                s
+            }
+            None => {
+                info!(
+                    "StatusKit state: plist absent or unreadable at {} — starting with empty state",
+                    state_path
+                );
+                rustpush::statuskit::StatusKitState::default()
+            }
+        };
         let state_path_for_closure = state_path.clone();
 
         let wrapped = Arc::new(WrappedStatusKitClient {
@@ -7129,20 +7146,16 @@ impl Client {
             });
         }
 
-        // Populate allowed_modes with standard Focus mode IDs so the
-        // receiver's iOS sees a real sharing request. An empty list may
-        // cause iOS to silently ignore the invite.
-        let standard_modes: Vec<String> = vec![
-            "com.apple.donotdisturb.mode.default".into(),
-            "com.apple.donotdisturb.mode.sleep".into(),
-            "com.apple.focus.mode.driving".into(),
-            "com.apple.focus.mode.personal".into(),
-            "com.apple.focus.mode.work".into(),
-        ];
+        // allowed_modes must be empty: at TPP-confirmed-working 31ad87b the
+        // invite sent vec![] and contacts reciprocated. f079364 populated
+        // the list with hard-coded Focus mode IDs on the speculation
+        // "iOS may silently ignore empty lists", but the evidence goes the
+        // other way — the populated value appears to make peer iOS silently
+        // drop the invite. Keep empty.
         let config_map: std::collections::HashMap<String, rustpush::statuskit::StatusKitPersonalConfig> =
             handles.iter()
                 .map(|h| (h.clone(), rustpush::statuskit::StatusKitPersonalConfig {
-                    allowed_modes: standard_modes.clone(),
+                    allowed_modes: vec![],
                 }))
                 .collect();
 

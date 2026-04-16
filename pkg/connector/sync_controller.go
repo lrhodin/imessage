@@ -798,8 +798,10 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 // never fires. Must run after InitStatuskit so shared_statuskit is populated.
 func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 	if c.client == nil || c.handle == "" {
+		log.Warn().Bool("client_nil", c.client == nil).Str("handle", c.handle).Msg("StatusKit invite: skipped (client or handle not ready)")
 		return
 	}
+	log.Info().Str("handle", c.handle).Msg("StatusKit invite: starting")
 	// Function-level panic guard. SetStatus/InviteToStatusSharing both
 	// cross into Rust and upstream has several reachable panic sites in
 	// the keysharing path (see audit).
@@ -819,11 +821,13 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 		selfHandles[h] = struct{}{}
 	}
 	var handles []string
+	var rawCount int
 	for rows.Next() {
 		var ghostID string
 		if err := rows.Scan(&ghostID); err != nil {
 			continue
 		}
+		rawCount++
 		if _, isSelf := selfHandles[ghostID]; isSelf {
 			continue
 		}
@@ -833,7 +837,9 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 		log.Warn().Err(err).Msg("StatusKit invite: ghost row iteration error")
 	}
 	rows.Close()
+	log.Info().Int("raw_count", rawCount).Int("after_self_filter", len(handles)).Msg("StatusKit invite: ghost query complete")
 	if len(handles) == 0 {
+		log.Warn().Int("raw_count", rawCount).Msg("StatusKit invite: zero ghost handles after self-filter — backfill likely incomplete, will retry on next periodic tick")
 		return
 	}
 	// ensure_channel (called inside invite_to_channel) returns Ok immediately
@@ -875,8 +881,10 @@ const statusKitReinviteMinSpacing = 4 * time.Hour
 // inviteContactsToStatusSharing, which runs at startup and after backfill.
 func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
 	if c.client == nil || c.handle == "" {
+		log.Warn().Bool("client_nil", c.client == nil).Str("handle", c.handle).Msg("StatusKit re-invite: skipped (client or handle not ready)")
 		return
 	}
+	log.Info().Str("handle", c.handle).Msg("StatusKit re-invite: starting")
 	defer func() {
 		if r := recover(); r != nil {
 			log.Warn().Interface("panic", r).Msg("reinvitePendingStatusSharingGhosts panicked — skipped")
@@ -893,11 +901,13 @@ func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
 		selfHandles[h] = struct{}{}
 	}
 	var allHandles []string
+	var rawCount int
 	for rows.Next() {
 		var ghostID string
 		if err := rows.Scan(&ghostID); err != nil {
 			continue
 		}
+		rawCount++
 		if _, isSelf := selfHandles[ghostID]; isSelf {
 			continue
 		}
@@ -907,7 +917,9 @@ func (c *IMClient) reinvitePendingStatusSharingGhosts(log zerolog.Logger) {
 		log.Warn().Err(err).Msg("StatusKit re-invite: ghost row iteration error")
 	}
 	rows.Close()
+	log.Info().Int("raw_count", rawCount).Int("after_self_filter", len(allHandles)).Msg("StatusKit re-invite: ghost query complete")
 	if len(allHandles) == 0 {
+		log.Warn().Int("raw_count", rawCount).Msg("StatusKit re-invite: zero ghost handles after self-filter — backfill likely incomplete")
 		return
 	}
 

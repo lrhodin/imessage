@@ -661,6 +661,10 @@ func (c *IMClient) onForwardBackfillDone() {
 		// post-backfill call ensures invites go out once we have
 		// handles to invite.
 		go c.inviteContactsToStatusSharing(log.Logger)
+		// Belt-and-suspenders: also trigger the pending-reinvite path so
+		// contacts who were in the DB but never responded to earlier
+		// invites get another chance the moment backfill settles.
+		go c.reinvitePendingStatusSharingGhosts(log.Logger)
 	}
 }
 
