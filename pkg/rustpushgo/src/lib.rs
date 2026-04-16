@@ -5712,6 +5712,18 @@ pub async fn new_client(
                         if *msg_topic == keysharing_topic_hash
                             && !matches!(payload, plist::Value::Data(_))
                         {
+                            // Extract command byte from payload for diagnostics
+                            // before the async block moves msg.
+                            let diag_cmd_workaround = if let plist::Value::Dictionary(ref d) = payload {
+                                d.get("c").and_then(|v| v.as_unsigned_integer()).map(|v| v as u8)
+                            } else {
+                                None
+                            };
+                            let diag_has_sP = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("sP") } else { false };
+                            let diag_has_P = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("P") } else { false };
+                            let diag_has_E = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("E") } else { false };
+                            let diag_has_t = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("t") } else { false };
+
                             let result: Result<bool, String> = async {
                                 use prost::Message as _;
                                 let recv = sk
@@ -5723,12 +5735,19 @@ pub async fn new_client(
                                     .await
                                     .map_err(|e| format!("identity.receive_message: {e}"))?;
                                 let Some(recv) = recv else {
+                                    warn!("StatusKit workaround: receive_message returned None (c={:?} sP={} P={} E={} t={}) — topic mismatch or not a Notification",
+                                        diag_cmd_workaround, diag_has_sP, diag_has_P, diag_has_E, diag_has_t);
                                     return Ok::<bool, String>(false);
                                 };
                                 let Some(message_unenc) = recv.message_unenc else {
+                                    // c=255 ACKs and other non-encrypted messages lack P/E/t fields,
+                                    // so the decryption block in receive_message is skipped entirely.
+                                    warn!("StatusKit workaround: message_unenc is None (c={} sender={:?} sP={} P={} E={} t={}) — no decrypted payload; likely server ACK or missing IDS keys",
+                                        recv.command, recv.sender, diag_has_sP, diag_has_P, diag_has_E, diag_has_t);
                                     return Ok(false);
                                 };
                                 let Some(sender) = recv.sender else {
+                                    warn!("StatusKit workaround: sender is None (c={}) — message has no sP field", recv.command);
                                     return Ok(false);
                                 };
 
@@ -5838,7 +5857,7 @@ pub async fn new_client(
                                     workaround_consumed = true;
                                 }
                                 Ok(false) => {
-                                    warn!("StatusKit workaround: keysharing Dictionary-payload arrived but receive_message returned None or partial fields — IDS decryption may have failed; falling through to upstream handle()");
+                                    // Detailed diagnostics already logged inside the async block.
                                 }
                                 Err(e) => {
                                     warn!(
