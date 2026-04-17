@@ -282,22 +282,33 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 	apsStateStr := &meta.APSState
 
 	// Eagerly persist full session state to the backup file so it survives DB resets.
-	saveSessionState(log, PersistedSessionState{
-		IDSIdentity:              meta.IDSIdentity,
-		APSState:                 meta.APSState,
-		IDSUsers:                 meta.IDSUsers,
-		PreferredHandle:          meta.PreferredHandle,
-		Platform:                 meta.Platform,
-		HardwareKey:              meta.HardwareKey,
-		DeviceID:                 meta.DeviceID,
-		AccountUsername:          meta.AccountUsername,
-		AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
-		AccountPET:               meta.AccountPET,
-		AccountADSID:             meta.AccountADSID,
-		AccountDSID:              meta.AccountDSID,
-		AccountSPDBase64:         meta.AccountSPDBase64,
-		MmeDelegateJSON:          meta.MmeDelegateJSON,
-	})
+	//
+	// Guard against overwriting a good backup with empty state. client.Connect
+	// (client.go ValidateKeystore path) wipes meta.IDSUsers/IDSIdentity/APSState
+	// from the DB when the keystore is missing and flips to StateBadCredentials;
+	// on the NEXT LoadUserLogin the meta is empty here, and without this guard
+	// we'd blow away session.json — escalating a recoverable key-loss into a
+	// full re-auth because tryAutoRestore on a future boot now finds no backup.
+	if meta.IDSUsers == "" && meta.IDSIdentity == "" && meta.APSState == "" {
+		log.Warn().Msg("LoadUserLogin: meta has no IDSUsers/IDSIdentity/APSState; skipping session.json overwrite to preserve existing backup")
+	} else {
+		saveSessionState(log, PersistedSessionState{
+			IDSIdentity:              meta.IDSIdentity,
+			APSState:                 meta.APSState,
+			IDSUsers:                 meta.IDSUsers,
+			PreferredHandle:          meta.PreferredHandle,
+			Platform:                 meta.Platform,
+			HardwareKey:              meta.HardwareKey,
+			DeviceID:                 meta.DeviceID,
+			AccountUsername:          meta.AccountUsername,
+			AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
+			AccountPET:               meta.AccountPET,
+			AccountADSID:             meta.AccountADSID,
+			AccountDSID:              meta.AccountDSID,
+			AccountSPDBase64:         meta.AccountSPDBase64,
+			MmeDelegateJSON:          meta.MmeDelegateJSON,
+		})
+	}
 
 	client := &IMClient{
 		Main:                    c,

@@ -5216,10 +5216,8 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	}
 	targetGUID := string(msg.EditTarget.ID)
 
-	err := retrySendOnAPNsFlap(func() error {
-		_, sendErr := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
-		return sendErr
-	})
+	// Rust-side retry handles SendTimedOut with stable UUID.
+	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
 	if err == nil {
 		// Work around mautrix-go bridgev2 not incrementing EditCount before saving.
 		msg.EditTarget.EditCount++
@@ -5239,10 +5237,8 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 
 	// Track outbound unsend so we can suppress the APNs echo.
 	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
-	err := retrySendOnAPNsFlap(func() error {
-		_, sendErr := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
-		return sendErr
-	})
+	// Rust-side retry handles SendTimedOut with stable UUID.
+	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
 	// while preserving the UUID for echo detection.
@@ -5304,10 +5300,8 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 	}
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetMessage.ID))
-	err := retrySendOnAPNsFlap(func() error {
-		_, sendErr := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.handle)
-		return sendErr
-	})
+	// Rust-side retry handles SendTimedOut with stable UUID.
+	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.handle)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send tapback: %w", err)
 	}
@@ -5351,10 +5345,9 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 	}
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetReaction.MessageID))
-	return retrySendOnAPNsFlap(func() error {
-		_, sendErr := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.handle)
-		return sendErr
-	})
+	// Rust-side retry handles SendTimedOut with stable UUID.
+	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.handle)
+	return err
 }
 
 // HandleMatrixDeleteChat is called when the user deletes a chat in Matrix/Beeper.

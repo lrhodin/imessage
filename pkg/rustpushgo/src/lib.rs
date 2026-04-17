@@ -2057,16 +2057,33 @@ pub async fn restore_token_provider(
     // Non-LoggedIn outcomes are logged and ignored: we're no worse off
     // than the skip-entirely variant, and the common-case LoggedIn path
     // is exactly the daily auto-renewal that master relied on.
+    //
+    // Snapshot/restore guard: upstream writes `self.tokens = keys`
+    // unconditionally when SPD contains a `t` dict (client.rs:776), which
+    // could partially overwrite a populated token map on a non-LoggedIn
+    // return. On the restore path tokens start empty so the snapshot is
+    // typically empty, but merging snapshot entries that upstream didn't
+    // (re)write guarantees we never exit this call with fewer tokens
+    // than we went in with. NeedsExtraStep with populated PET is treated
+    // as success (see LoginSession::finish and upstream client.rs:1039).
     let _ = pet;
+    let snapshot = std::mem::take(&mut account.tokens);
     match account.login_email_pass(&username, &hashed_password).await {
         Ok(icloud_auth::LoginState::LoggedIn) => {
             info!("restore_token_provider: proactive PET refresh succeeded");
         }
         Ok(state) => {
-            warn!(
-                "restore_token_provider: proactive PET refresh returned non-logged-in state: {:?} — manual re-login may be required",
-                state
-            );
+            if account.tokens.contains_key("com.apple.gs.idms.pet") {
+                info!(
+                    "restore_token_provider: PET refresh returned {:?} but PET was populated — treating as success",
+                    state
+                );
+            } else {
+                warn!(
+                    "restore_token_provider: proactive PET refresh returned non-logged-in state: {:?} — manual re-login may be required",
+                    state
+                );
+            }
         }
         Err(err) => {
             warn!(
@@ -2074,6 +2091,9 @@ pub async fn restore_token_provider(
                 err
             );
         }
+    }
+    for (k, v) in snapshot {
+        account.tokens.entry(k).or_insert(v);
     }
 
     let account = Arc::new(rustpush::DebugMutex::new(account));
@@ -2976,7 +2996,7 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
             }
         }
     };
-    match ft.ring(&session, &targets, false).await {
+    let rang = match ft.ring(&session, &targets, false).await {
         Ok(_) => {
             info!(
                 "pending ring: rang {} target(s) in session {} (triggered by join from {})",
@@ -2994,8 +3014,119 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
             if let Some(session) = state.sessions.get_mut(guid) {
                 session.is_ringing_inaccurate = true;
             }
+            true
         }
-        Err(e) => warn!("pending ring: ft.ring failed for session {}: {:?}", guid, e),
+        Err(e) => {
+            warn!("pending ring: ft.ring failed for session {}: {:?}", guid, e);
+            false
+        }
+    };
+    if rang {
+        suppress_own_device_ring(ft, guid).await;
+    }
+}
+
+// Send a RespondedElsewhere FaceTime message scoped to the caller's own
+// handle, to silence Apple's server-side Continuity fanout on outgoing calls.
+//
+// Problem: when the bridge initiates an outgoing FT call (via
+// create_session_no_ring + pending-ring fire-on-join, or via respond_letmein
+// for web-link taps), Apple's Continuity layer sees "handle X initiated a
+// call via web/bridge" and rings handle X's OTHER registered devices (Mac,
+// iPad) to offer "join this call on your native device." Native iPhone FT
+// doesn't trip this because local CallKit registers the initiating device
+// as an active-call device; the bridge can't do that.
+//
+// Fix: mirror upstream's pattern at facetime.rs:708-725, where
+// `prop_up_conv(ring=false)` sends RespondedElsewhere to own-devices when
+// the user picks up an incoming call. We emit the same wire after our
+// outgoing ring fires so the caller's MacBook/iPad stop ringing. The push
+// is scoped to the caller's own handle only — the target (callee) receives
+// no RespondedElsewhere, so their ring is unaffected.
+//
+// Reuses only public upstream APIs (IdentityManager::cache_keys /
+// send_message, KeyCache::get_participants_targets, ConversationMessage
+// proto). No upstream patching.
+async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str) {
+    use prost::Message as _;
+    use rustpush::facetime::facetimep::{ConversationMessage, ConversationMessageType};
+    use rustpush::ids::identity_manager::{IDSSendMessage, Raw};
+    use rustpush::ids::user::QueryOptions;
+
+    let handle = {
+        let state = ft.state.read().await;
+        let Some(session) = state.sessions.get(guid) else {
+            warn!("suppress_own_device_ring: session {} not found", guid);
+            return;
+        };
+        match session.my_handles.first().cloned() {
+            Some(h) => h,
+            None => {
+                warn!("suppress_own_device_ring: session {} has no my_handles", guid);
+                return;
+            }
+        }
+    };
+
+    let mut message = ConversationMessage::default();
+    message.set_type(ConversationMessageType::RespondedElsewhere);
+    message.conversation_group_uuid_string = guid.to_string();
+    message.disconnected_reason = 4;
+
+    let relevant_people = vec![handle.clone()];
+    let topic = "com.apple.private.alloy.facetime.multi";
+
+    if let Err(e) = ft
+        .identity
+        .cache_keys(
+            topic,
+            &relevant_people,
+            &handle,
+            false,
+            &QueryOptions { required_for_message: true, result_expected: true },
+        )
+        .await
+    {
+        warn!(
+            "suppress_own_device_ring: cache_keys failed for session {}: {:?}",
+            guid, e
+        );
+        return;
+    }
+
+    let targets = ft
+        .identity
+        .cache
+        .lock()
+        .await
+        .get_participants_targets(topic, &handle, &relevant_people);
+    if targets.is_empty() {
+        // No other own-devices registered — nothing to suppress.
+        return;
+    }
+
+    let ids_send = IDSSendMessage {
+        sender: handle.clone(),
+        raw: Raw::Body(message.encode_to_vec()),
+        send_delivered: false,
+        command: 242,
+        no_response: false,
+        id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+        scheduled_ms: None,
+        queue_id: None,
+        relay: None,
+        extras: Default::default(),
+    };
+
+    match ft.identity.send_message(topic, ids_send, targets).await {
+        Ok(_) => info!(
+            "suppress_own_device_ring: sent RespondedElsewhere to own handle {} for session {}",
+            handle, guid
+        ),
+        Err(e) => warn!(
+            "suppress_own_device_ring: send_message failed for session {}: {:?}",
+            guid, e
+        ),
     }
 }
 
@@ -3267,6 +3398,7 @@ async fn auto_approve_bridge_letmein(
                     request.requestor,
                     approved_group
                 );
+                suppress_own_device_ring(facetime, &approved_group).await;
                 return Ok(());
             }
             Err(e) => {
@@ -7589,7 +7721,7 @@ impl Client {
                 embedded_profile: None,
             }),
         );
-        self.client.send(&mut msg).await
+        self.send_with_flap_retry(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send tapback: {}", e) })?;
         Ok(msg.id.clone())
     }
@@ -7673,7 +7805,7 @@ impl Client {
                 }]),
             }),
         );
-        self.client.send(&mut msg).await
+        self.send_with_flap_retry(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send edit: {}", e) })?;
         Ok(msg.id.clone())
     }
@@ -7694,7 +7826,7 @@ impl Client {
                 edit_part,
             }),
         );
-        self.client.send(&mut msg).await
+        self.send_with_flap_retry(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send unsend: {}", e) })?;
         Ok(msg.id.clone())
     }
@@ -9277,7 +9409,11 @@ impl Client {
                     );
                     last_perform_err = Some(format!("zone_key: {}", e));
                     if attempt_no < ATT_SYNC_RETRIES {
-                        self.reset_cloud_client().await;
+                        if is_token_missing_error(&e) {
+                            self.refresh_mme_and_reset_cloud_client().await;
+                        } else {
+                            self.reset_cloud_client().await;
+                        }
                         cm_handle = self.get_or_init_cloud_messages_client().await?;
                         continue;
                     }
@@ -9324,7 +9460,11 @@ impl Client {
                     );
                     last_perform_err = Some(format!("{}", e));
                     if attempt_no < ATT_SYNC_RETRIES {
-                        self.reset_cloud_client().await;
+                        if is_token_missing_error(&e) {
+                            self.refresh_mme_and_reset_cloud_client().await;
+                        } else {
+                            self.reset_cloud_client().await;
+                        }
                         cm_handle = self.get_or_init_cloud_messages_client().await?;
                         continue;
                     }

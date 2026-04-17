@@ -205,6 +205,10 @@ ensure-rustpush-source:
 			echo "Making rustpush activation module public (needed by RelayOSConfig)..."; \
 			sed -i.bak 's/^mod activation;/pub mod activation;/' $(RUSTPUSH_DIR)/src/lib.rs && rm -f $(RUSTPUSH_DIR)/src/lib.rs.bak; \
 		fi; \
+		if grep -q '^mod ids;' $(RUSTPUSH_DIR)/src/lib.rs 2>/dev/null; then \
+			echo "Making rustpush ids module public (needed by FT RespondedElsewhere overlay)..."; \
+			sed -i.bak 's/^mod ids;/pub mod ids;/' $(RUSTPUSH_DIR)/src/lib.rs && rm -f $(RUSTPUSH_DIR)/src/lib.rs.bak; \
+		fi; \
 	fi
 
 # `ensure-rustpush-source` is an order-only prereq (the `|` separator):

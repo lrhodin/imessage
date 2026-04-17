@@ -54,11 +54,23 @@ pub async fn invite_keysharing<T: AnisetteProvider + Send + Sync + 'static>(
     // Zero targets usually means the cache still has stale-empty entries
     // from a prior session (dirty cutoff is ~1 hour). One invalidate + retry
     // forces a live IDS query.
+    //
+    // Scoped to the keysharing topic only — upstream's `invalidate_id_cache`
+    // (identity_manager.rs:910) calls `invalidate_all` (line 256) which wipes
+    // MADRID's key cache too, forcing an IDS re-query before the next
+    // iMessage send. Dropping just the keysharing entry from the cache map
+    // is functionally equivalent for this service (no private_data/env_hash
+    // to preserve — those are MADRID-only per line 636/650/662/669) and
+    // leaves iMessage's cache untouched.
     let targets = if targets.is_empty() {
         warn!(
-            "StatusKit: zero targets for keysharing topic — invalidating IDS cache and retrying"
+            "StatusKit: zero targets for keysharing topic — invalidating keysharing cache and retrying"
         );
-        sk.identity.invalidate_id_cache().await;
+        {
+            let mut cache_guard = sk.identity.cache.lock().await;
+            cache_guard.cache.remove(KEYSHARING_TOPIC);
+            cache_guard.save();
+        }
         sk.identity
             .targets_for_handles(KEYSHARING_TOPIC, handles, sender_handle)
             .await?
