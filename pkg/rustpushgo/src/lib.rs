@@ -1103,6 +1103,16 @@ fn is_pcs_recoverable_error(err: &rustpush::PushError) -> bool {
     )
 }
 
+/// True when the error is a missing-MME-token failure. Upstream's
+/// `get_mme_token(name)` returns `TokenMissing` when the seeded delegate
+/// lacks the requested name (e.g. `cloudKitToken`), and it only
+/// auto-refreshes the delegate if it's older than one week. A partial or
+/// stale seeded delegate that's still within that week gets permanently
+/// stuck on this error until we force a refresh_mme() ourselves.
+fn is_token_missing_error(err: &rustpush::PushError) -> bool {
+    matches!(err, rustpush::PushError::TokenMissing)
+}
+
 fn keychain_retry_delay(attempt: usize) -> Duration {
     match attempt {
         0..=4 => Duration::from_secs(2),
@@ -6912,6 +6922,24 @@ impl Client {
         }
     }
 
+    /// Force-refresh the MobileMe delegate and clear the cached CloudKit
+    /// clients. Call this when a CloudKit sync fails with TokenMissing:
+    /// the seeded delegate is missing the token CloudKit needs (typically
+    /// `cloudKitToken`), and upstream's get_mme_token only auto-refreshes
+    /// after a week of staleness. Without an explicit refresh here the
+    /// bridge gets permanently stuck on a partial delegate until that week
+    /// elapses.
+    async fn refresh_mme_and_reset_cloud_client(&self) {
+        if let Some(tp) = &self.token_provider {
+            if let Err(e) = tp.inner.refresh_mme().await {
+                warn!("refresh_mme failed during cloud-client recovery: {}", e);
+            } else {
+                info!("Cloud client recovery: refreshed MobileMe delegate");
+            }
+        }
+        self.reset_cloud_client().await;
+    }
+
     /// Initialize the StatusKit presence system. Must be called after login
     /// when a TokenProvider is available. The callback receives presence
     /// updates for subscribed handles via the APNs receive loop.
@@ -8725,9 +8753,10 @@ impl Client {
         const MAX_SYNC_ATTEMPTS: usize = 4;
         let mut sync_result = None;
         let mut last_pcs_err: Option<rustpush::PushError> = None;
+        let mut cm_handle = cloud_messages;
 
         for attempt in 0..MAX_SYNC_ATTEMPTS {
-            match cloud_messages.sync_chats(token.clone()).await {
+            match cm_handle.sync_chats(token.clone()).await {
                 Ok(result) => {
                     sync_result = Some(result);
                     break;
@@ -8745,6 +8774,21 @@ impl Client {
                         self.recover_cloud_pcs_state("CloudKit chats sync").await?;
                         continue;
                     }
+                }
+                Err(err) if is_token_missing_error(&err) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "CloudKit chats sync hit TokenMissing on attempt {}/{} — refreshing MobileMe delegate",
+                        attempt_no, MAX_SYNC_ATTEMPTS
+                    );
+                    if attempt_no < MAX_SYNC_ATTEMPTS {
+                        self.refresh_mme_and_reset_cloud_client().await;
+                        cm_handle = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                    return Err(WrappedError::GenericError {
+                        msg: format!("Failed to sync CloudKit chats: {}", err),
+                    });
                 }
                 Err(err) => {
                     return Err(WrappedError::GenericError {
@@ -8864,7 +8908,7 @@ impl Client {
             if token.is_some() { "present" } else { "nil" },
             token.as_ref().map_or(0, |t| t.len())
         );
-        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let mut cloud_messages = self.get_or_init_cloud_messages_client().await?;
 
         const MAX_SYNC_ATTEMPTS: usize = 4;
         let mut sync_result = None;
@@ -8899,6 +8943,21 @@ impl Client {
                         self.recover_cloud_pcs_state("CloudKit messages sync").await?;
                         continue;
                     }
+                }
+                Ok(Err(err)) if is_token_missing_error(&err) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "CloudKit messages sync hit TokenMissing on attempt {}/{} — refreshing MobileMe delegate",
+                        attempt_no, MAX_SYNC_ATTEMPTS
+                    );
+                    if attempt_no < MAX_SYNC_ATTEMPTS {
+                        self.refresh_mme_and_reset_cloud_client().await;
+                        cloud_messages = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                    return Err(WrappedError::GenericError {
+                        msg: format!("Failed to sync CloudKit messages: {}", err),
+                    });
                 }
                 Ok(Err(err)) => {
                     return Err(WrappedError::GenericError {
@@ -9170,7 +9229,16 @@ impl Client {
                     );
                     last_perform_err = Some(format!("get_container: {}", e));
                     if attempt_no < ATT_SYNC_RETRIES {
-                        self.reset_cloud_client().await;
+                        // TokenMissing means the seeded MME delegate lacks the
+                        // token CloudKit init needs (mmeAuthToken). A plain
+                        // reset_cloud_client would reload the same delegate
+                        // and fail identically; force-refresh the delegate so
+                        // the re-init actually sees fresh tokens.
+                        if is_token_missing_error(&e) {
+                            self.refresh_mme_and_reset_cloud_client().await;
+                        } else {
+                            self.reset_cloud_client().await;
+                        }
                         cm_handle = self.get_or_init_cloud_messages_client().await?;
                         continue;
                     }
@@ -9735,9 +9803,17 @@ impl Client {
 
         let seen_ids: std::collections::HashSet<String> = known_record_names.into_iter().collect();
 
-        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let mut cloud_messages = self.get_or_init_cloud_messages_client().await?;
         let container = match cloud_messages.get_container().await {
             Ok(c) => c,
+            Err(e) if is_token_missing_error(&e) => {
+                warn!("cloud_query_attachments_fallback: get_container TokenMissing — refreshing MobileMe delegate and retrying");
+                self.refresh_mme_and_reset_cloud_client().await;
+                cloud_messages = self.get_or_init_cloud_messages_client().await?;
+                cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
+                    msg: format!("cloud_query_attachments_fallback: get_container failed after MME refresh: {}", e),
+                })?
+            }
             Err(e) => return Err(WrappedError::GenericError { msg: format!("cloud_query_attachments_fallback: get_container failed: {}", e) }),
         };
         let zone_id = container.private_zone("attachmentManateeZone".to_string());
