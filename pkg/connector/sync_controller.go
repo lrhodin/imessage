@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,51 @@ const cloudSyncVersion = 4
 // Each CloudKit zone sync (messages, chats, attachments) breaks after this many
 // pages so a runaway response can never loop forever.
 const maxCloudSyncPages = 10000
+
+// cloudKitRetryAfterRegex extracts the server-provided retry hint that
+// CloudKit includes on transient errors (ZoneBusy, "Blobification error",
+// etc). Upstream surfaces the hint via PushError's {:?} Debug formatter
+// embedded in the FFI error string; no structured field reaches Go.
+var cloudKitRetryAfterRegex = regexp.MustCompile(`retry_after_seconds:\s*Some\((\d+)\)`)
+
+// cloudKitRetryDelay returns the delay to wait before retrying a failed
+// CloudKit sync page. Uses the larger of: (a) Apple's explicit
+// retry_after_seconds hint parsed from the error string, (b) an
+// exponential backoff ramp keyed on consecutive errors (500ms, 1s, 2s,
+// 4s, 8s). Clamped to 30s so a malformed hint or long error streak can't
+// stall a pagination pass indefinitely — the outer sync controller will
+// retry the whole zone after cloudSyncRetryInterval anyway.
+func cloudKitRetryDelay(err error, consecutiveErrors int) time.Duration {
+	// Exponential fallback: 500ms * 2^(n-1), capped at 30s.
+	// n=1 → 500ms, n=2 → 1s, n=3 → 2s, n=4 → 4s, n=5 → 8s.
+	fallback := 500 * time.Millisecond
+	if consecutiveErrors > 1 {
+		shift := consecutiveErrors - 1
+		if shift > 6 {
+			shift = 6 // cap the multiplier so we don't overflow the Duration math
+		}
+		fallback = fallback << shift
+	}
+	if fallback > 30*time.Second {
+		fallback = 30 * time.Second
+	}
+
+	delay := fallback
+	if err != nil {
+		if m := cloudKitRetryAfterRegex.FindStringSubmatch(err.Error()); len(m) >= 2 {
+			if secs, parseErr := strconv.Atoi(m[1]); parseErr == nil && secs > 0 {
+				hint := time.Duration(secs) * time.Second
+				if hint > 30*time.Second {
+					hint = 30 * time.Second
+				}
+				if hint > delay {
+					delay = hint
+				}
+			}
+		}
+	}
+	return delay
+}
 
 // cloudChatSyncVersion is bumped when chat-specific sync logic changes in a
 // way that requires a one-time full re-download of the chatManateeZone only
@@ -1824,10 +1870,12 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 		resp, syncErr := safeCloudSyncAttachments(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
+			retryDelay := cloudKitRetryDelay(syncErr, consecutiveErrors)
 			log.Warn().Err(syncErr).
 				Int("page", page).
 				Int("imported_so_far", len(attMap)).
 				Int("consecutive_errors", consecutiveErrors).
+				Dur("retry_after", retryDelay).
 				Msg("CloudKit attachment sync page failed (FFI error)")
 			if consecutiveErrors >= maxConsecutiveAttErrors {
 				log.Error().
@@ -1836,6 +1884,7 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 					Msg("CloudKit attachment sync: too many consecutive FFI errors, stopping pagination")
 				break
 			}
+			time.Sleep(retryDelay)
 			continue
 		}
 		consecutiveErrors = 0
@@ -1969,10 +2018,12 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 		resp, syncErr := safeCloudSyncChats(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
+			retryDelay := cloudKitRetryDelay(syncErr, consecutiveErrors)
 			log.Warn().Err(syncErr).
 				Int("page", page).
 				Int("imported_so_far", counts.Imported).
 				Int("consecutive_errors", consecutiveErrors).
+				Dur("retry_after", retryDelay).
 				Msg("CloudKit chat sync page failed (FFI error)")
 			if consecutiveErrors >= maxConsecutiveChatErrors {
 				log.Error().
@@ -1981,7 +2032,7 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 					Msg("CloudKit chat sync: too many consecutive FFI errors, stopping pagination")
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(retryDelay)
 			continue
 		}
 		consecutiveErrors = 0
@@ -2079,10 +2130,12 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 		resp, syncErr := safeCloudSyncMessages(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
+			retryDelay := cloudKitRetryDelay(syncErr, consecutiveErrors)
 			log.Warn().Err(syncErr).
 				Int("page", page).
 				Int("imported_so_far", counts.Imported).
 				Int("consecutive_errors", consecutiveErrors).
+				Dur("retry_after", retryDelay).
 				Msg("CloudKit message sync page failed (FFI error)")
 			if consecutiveErrors >= maxConsecutiveErrors {
 				log.Error().
@@ -2093,7 +2146,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 			}
 			// Skip this page and retry with the same token on next iteration.
 			// The server may return different records on retry.
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(retryDelay)
 			continue
 		}
 		consecutiveErrors = 0
