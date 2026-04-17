@@ -2041,22 +2041,40 @@ pub async fn restore_token_provider(
 
     account.spd = Some(spd);
 
-    // GSA tokens (e.g. com.apple.gs.sharedchannels.auth) are populated by
-    // login_email_pass during the initial 2FA-completed login. On restore,
-    // login_email_pass returns NeedsDevice2FA and destructively overwrites
-    // account.tokens with an empty set — so we intentionally skip it here.
-    // FetchedToken has private fields so we cannot reconstruct tokens from
-    // the persisted SPD either. After a fresh login, tokens are available
-    // for the lifetime of that session. On restart, ensure_channel still
-    // works (persisted my_key), invites use IDS (not GSA), and SetStatus
-    // is already best-effort. Only share_status (publishing your own Focus
-    // state) is unavailable until re-login.
-    info!(
-        "restore_token_provider: restored SPD (GSA tokens unavailable until re-login)"
-    );
-
-    // PET remains part of persisted payload for compatibility/telemetry.
+    // Proactively refresh the GSA session using persisted credentials.
+    //
+    // This was removed in 0bbb081 on the theory that login_email_pass on
+    // restore always returns NeedsDevice2FA and destructively wipes
+    // account.tokens. In practice, if the call runs while Apple still
+    // considers the session warm (typical path on real Apple hardware with
+    // stable anisette state) it returns LoggedIn with fresh GSA + PET
+    // tokens populated from the SPD response. Without this call the
+    // restored account has ZERO tokens, so the first get_gsa_token("pet")
+    // hits its own auto-refresh path and fails on a now-stale session —
+    // guaranteeing a manual re-2FA every day as Apple's 24h PET lifetime
+    // elapses.
+    //
+    // Non-LoggedIn outcomes are logged and ignored: we're no worse off
+    // than the skip-entirely variant, and the common-case LoggedIn path
+    // is exactly the daily auto-renewal that master relied on.
     let _ = pet;
+    match account.login_email_pass(&username, &hashed_password).await {
+        Ok(icloud_auth::LoginState::LoggedIn) => {
+            info!("restore_token_provider: proactive PET refresh succeeded");
+        }
+        Ok(state) => {
+            warn!(
+                "restore_token_provider: proactive PET refresh returned non-logged-in state: {:?} — manual re-login may be required",
+                state
+            );
+        }
+        Err(err) => {
+            warn!(
+                "restore_token_provider: proactive PET refresh failed (non-fatal): {}",
+                err
+            );
+        }
+    }
 
     let account = Arc::new(rustpush::DebugMutex::new(account));
     let token_provider = TokenProvider::new(account.clone(), os_config.clone());
