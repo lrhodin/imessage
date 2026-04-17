@@ -11,6 +11,8 @@ package connector
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -647,10 +649,13 @@ func fetchDevicesAndPrompt(log zerolog.Logger, tp **rustpushgo.WrappedTokenProvi
 		return devicePasscodeStepForDevice(devs, 0), nil
 	}
 
-	// Multiple devices — let the user choose
+	// Multiple devices — let the user choose. Prefix each label with its
+	// 1-based index so the Matrix bot's login flow (which renders Select
+	// options as a plain list in chat, not as an app dropdown) shows a
+	// clearly numbered picker instead of an ambiguous bullet list.
 	options := make([]string, len(devs))
 	for i, d := range devs {
-		options[i] = formatDeviceLabel(d)
+		options[i] = fmt.Sprintf("%d. %s", i+1, formatDeviceLabel(d))
 	}
 
 	return &bridgev2.LoginStep{
@@ -670,11 +675,21 @@ func fetchDevicesAndPrompt(log zerolog.Logger, tp **rustpushgo.WrappedTokenProvi
 	}, nil
 }
 
-// parseDeviceSelection converts the user's device selection (the label string)
-// back to an index into the devices list.
+// parseDeviceSelection converts the user's device selection back to an index
+// into the devices list. Accepts three forms so the bot's numbered-picker
+// flow works regardless of how the user replies:
+//   - the bare 1-based index (e.g. "2")
+//   - the full numbered label we emitted (e.g. "2. iPhone 15 (iPhone15,2)")
+//   - the raw device label without the prefix (e.g. "iPhone 15 (iPhone15,2)")
 func parseDeviceSelection(selected string, devices []rustpushgo.EscrowDeviceInfo) int {
+	trimmed := strings.TrimSpace(selected)
+	if n, err := strconv.Atoi(trimmed); err == nil && n >= 1 && n <= len(devices) {
+		return n - 1
+	}
 	for i, d := range devices {
-		if formatDeviceLabel(d) == selected {
+		label := formatDeviceLabel(d)
+		numbered := fmt.Sprintf("%d. %s", i+1, label)
+		if trimmed == label || trimmed == numbered {
 			return i
 		}
 	}
