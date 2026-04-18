@@ -1687,6 +1687,55 @@ async fn join_keychain_with_bottles(
     }
 }
 
+/// Shared snapshot/merge body for proactive PET refresh. Used by both
+/// `restore_token_provider` (one-shot at startup) and
+/// `WrappedTokenProvider::refresh_pet_token` (periodic mid-run).
+///
+/// Snapshot `account.tokens` before the call, run `login_email_pass`, then
+/// merge the snapshot back so any token upstream didn't (re)write is
+/// preserved. Upstream's `login_email_pass` can unconditionally overwrite
+/// `self.tokens` when SPD contains a `t` dict (client.rs:776), which on a
+/// non-LoggedIn return path would partially wipe a good token map. The merge
+/// guarantees we never exit with fewer tokens than we entered.
+///
+/// NeedsExtraStep with a populated PET is treated as success (see upstream
+/// LoginSession::finish / client.rs:1039).
+///
+/// Infallible — any auth/network error is logged and swallowed so callers
+/// (especially the periodic tick) can retry on the next cycle.
+async fn refresh_pet_with_snapshot(
+    account: &mut AppleAccount<BridgeDefaultAnisetteProvider>,
+    username: &str,
+    hashed_password: &[u8],
+    context: &str,
+) {
+    let snapshot = std::mem::take(&mut account.tokens);
+    match account.login_email_pass(username, hashed_password).await {
+        Ok(icloud_auth::LoginState::LoggedIn) => {
+            info!("{}: proactive PET refresh succeeded", context);
+        }
+        Ok(state) => {
+            if account.tokens.contains_key("com.apple.gs.idms.pet") {
+                info!(
+                    "{}: PET refresh returned {:?} but PET was populated — treating as success",
+                    context, state
+                );
+            } else {
+                warn!(
+                    "{}: proactive PET refresh returned non-logged-in state: {:?} — manual re-login may be required",
+                    context, state
+                );
+            }
+        }
+        Err(err) => {
+            warn!("{}: proactive PET refresh failed (non-fatal): {}", context, err);
+        }
+    }
+    for (k, v) in snapshot {
+        account.tokens.entry(k).or_insert(v);
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl WrappedTokenProvider {
     /// Get HTTP headers needed for iCloud MobileMe API calls.
@@ -1799,6 +1848,34 @@ impl WrappedTokenProvider {
                 msg: format!("Failed to deserialize MobileMe delegate: {}", e),
             })?;
         *self.mme_delegate_bytes.lock().await = Some(json.into_bytes());
+        Ok(())
+    }
+
+    /// Proactively refresh the GSA/PET session by re-running login_email_pass
+    /// against the stored credentials. Apple's PET lifetime is ~24h; on a
+    /// long-running bridge without restarts, a mid-run refresh prevents the
+    /// session from aging out and forcing a manual 2FA.
+    ///
+    /// Lock scope: holds `self.account` across `login_email_pass` (network
+    /// I/O). This matches upstream's own `TokenProvider::get_token` pattern
+    /// at `icloud-auth/client.rs:338-360` which also holds this lock across
+    /// its auto-refresh `login_email_pass` call. Any concurrent `get_dsid` /
+    /// `get_adsid` / `get_gsa_token` caller briefly waits (typically 1-3s on
+    /// a warm session) once per 12h tick. Not a new contention pattern —
+    /// it's inherent to how upstream serializes access to AppleAccount.
+    ///
+    /// Non-fatal: any failure is logged inside `refresh_pet_with_snapshot`
+    /// and swallowed so the Go-side caller treats an Err return as "try
+    /// again next tick" rather than a hard failure.
+    pub async fn refresh_pet_token(&self) -> Result<(), WrappedError> {
+        let mut account = self.account.lock().await;
+        let username = account.username.clone().ok_or(WrappedError::GenericError {
+            msg: "refresh_pet_token: account has no username".into(),
+        })?;
+        let hashed_password = account.hashed_password.clone().ok_or(WrappedError::GenericError {
+            msg: "refresh_pet_token: account has no hashed_password".into(),
+        })?;
+        refresh_pet_with_snapshot(&mut account, &username, &hashed_password, "refresh_pet_token").await;
         Ok(())
     }
 }
@@ -2054,47 +2131,10 @@ pub async fn restore_token_provider(
     // guaranteeing a manual re-2FA every day as Apple's 24h PET lifetime
     // elapses.
     //
-    // Non-LoggedIn outcomes are logged and ignored: we're no worse off
-    // than the skip-entirely variant, and the common-case LoggedIn path
-    // is exactly the daily auto-renewal that master relied on.
-    //
-    // Snapshot/restore guard: upstream writes `self.tokens = keys`
-    // unconditionally when SPD contains a `t` dict (client.rs:776), which
-    // could partially overwrite a populated token map on a non-LoggedIn
-    // return. On the restore path tokens start empty so the snapshot is
-    // typically empty, but merging snapshot entries that upstream didn't
-    // (re)write guarantees we never exit this call with fewer tokens
-    // than we went in with. NeedsExtraStep with populated PET is treated
-    // as success (see LoginSession::finish and upstream client.rs:1039).
+    // Shared snapshot/merge body with the periodic mid-run refresh path —
+    // see `refresh_pet_with_snapshot` above for the guard rationale.
     let _ = pet;
-    let snapshot = std::mem::take(&mut account.tokens);
-    match account.login_email_pass(&username, &hashed_password).await {
-        Ok(icloud_auth::LoginState::LoggedIn) => {
-            info!("restore_token_provider: proactive PET refresh succeeded");
-        }
-        Ok(state) => {
-            if account.tokens.contains_key("com.apple.gs.idms.pet") {
-                info!(
-                    "restore_token_provider: PET refresh returned {:?} but PET was populated — treating as success",
-                    state
-                );
-            } else {
-                warn!(
-                    "restore_token_provider: proactive PET refresh returned non-logged-in state: {:?} — manual re-login may be required",
-                    state
-                );
-            }
-        }
-        Err(err) => {
-            warn!(
-                "restore_token_provider: proactive PET refresh failed (non-fatal): {}",
-                err
-            );
-        }
-    }
-    for (k, v) in snapshot {
-        account.tokens.entry(k).or_insert(v);
-    }
+    refresh_pet_with_snapshot(&mut account, &username, &hashed_password, "restore_token_provider").await;
 
     let account = Arc::new(rustpush::DebugMutex::new(account));
     let token_provider = TokenProvider::new(account.clone(), os_config.clone());
@@ -7017,6 +7057,27 @@ impl Client {
 // Plain (non-FFI) impl for internal helpers that use upstream rustpush types
 // (MessageInst, SendJob, PushError) not safe to cross the uniffi boundary.
 impl Client {
+    /// Force-refresh the MobileMe delegate and clear the cached CloudKit
+    /// clients. Call this when a CloudKit sync fails with TokenMissing:
+    /// the seeded delegate is missing the token CloudKit needs (typically
+    /// `cloudKitToken`), and upstream's get_mme_token only auto-refreshes
+    /// after a week of staleness. Without an explicit refresh here the
+    /// bridge gets permanently stuck on a partial delegate until that week
+    /// elapses.
+    ///
+    /// Internal helper: not exposed via FFI. All call sites are inside
+    /// this crate's Client impls.
+    async fn refresh_mme_and_reset_cloud_client(&self) {
+        if let Some(tp) = &self.token_provider {
+            if let Err(e) = tp.inner.refresh_mme().await {
+                warn!("refresh_mme failed during cloud-client recovery: {}", e);
+            } else {
+                info!("Cloud client recovery: refreshed MobileMe delegate");
+            }
+        }
+        self.reset_cloud_client().await;
+    }
+
     /// Retry client.send on PushError::SendTimedOut, reusing the same
     /// MessageInst (and therefore the same UUID) across attempts. A timed-out
     /// send may have already reached Apple; if we retry with a fresh
@@ -7070,24 +7131,6 @@ impl Client {
         if let Some(tp) = &self.token_provider {
             let _ = tp.inner.refresh_mme().await;
         }
-    }
-
-    /// Force-refresh the MobileMe delegate and clear the cached CloudKit
-    /// clients. Call this when a CloudKit sync fails with TokenMissing:
-    /// the seeded delegate is missing the token CloudKit needs (typically
-    /// `cloudKitToken`), and upstream's get_mme_token only auto-refreshes
-    /// after a week of staleness. Without an explicit refresh here the
-    /// bridge gets permanently stuck on a partial delegate until that week
-    /// elapses.
-    async fn refresh_mme_and_reset_cloud_client(&self) {
-        if let Some(tp) = &self.token_provider {
-            if let Err(e) = tp.inner.refresh_mme().await {
-                warn!("refresh_mme failed during cloud-client recovery: {}", e);
-            } else {
-                info!("Cloud client recovery: refreshed MobileMe delegate");
-            }
-        }
-        self.reset_cloud_client().await;
     }
 
     /// Initialize the StatusKit presence system. Must be called after login

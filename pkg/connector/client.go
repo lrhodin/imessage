@@ -946,6 +946,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 			done <- c.client.InitStatuskit(c)
 		}()
 		subscribeAfterInit := func(err error) {
+			// Guard against Disconnect having nil'd c.client during the
+			// init window (e.g. bridge shutdown or reconnect cycle while
+			// InitStatuskit was still running past its 30s timeout).
+			if c.client == nil {
+				return
+			}
 			// Registration state is independent of StatusKit init — log it
 			// unconditionally so we can see MULTIPLEX presence even when
 			// init fails. If MULTIPLEX is absent, key exchange cannot work
@@ -1012,6 +1018,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	c.stopChan = make(chan struct{})
 	c.msgBuffer = &messageBuffer{client: c}
 	go c.periodicStateSave(log)
+	go c.periodicPetRefresh(log)
 	go c.periodicStatusSharingReinvite(log)
 	go c.startSharedStreamsWatcher(log)
 
@@ -7610,6 +7617,54 @@ func (c *IMClient) periodicStateSave(log zerolog.Logger) {
 		case <-c.stopChan:
 			c.persistState(log)
 			log.Debug().Msg("Final state save on disconnect")
+			return
+		}
+	}
+}
+
+// safeRefreshPetToken wraps RefreshPetToken with panic recovery and a 60s
+// timeout. Uniffi turns Rust panics into Go panics; without recovery a single
+// anisette or network hiccup could crash the bridge from a best-effort
+// background refresh. The timeout prevents an anisette-poisoned tokio mutex
+// (see project memory) from blocking the goroutine indefinitely.
+func safeRefreshPetToken(tp *rustpushgo.WrappedTokenProvider) error {
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("RefreshPetToken panicked: %v", r)
+			}
+		}()
+		done <- tp.RefreshPetToken()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(60 * time.Second):
+		return fmt.Errorf("RefreshPetToken timed out after 60s")
+	}
+}
+
+// periodicPetRefresh proactively re-runs login_email_pass every 12h so the
+// GSA/PET session never ages past Apple's ~24h lifetime. Closes the gap that
+// restore_token_provider only covers at startup: a bridge running continuously
+// for >24h would otherwise rely on upstream's on-demand auto-refresh, which
+// fails with NeedsDevice2FA once Apple has aged out the session.
+func (c *IMClient) periodicPetRefresh(log zerolog.Logger) {
+	ticker := time.NewTicker(12 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if c.tokenProvider == nil || *c.tokenProvider == nil {
+				continue
+			}
+			if err := safeRefreshPetToken(*c.tokenProvider); err != nil {
+				log.Warn().Err(err).Msg("Periodic PET refresh failed")
+			} else {
+				log.Debug().Msg("Periodic PET refresh completed")
+			}
+		case <-c.stopChan:
 			return
 		}
 	}

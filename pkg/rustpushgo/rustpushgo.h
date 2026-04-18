@@ -1124,6 +1124,11 @@ void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_join_keychain_clique_for_
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_refresh_pet_token(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_seed_mme_delegate_json(
 	void* ptr,
 	RustBuffer json,
@@ -2145,6 +2150,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_cl
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_clique_for_device(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_refresh_pet_token(
 	RustCallStatus* out_status
 );
 
