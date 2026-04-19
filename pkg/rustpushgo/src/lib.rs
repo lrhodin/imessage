@@ -7257,14 +7257,12 @@ impl Client {
                 // If the PET slot is still empty after refresh, Apple is
                 // blocking us (most commonly NeedsDevice2FA). Set the cooldown
                 // so subsequent CloudKit TokenMissing retries don't redo SRP.
+                // We can't inspect the FetchedToken's expiration (private
+                // field) — presence alone is a good proxy because
+                // login_email_pass only writes the map on success.
                 let pet_present = {
                     let account = tp.account.lock().await;
                     account.tokens.contains_key("com.apple.gs.idms.pet")
-                        && account
-                            .tokens
-                            .get("com.apple.gs.idms.pet")
-                            .map(|t| t.expiration.elapsed().is_err())
-                            .unwrap_or(false)
                 };
                 if !pet_present {
                     PET_REFRESH_STUCK_UNTIL_MS
