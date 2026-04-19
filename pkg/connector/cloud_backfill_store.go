@@ -1423,6 +1423,38 @@ func (s *cloudBackfillStore) hasChatBatch(ctx context.Context, chatIDs []string)
 	return existing, nil
 }
 
+// getAttachmentRecordName returns the CloudKit record_name for a single
+// attachment of a message, looked up by (message_guid, att_index). Returns
+// empty string + nil error if the cloud_message row or its attachments_json
+// hasn't been ingested yet (CloudKit sync may still be catching up on the
+// live APNs-delivered message). Used by the AttachmentRetrier as a fallback
+// when the MMCS URL retry exhausts — if CloudKit has the record, the retrier
+// can download via safeCloudDownloadAttachment instead.
+func (s *cloudBackfillStore) getAttachmentRecordName(ctx context.Context, msgGUID string, attIndex int) (string, error) {
+	var attsJSON string
+	err := s.db.QueryRow(ctx,
+		`SELECT COALESCE(attachments_json, '') FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+		s.loginID, msgGUID,
+	).Scan(&attsJSON)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	if attsJSON == "" {
+		return "", nil
+	}
+	var atts []cloudAttachmentRow
+	if err := json.Unmarshal([]byte(attsJSON), &atts); err != nil {
+		return "", fmt.Errorf("unmarshal attachments_json for %s: %w", msgGUID, err)
+	}
+	if attIndex < 0 || attIndex >= len(atts) {
+		return "", nil
+	}
+	return atts[attIndex].RecordName, nil
+}
+
 func (s *cloudBackfillStore) getChatParticipantsByPortalID(ctx context.Context, portalID string) ([]string, error) {
 	var participantsJSON string
 	err := s.db.QueryRow(ctx,

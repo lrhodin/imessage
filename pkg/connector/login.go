@@ -854,6 +854,7 @@ func completeLoginWithMeta(
 		contactsReadyCh:         make(chan struct{}),
 		cloudStore:              newCloudBackfillStore(main.Bridge.DB.Database, loginID),
 		sharedProfileStore:      newSharedProfileStore(main.Bridge.DB.Database, loginID),
+		pendingAttachments:      newPendingAttachmentStore(main.Bridge.DB.Database, loginID),
 		fordCache:               NewFordKeyCache(),
 		recentUnsends:           make(map[string]time.Time),
 		recentOutboundUnsends:   make(map[string]time.Time),

@@ -321,6 +321,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		contactsReadyCh:         make(chan struct{}),
 		cloudStore:              newCloudBackfillStore(c.Bridge.DB.Database, login.ID),
 		sharedProfileStore:      newSharedProfileStore(c.Bridge.DB.Database, login.ID),
+		pendingAttachments:      newPendingAttachmentStore(c.Bridge.DB.Database, login.ID),
 		fordCache:               NewFordKeyCache(),
 		recentUnsends:           make(map[string]time.Time),
 		recentOutboundUnsends:   make(map[string]time.Time),

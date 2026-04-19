@@ -204,6 +204,14 @@ type IMClient struct {
 	// Cloud backfill local cache store.
 	cloudStore *cloudBackfillStore
 
+	// Layer-2 MMCS attachment recovery: persists descriptors for attachments
+	// whose push-time download exhausted the rustpushgo retry (Layer 1).
+	// AttachmentRetrier drains this on a timer with its own longer-horizon
+	// backoff (30s → 2m → 10m → 30m → 1h → 6h) and falls back to CloudKit
+	// if the MMCS URL has expired. See pending_attachment_store.go +
+	// attachment_retrier.go.
+	pendingAttachments *pendingAttachmentStore
+
 	// Ford key cache — reimplementation of the 94f7b8e Ford cross-batch
 	// deduplication fix in Go. Populated aggressively during CloudKit
 	// attachment sync from every record's `lqa.protection_info` (and
@@ -1035,6 +1043,17 @@ func (c *IMClient) Connect(ctx context.Context) {
 		// the share-profile path (it only depends on ProfilesClient /
 		// keychain init, not on contacts).
 		go c.refreshSharedProfilesOnConnect(log)
+	}
+
+	// Ensure Layer-2 MMCS attachment retry schema and spawn the background
+	// worker. The worker is cheap when the queue is empty (one DB SELECT per
+	// tick) so running it unconditionally matches the shared_profiles pattern.
+	if c.pendingAttachments != nil {
+		if err := c.pendingAttachments.ensureSchema(context.Background()); err != nil {
+			log.Warn().Err(err).Msg("Failed to ensure pending_attachment_retry schema")
+		} else {
+			go (&attachmentRetrier{Client: c}).Run(c.stopChan)
+		}
 	}
 
 	// Ensure CloudKit backfill schema/storage is available.
@@ -2315,6 +2334,18 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Data: attMsg,
 			ID:   makeMessageID(attID),
 			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
+				// Layer-2 MMCS retry enqueue: when download_mmcs_attachments
+				// (pkg/rustpushgo/src/lib.rs) exhausts the Layer-1 retries,
+				// it leaves the attachment non-inline with no bytes but
+				// keeps the MMCS descriptor JSON. Record that shape so the
+				// background retrier can replay the download later and edit
+				// the notice placeholder into the real m.image/m.video.
+				if data.Attachment != nil && !data.Attachment.IsInline &&
+					data.Attachment.InlineData == nil &&
+					data.Attachment.MmcsDescriptorJson != nil &&
+					*data.Attachment.MmcsDescriptorJson != "" {
+					c.enqueuePendingMMCSRecovery(ctx, portal, data)
+				}
 				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
 			},
 		})
