@@ -2118,23 +2118,43 @@ pub async fn restore_token_provider(
 
     account.spd = Some(spd);
 
-    // Proactively refresh the GSA session using persisted credentials.
+    // Inject the persisted PET into account.tokens with an already-expired
+    // timestamp. Byte-for-byte port of the master-branch restore path
+    // (master's pkg/rustpushgo/src/lib.rs line 805).
     //
-    // This was removed in 0bbb081 on the theory that login_email_pass on
-    // restore always returns NeedsDevice2FA and destructively wipes
-    // account.tokens. In practice, if the call runs while Apple still
-    // considers the session warm (typical path on real Apple hardware with
-    // stable anisette state) it returns LoggedIn with fresh GSA + PET
-    // tokens populated from the SPD response. Without this call the
-    // restored account has ZERO tokens, so the first get_gsa_token("pet")
-    // hits its own auto-refresh path and fails on a now-stale session —
-    // guaranteeing a manual re-2FA every day as Apple's 24h PET lifetime
-    // elapses.
+    // Why: upstream's `get_token` short-circuits and returns None when
+    // `tokens.is_empty() == false` AND the requested key is absent. So if
+    // we leave tokens empty OR populate it without the PET key, the first
+    // `get_gsa_token("com.apple.gs.idms.pet")` call either takes a
+    // corner-case path or returns None immediately. Neither gives upstream
+    // the opportunity to auto-refresh via `login_email_pass`.
     //
-    // Shared snapshot/merge body with the periodic mid-run refresh path —
-    // see `refresh_pet_with_snapshot` above for the guard rationale.
-    let _ = pet;
-    refresh_pet_with_snapshot(&mut account, &username, &hashed_password, "restore_token_provider").await;
+    // With an expired PET entry present, `get_token`'s expiration check
+    // fires (`data.expiration.elapsed().is_err()` → false → has_valid_token
+    // false), it enters the auto-refresh branch, calls `login_email_pass`
+    // with the persisted credentials, and — assuming Apple still trusts
+    // the device via consistent anisette state — returns LoggedIn with
+    // fresh GSA/HB/PET tokens populated from the SPD response. No 2FA.
+    //
+    // The 0bbb081 commit that removed this trick said "FetchedToken has
+    // private fields so we cannot reconstruct tokens from the persisted
+    // SPD" — that was accurate against raw OpenBubbles upstream but no
+    // longer applies, because the Makefile's `ensure-rustpush-source`
+    // target now sed-patches `pub token`/`pub expiration` onto
+    // `FetchedToken` alongside the existing `pub mod activation; pub mod
+    // ids;` visibility bumps. See Makefile:208-217.
+    //
+    // This is the PRIMARY fix for the daily-auth-breaks-at-24h regression
+    // that appeared after the refactor migration to raw OpenBubbles and
+    // was never fully restored by the subsequent periodic-refresh commits
+    // (66d6402, bdd4ebe).
+    account.tokens.insert(
+        "com.apple.gs.idms.pet".to_string(),
+        icloud_auth::FetchedToken {
+            token: pet,
+            expiration: std::time::UNIX_EPOCH,
+        },
+    );
 
     let account = Arc::new(rustpush::DebugMutex::new(account));
     let token_provider = TokenProvider::new(account.clone(), os_config.clone());

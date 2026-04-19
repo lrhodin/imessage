@@ -209,6 +209,14 @@ ensure-rustpush-source:
 			echo "Making rustpush ids module public (needed by FT RespondedElsewhere overlay)..."; \
 			sed -i.bak 's/^mod ids;/pub mod ids;/' $(RUSTPUSH_DIR)/src/lib.rs && rm -f $(RUSTPUSH_DIR)/src/lib.rs.bak; \
 		fi; \
+		if grep -q '^    token: String,$$' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs 2>/dev/null; then \
+			echo "Making FetchedToken.token pub (needed to replay persisted PET on session restore)..."; \
+			sed -i.bak 's/^    token: String,$$/    pub token: String,/' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs && rm -f $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs.bak; \
+		fi; \
+		if grep -q '^    expiration: SystemTime,$$' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs 2>/dev/null; then \
+			echo "Making FetchedToken.expiration pub..."; \
+			sed -i.bak 's/^    expiration: SystemTime,$$/    pub expiration: SystemTime,/' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs && rm -f $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs.bak; \
+		fi; \
 	fi
 
 # `ensure-rustpush-source` is an order-only prereq (the `|` separator):
