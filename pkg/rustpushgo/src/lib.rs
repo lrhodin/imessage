@@ -4910,21 +4910,76 @@ async fn download_mmcs_attachments(
     }
 }
 
-/// Download one MMCS attachment via the wrapper-level path:
-/// APNs auth handshake → manual V1+V2 Ford-capable chunk decode →
-/// iMessage outer AES-256-CTR unwrap.
+/// Download one MMCS attachment via the wrapper-level path, with bounded
+/// retries on transient failures.
+///
+/// Upstream's `send_message` (aps.rs:1319) schedules a connection reload via
+/// `do_reload()` whenever its 15-second ack wait times out (aps.rs:1349). The
+/// caller is expected to retry so the reloaded connection can serve the next
+/// attempt — not retrying is what made the first transient APNs blip fatal.
+///
+/// Retries: 3 attempts total with 500 ms / 1 s / 2 s backoff between them.
+/// Only genuinely transient errors retry; Ford SIV mismatches, chunk OOB, and
+/// decode errors return immediately.
+async fn download_one_mmcs_attachment(
+    mmcs: &rustpush::MMCSFile,
+    conn: &rustpush::APSConnectionResource,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        match download_one_mmcs_attachment_once(mmcs, conn, name).await {
+            Ok(bytes) => {
+                if attempt > 1 {
+                    info!(
+                        "MMCS download succeeded for {} on attempt {}/{}",
+                        name, attempt, MAX_ATTEMPTS
+                    );
+                }
+                return Ok(bytes);
+            }
+            Err(e) => {
+                let transient = e.contains("Send timeout")
+                    || e.contains("try again")
+                    || e.contains("APNs wait_for_timeout")
+                    || e.contains("connection")
+                    || e.contains("container fetch")
+                    || e.contains("HTTP");
+                if !transient || attempt == MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                warn!(
+                    "MMCS download attempt {}/{} for {} failed: {} — retrying",
+                    attempt, MAX_ATTEMPTS, name, e
+                );
+                last_err = e;
+                // Backoff 500 ms, 1 s, 2 s — gives upstream's do_reload()
+                // time to re-establish the APS connection between tries.
+                let backoff_ms = 500u64 * (1u64 << (attempt - 1));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+    Err(format!(
+        "MMCS download exhausted {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    ))
+}
+
+/// One attempt of the MMCS download pipeline: APNs auth handshake → manual
+/// V1+V2 Ford-capable chunk decode → iMessage outer AES-256-CTR unwrap.
 ///
 /// Equivalent to upstream's `MMCSFile::get_attachment` but bypasses the
 /// panicking `get_mmcs` call at its tail.
 ///
-/// iMessage MMCS differs from CloudKit MMCS in one important way: the
-/// file bytes are additionally wrapped in an `IMessageContainer` layer
-/// (AES-256-CTR with `MMCSFile.key` and a zero nonce). Upstream handles
-/// this by passing a `WriteContainer` impl through to `get_mmcs` that
-/// decrypts during chunk writes. Since our manual path returns the
-/// assembled chunk plaintext without that hook, we apply the outer
-/// unwrap here as a post-processing step.
-async fn download_one_mmcs_attachment(
+/// iMessage MMCS differs from CloudKit MMCS in one important way: the file
+/// bytes are additionally wrapped in an `IMessageContainer` layer (AES-256-CTR
+/// with `MMCSFile.key` and a zero nonce). Upstream handles this by passing a
+/// `WriteContainer` impl through to `get_mmcs` that decrypts during chunk
+/// writes. Since our manual path returns the assembled chunk plaintext without
+/// that hook, we apply the outer unwrap here as a post-processing step.
+async fn download_one_mmcs_attachment_once(
     mmcs: &rustpush::MMCSFile,
     conn: &rustpush::APSConnectionResource,
     name: &str,
