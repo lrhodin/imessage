@@ -7197,24 +7197,95 @@ impl Client {
     ///
     /// Internal helper: not exposed via FFI. All call sites are inside this
     /// crate's Client impls.
+    ///
+    /// Rate limiting: `refresh_pet_token` hits Apple's GSA SRP endpoint
+    /// (`login_email_pass`). CloudKit's caller loop can retry this helper
+    /// many times per minute when Apple rejects the session. Without a
+    /// circuit breaker we'd hammer Apple's auth endpoint at dozens of
+    /// SRP handshakes per minute, which is exactly the pattern Apple's
+    /// anti-abuse flags as credential stuffing — risk of account lockout.
+    ///
+    /// Two guards:
+    ///   * `LAST_PET_REFRESH_MS`: global min-interval. Skip if a PET
+    ///     refresh attempt happened in the last 60 s.
+    ///   * `PET_REFRESH_STUCK_UNTIL_MS`: set to a future timestamp when
+    ///     Apple returns `NeedsDevice2FA`. Further refresh calls no-op
+    ///     until the cooldown elapses (1 h) or the process restarts.
+    ///     Without this, every CloudKit retry triggers a fresh SRP attempt
+    ///     knowing full well Apple is going to demand 2FA again.
     async fn refresh_mme_and_reset_cloud_client(&self) {
+        use std::sync::atomic::AtomicU64;
+
+        static LAST_PET_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
+        static PET_REFRESH_STUCK_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+        const MIN_INTERVAL_MS: u64 = 60_000;
+        const STUCK_COOLDOWN_MS: u64 = 60 * 60 * 1000; // 1 h
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
         if let Some(tp) = &self.token_provider {
-            // Step 1: fresh PET from Apple via stored credentials. Infallible
-            // per refresh_pet_with_snapshot's docstring; any auth/network
-            // error is logged and swallowed so step 2 still runs with
-            // whatever's in memory (matches pre-fix behavior in the worst
-            // case).
-            if let Err(e) = tp.refresh_pet_token().await {
-                warn!("refresh_pet_token before MME refresh failed: {:?}", e);
+            let stuck_until = PET_REFRESH_STUCK_UNTIL_MS.load(Ordering::Relaxed);
+            let last = LAST_PET_REFRESH_MS.load(Ordering::Relaxed);
+            let skip_pet = now_ms < stuck_until || now_ms.saturating_sub(last) < MIN_INTERVAL_MS;
+
+            if skip_pet {
+                if now_ms < stuck_until {
+                    warn!(
+                        "Skipping refresh_pet_token: Apple returned NeedsDevice2FA recently; \
+                         cooldown active for {}s more (manual re-login required)",
+                        (stuck_until - now_ms) / 1000
+                    );
+                } else {
+                    info!(
+                        "Skipping refresh_pet_token: last attempt {}s ago; min interval {}s",
+                        now_ms.saturating_sub(last) / 1000,
+                        MIN_INTERVAL_MS / 1000
+                    );
+                }
+            } else {
+                LAST_PET_REFRESH_MS.store(now_ms, Ordering::Relaxed);
+                // Detect NeedsDevice2FA by inspecting the account state after the
+                // refresh call. refresh_pet_token is infallible by design
+                // (swallows errors), so we can't rely on its return — we have to
+                // look at the resulting token map.
+                if let Err(e) = tp.refresh_pet_token().await {
+                    warn!("refresh_pet_token before MME refresh failed: {:?}", e);
+                }
+                // If the PET slot is still empty after refresh, Apple is
+                // blocking us (most commonly NeedsDevice2FA). Set the cooldown
+                // so subsequent CloudKit TokenMissing retries don't redo SRP.
+                let pet_present = {
+                    let account = tp.account.lock().await;
+                    account.tokens.contains_key("com.apple.gs.idms.pet")
+                        && account
+                            .tokens
+                            .get("com.apple.gs.idms.pet")
+                            .map(|t| t.expiration.elapsed().is_err())
+                            .unwrap_or(false)
+                };
+                if !pet_present {
+                    PET_REFRESH_STUCK_UNTIL_MS
+                        .store(now_ms + STUCK_COOLDOWN_MS, Ordering::Relaxed);
+                    warn!(
+                        "PET refresh produced no valid PET — engaging {}m cooldown to \
+                         avoid hammering Apple auth (manual re-login likely required)",
+                        STUCK_COOLDOWN_MS / 60_000
+                    );
+                }
             }
-            // Step 2: MME delegate refresh. Now the PET should be present.
+
+            // Always attempt refresh_mme — it's a cheap MobileMe call that
+            // uses whatever PET is currently in memory. If nothing changed
+            // it'll just log the same Token missing warning once.
             if let Err(e) = tp.inner.refresh_mme().await {
                 warn!("refresh_mme failed during cloud-client recovery: {}", e);
             } else {
-                info!("Cloud client recovery: refreshed PET + MobileMe delegate");
+                info!("Cloud client recovery: refreshed MobileMe delegate");
             }
         }
-        // Step 3: drop cached clients so the next get_or_init_* sees the new delegate.
         self.reset_cloud_client().await;
     }
 
