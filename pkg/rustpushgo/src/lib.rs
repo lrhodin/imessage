@@ -2338,6 +2338,57 @@ pub struct WrappedAttachment {
     pub inline_data: Option<Vec<u8>>,
     /// True for Live Photo attachments (Apple's "iris" flag).
     pub iris: bool,
+    /// Serialized MMCS descriptor JSON for non-inline attachments; None for
+    /// inline attachments and rich-link sidebands. The Go-side
+    /// AttachmentRetrier persists this alongside a pending row so it can
+    /// re-invoke the download later via retry_mmcs_from_descriptor without
+    /// needing the original MessageInst to still be in memory. See
+    /// MmcsDescriptor below.
+    pub mmcs_descriptor_json: Option<String>,
+}
+
+/// Serializable handle for a rustpush MMCSFile. Persisted by Go so the
+/// background AttachmentRetrier can reconstruct the handle and call
+/// download_one_mmcs_attachment against a freshly healthy APNs connection.
+/// Binary fields are base64-encoded so the JSON round-trips through SQLite
+/// without escaping headaches.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct MmcsDescriptor {
+    url: String,
+    object: String,
+    signature_b64: String,
+    key_b64: String,
+    size: usize,
+}
+
+impl MmcsDescriptor {
+    fn from_file(mmcs: &rustpush::MMCSFile) -> Self {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        Self {
+            url: mmcs.url.clone(),
+            object: mmcs.object.clone(),
+            signature_b64: STANDARD.encode(&mmcs.signature),
+            key_b64: STANDARD.encode(&mmcs.key),
+            size: mmcs.size,
+        }
+    }
+
+    fn to_file(&self) -> Result<rustpush::MMCSFile, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let signature = STANDARD
+            .decode(&self.signature_b64)
+            .map_err(|e| format!("decode signature_b64: {e}"))?;
+        let key = STANDARD
+            .decode(&self.key_b64)
+            .map_err(|e| format!("decode key_b64: {e}"))?;
+        Ok(rustpush::MMCSFile {
+            url: self.url.clone(),
+            object: self.object.clone(),
+            signature,
+            key,
+            size: self.size,
+        })
+    }
 }
 
 /// Result of fetching a shared iMessage profile (Name & Photo Sharing).
@@ -3642,10 +3693,17 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
 
             for indexed_part in &normal.parts.0 {
                 if let MessagePart::Attachment(att) = &indexed_part.part {
-                    let (is_inline, inline_data, size) = match &att.a_type {
-                        AttachmentType::Inline(data) => (true, Some(data.clone()), data.len() as u64),
-                        AttachmentType::MMCS(mmcs) => (false, None, mmcs.size as u64),
-                    };
+                    let (is_inline, inline_data, size, mmcs_descriptor_json) =
+                        match &att.a_type {
+                            AttachmentType::Inline(data) => {
+                                (true, Some(data.clone()), data.len() as u64, None)
+                            }
+                            AttachmentType::MMCS(mmcs) => {
+                                let descriptor = MmcsDescriptor::from_file(mmcs);
+                                let json = serde_json::to_string(&descriptor).ok();
+                                (false, None, mmcs.size as u64, json)
+                            }
+                        };
                     w.attachments.push(WrappedAttachment {
                         mime_type: att.mime.clone(),
                         filename: att.name.clone(),
@@ -3654,6 +3712,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                         is_inline,
                         inline_data,
                         iris: att.iris,
+                        mmcs_descriptor_json,
                     });
                 }
             }
@@ -3693,6 +3752,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                     is_inline: true,
                     inline_data: Some(meta.into_bytes()),
                     iris: false,
+                    mmcs_descriptor_json: None,
                 });
 
                 // Image data (from image or icon)
@@ -3715,6 +3775,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                         is_inline: true,
                         inline_data: Some(img_data),
                         iris: false,
+                        mmcs_descriptor_json: None,
                     });
                 }
             }
@@ -7177,6 +7238,32 @@ impl Client {
         *self.cloud_messages_client.lock().await = None;
         *self.cloud_keychain_client.lock().await = None;
         *self.profiles_client.lock().await = None;
+    }
+
+    /// Retry an MMCS attachment download from a previously-captured descriptor
+    /// blob. Called by the Go-side AttachmentRetrier when a push-time download
+    /// failed and the queued row is due for another attempt. Internally reuses
+    /// download_one_mmcs_attachment so the Layer-1 3-attempt retry with
+    /// exponential backoff applies to each invocation.
+    pub async fn retry_mmcs_from_descriptor(
+        &self,
+        descriptor_json: String,
+        name: String,
+    ) -> Result<Vec<u8>, WrappedError> {
+        let descriptor: MmcsDescriptor =
+            serde_json::from_str(&descriptor_json).map_err(|e| WrappedError::GenericError {
+                msg: format!("retry_mmcs_from_descriptor: decode descriptor JSON: {e}"),
+            })?;
+        let mmcs = descriptor
+            .to_file()
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("retry_mmcs_from_descriptor: rebuild MMCSFile: {e}"),
+            })?;
+        download_one_mmcs_attachment(&mmcs, &self.conn, &name)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("retry_mmcs_from_descriptor {name}: {e}"),
+            })
     }
 
     /// Reset the cached Shared Streams client and force-refresh the MME

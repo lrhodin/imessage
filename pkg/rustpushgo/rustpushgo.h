@@ -301,6 +301,13 @@ void* uniffi_rustpushgo_fn_method_client_restore_cloud_chat(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_retry_mmcs_from_descriptor(
+	void* ptr,
+	RustBuffer descriptor_json,
+	RustBuffer name,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_send_attachment(
 	void* ptr,
 	RustBuffer conversation,
@@ -1714,6 +1721,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_resolve_handle_cached(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_restore_cloud_chat(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_retry_mmcs_from_descriptor(
 	RustCallStatus* out_status
 );
 
