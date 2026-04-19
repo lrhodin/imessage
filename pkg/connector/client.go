@@ -211,6 +211,7 @@ type IMClient struct {
 	// if the MMCS URL has expired. See pending_attachment_store.go +
 	// attachment_retrier.go.
 	pendingAttachments *pendingAttachmentStore
+	retrierOnce        sync.Once
 
 	// Ford key cache — reimplementation of the 94f7b8e Ford cross-batch
 	// deduplication fix in Go. Populated aggressively during CloudKit
@@ -1048,11 +1049,16 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// Ensure Layer-2 MMCS attachment retry schema and spawn the background
 	// worker. The worker is cheap when the queue is empty (one DB SELECT per
 	// tick) so running it unconditionally matches the shared_profiles pattern.
+	// sync.Once guards against Connect being re-invoked (reconnect, relogin,
+	// session restore) — two retrier goroutines on the same table would race
+	// on GetDue and emit duplicate edits for the same attachment.
 	if c.pendingAttachments != nil {
 		if err := c.pendingAttachments.ensureSchema(context.Background()); err != nil {
 			log.Warn().Err(err).Msg("Failed to ensure pending_attachment_retry schema")
 		} else {
-			go (&attachmentRetrier{Client: c}).Run(c.stopChan)
+			c.retrierOnce.Do(func() {
+				go (&attachmentRetrier{Client: c}).Run(c.stopChan)
+			})
 		}
 	}
 

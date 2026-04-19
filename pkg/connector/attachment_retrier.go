@@ -418,12 +418,26 @@ func (c *IMClient) enqueuePendingMMCSRecovery(ctx context.Context, portal *bridg
 		AttemptCount:   0,
 		NextAttemptAt:  now.Add(attachmentRetrierBackoff(1)),
 	}
-	if err := c.pendingAttachments.Insert(ctx, row); err != nil {
-		zerolog.Ctx(ctx).Err(err).
+	// Bounded retry on transient DB failures (SQLITE_BUSY, locked). A failed
+	// Insert means the notice placeholder ships but nothing will ever edit it
+	// into the real attachment, so make a best effort before giving up.
+	var insertErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		insertErr = c.pendingAttachments.Insert(ctx, row)
+		if insertErr == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+	}
+	if insertErr != nil {
+		zerolog.Ctx(ctx).Err(insertErr).
 			Str("msg_guid", attMsg.Uuid).
 			Int("att_index", attMsg.Index).
 			Str("file", att.Filename).
-			Msg("Failed to enqueue MMCS attachment for background retry")
+			Msg("Failed to enqueue MMCS attachment for background retry (notice will stick)")
 		return
 	}
 	zerolog.Ctx(ctx).Info().
