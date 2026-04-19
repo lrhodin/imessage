@@ -18,12 +18,11 @@ REM     * MSVC compiler/linker in PATH
 REM     * LIB/INCLUDE pointing at MSVC + Windows SDK
 REM     * Cargo, uniffi-bindgen-go, python3, protoc, clang all on PATH
 REM     * LIBCLANG_PATH set for bindgen
-REM     * CARGO_TARGET_DIR redirected outside Dropbox
 REM
-REM Requires one-time installs (the script auto-installs anything missing on
-REM first run; subsequent runs detect and skip).
+REM Requires one-time installs (the script auto-installs uniffi-bindgen-go on
+REM first run; everything else is installed via winget).
 REM
-REM Prerequisite packages (via winget):
+REM Prerequisite packages (install once via winget):
 REM     winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 REM     winget install --id Microsoft.WindowsSDK.10.0.26100
 REM     winget install --id Rustlang.Rustup
@@ -33,10 +32,14 @@ REM     winget install --id Python.Python.3.12              (unicorn-engine + pa
 REM     winget install --id Google.Protobuf                 (cloudkit-proto build uses protoc)
 REM     winget install --id LLVM.LLVM                       (bindgen in unicorn-engine-sys needs libclang)
 REM
-REM CARGO_TARGET_DIR override: this repo lives under Dropbox, which races with
-REM cargo's build outputs and causes `os error 32: file in use` failures on
-REM openssl-sys and similar native builds. Redirecting the target dir to a
-REM path outside Dropbox eliminates the race entirely.
+REM Note: if your build output directory (target/) sits on a filesystem that
+REM races with other processes on write (cloud-sync folders, aggressive
+REM antivirus real-time scanners), cargo may emit `os error 32: file in use`
+REM on intermediate openssl-sys files. The fix is to set CARGO_TARGET_DIR to
+REM an unsynced/unscanned path before running cargo — e.g.
+REM `set CARGO_TARGET_DIR=C:\cargo-target\imessage` in your shell. This script
+REM does NOT set CARGO_TARGET_DIR by default; the cargo default (in-tree
+REM `target/`) is what the Makefile expects.
 
 REM Prepend the VS Installer dir so vcvarsall can find vswhere.
 set "PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%"
@@ -57,10 +60,6 @@ set "PATH=C:\Program Files\CMake\bin;C:\Program Files\Python312;C:\Users\%USERNA
 
 REM bindgen (used by unicorn-engine-sys) looks up libclang via LIBCLANG_PATH.
 if not defined LIBCLANG_PATH set "LIBCLANG_PATH=C:\Program Files\LLVM\bin"
-
-REM Redirect cargo build output away from Dropbox to avoid sync races on
-REM openssl-sys / unicorn-engine-sys intermediate files.
-if not defined CARGO_TARGET_DIR set "CARGO_TARGET_DIR=C:\Users\%USERNAME%\AppData\Local\cargo-target\imessage"
 
 REM === python3 alias for `make bindings` ===
 REM The Makefile at scripts/patch_bindings.py invokes `python3`. Windows Python
