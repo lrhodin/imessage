@@ -7174,23 +7174,47 @@ impl Client {
 // (MessageInst, SendJob, PushError) not safe to cross the uniffi boundary.
 impl Client {
     /// Force-refresh the MobileMe delegate and clear the cached CloudKit
-    /// clients. Call this when a CloudKit sync fails with TokenMissing:
-    /// the seeded delegate is missing the token CloudKit needs (typically
-    /// `cloudKitToken`), and upstream's get_mme_token only auto-refreshes
-    /// after a week of staleness. Without an explicit refresh here the
-    /// bridge gets permanently stuck on a partial delegate until that week
-    /// elapses.
+    /// clients. Call this when a CloudKit sync fails with TokenMissing.
     ///
-    /// Internal helper: not exposed via FFI. All call sites are inside
-    /// this crate's Client impls.
+    /// Sequence matters here:
+    ///
+    ///   1. Refresh the PET first. Upstream's `refresh_mme` (auth.rs:176)
+    ///      calls `get_gsa_token("com.apple.gs.idms.pet")` on line 179 and
+    ///      errors `TokenMissing` if the PET is absent/expired. Apple PETs
+    ///      have a ~24h TTL so after an overnight idle + bridge restart the
+    ///      PET loaded from disk is stale, making `refresh_mme` always fail
+    ///      with Token missing — the exact daily-auth-breaks symptom. The
+    ///      persisted `AccountUsername` + `AccountHashedPasswordHex` + SPD
+    ///      let us silently re-run `login_email_pass` via
+    ///      `refresh_pet_token` to fetch a fresh PET from Apple without
+    ///      user interaction.
+    ///
+    ///   2. Refresh the MME delegate. Now that the PET is fresh this hits
+    ///      the normal success path and we get a new `cloudKitToken`.
+    ///
+    ///   3. Reset the cached CloudKit clients so the next sync picks up
+    ///      the new delegate.
+    ///
+    /// Internal helper: not exposed via FFI. All call sites are inside this
+    /// crate's Client impls.
     async fn refresh_mme_and_reset_cloud_client(&self) {
         if let Some(tp) = &self.token_provider {
+            // Step 1: fresh PET from Apple via stored credentials. Infallible
+            // per refresh_pet_with_snapshot's docstring; any auth/network
+            // error is logged and swallowed so step 2 still runs with
+            // whatever's in memory (matches pre-fix behavior in the worst
+            // case).
+            if let Err(e) = tp.refresh_pet_token().await {
+                warn!("refresh_pet_token before MME refresh failed: {:?}", e);
+            }
+            // Step 2: MME delegate refresh. Now the PET should be present.
             if let Err(e) = tp.inner.refresh_mme().await {
                 warn!("refresh_mme failed during cloud-client recovery: {}", e);
             } else {
-                info!("Cloud client recovery: refreshed MobileMe delegate");
+                info!("Cloud client recovery: refreshed PET + MobileMe delegate");
             }
         }
+        // Step 3: drop cached clients so the next get_or_init_* sees the new delegate.
         self.reset_cloud_client().await;
     }
 
