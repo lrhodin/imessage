@@ -9360,6 +9360,31 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		}
 	}
 
+	// Guard: no payload means the MMCS download failed upstream after the
+	// rustpushgo retry exhausted (download_one_mmcs_attachment at
+	// pkg/rustpushgo/src/lib.rs logs the specific error). Without this guard
+	// we'd fall through to build an m.image/m.video/m.file event with no
+	// url/file field, and clients render that as "Unsupported attachment
+	// type: IMAGE (<body>)". Emit an m.notice placeholder instead — mirrors
+	// the CloudKit backfill fallback a few thousand lines up in this file.
+	if inlineData == nil {
+		zerolog.Ctx(ctx).Warn().
+			Str("file", fileName).
+			Str("mime", mimeType).
+			Uint64("size", att.Size).
+			Msg("Attachment has no payload — MMCS download failed; emitting notice placeholder")
+		return &bridgev2.ConvertedMessage{
+			Parts: []*bridgev2.ConvertedMessagePart{{
+				ID:   networkid.PartID(fmt.Sprintf("att%d", attMsg.Index)),
+				Type: event.EventMessage,
+				Content: &event.MessageEventContent{
+					MsgType: event.MsgNotice,
+					Body:    fmt.Sprintf("Attachment could not be downloaded (%s).", fileName),
+				},
+			}},
+		}, nil
+	}
+
 	var vcardPreview *event.MessageEventContent
 	if inlineData != nil && isVCardAttachment(mimeType, fileName, att.UtiType) {
 		vcardPreview = makeVCardPreviewContent(inlineData)
